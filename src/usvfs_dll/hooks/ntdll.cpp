@@ -297,7 +297,7 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
                          FILE_INFORMATION_CLASS FileInformationClass, PVOID& buffer,
                          ULONG& bufferSize, std::set<std::wstring>& foundFiles,
                          HANDLE event, PIO_APC_ROUTINE apcRoutine, PVOID apcContext,
-                         BOOLEAN returnSingleEntry)
+                         BOOLEAN returnSingleEntry, bool* completeSingleEntry = nullptr)
 {
   NTSTATUS res = STATUS_NO_SUCH_FILE;
   if (hdl != INVALID_HANDLE_VALUE) {
@@ -318,6 +318,14 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
         ULONG offset;
         std::wstring fileName;
         GetFileInformationData(FileInformationClass, buffer, offset, fileName);
+        if (completeSingleEntry != nullptr && totalOffset == 0 && offset == 0) {
+          // Allow for the largest supported directory record and either name.
+          // Use the returned name: an exact query can also match a short-name alias.
+          *completeSingleEntry =
+              bufferSize >=
+              sizeof(FILE_ID_ALL_EXTD_BOTH_DIR_INFORMATION) +
+                  std::max(fileName.size(), fakeName.size()) * sizeof(WCHAR);
+        }
         // in case this is a single-file search result and the specified
         // filename differs from the file name found, replace it in the
         // information structure
@@ -471,8 +479,7 @@ void gatherVirtualEntries(const UnicodeString& dirName,
  *        as the name component of realpath
  * @param ReturnSingleEntry
  * @param dataRead
- * @return true if a virtual result was added, false if the search handle in the
- *         info object yields no more results
+ * @return true if the query succeeded, false if the current search failed or ended
  */
 bool addVirtualSearchResult(PVOID& FileInformation,
                             FILE_INFORMATION_CLASS FileInformationClass,
@@ -497,13 +504,21 @@ bool addVirtualSearchResult(PVOID& FileInformation,
   }
   std::wstring fileName =
       ush::string_cast<std::wstring>(fullPath.filename().string(), ush::CodePage::UTF8);
-  NTSTATUS subRes = addNtSearchData(
+  bool completeSingleEntry = false;
+  NTSTATUS subRes          = addNtSearchData(
       info.currentSearchHandle,
       (fileName != L".") ? static_cast<PUNICODE_STRING>(UnicodeString(fileName.c_str()))
                          : nullptr,
       virtualName, FileInformationClass, FileInformation, dataRead, info.foundFiles,
-      nullptr, nullptr, nullptr, ReturnSingleEntry);
+      nullptr, nullptr, nullptr, ReturnSingleEntry, &completeSingleEntry);
   if (subRes == STATUS_SUCCESS) {
+    // A complete exact match needs no follow-up query to discover EOF.
+    if (completeSingleEntry && dataRead != 0 && !fileName.empty() && fileName != L"." &&
+        fileName.find_first_of(L"*?<>\"") == std::wstring::npos) {
+      info.virtualMatches.pop();
+      CloseHandle(info.currentSearchHandle);
+      info.currentSearchHandle = INVALID_HANDLE_VALUE;
+    }
     return true;
   } else {
     // STATUS_NO_MORE_FILES merely means the search ended, everything else is an
@@ -629,8 +644,7 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
         if (addVirtualSearchResult(FileInformationCurrent, FileInformationClass,
                                    infoIter->second, match.realPath, match.virtualName,
                                    ReturnSingleEntry, dataRead)) {
-          // a positive result here means the call returned data and there may
-          // be further objects to be retrieved by repeating the call
+          // Return this result before querying another redirection.
           dataReturned = true;
         } else {
           // proceed to next search handle
@@ -656,7 +670,7 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
     res = STATUS_SUCCESS;
   }
   IoStatusBlock->Status      = res;
-  IoStatusBlock->Information = dataRead;
+  IoStatusBlock->Information = dataReturned ? dataRead : 0;
 
   size_t numVirtualFiles = infoIter->second.virtualMatches.size();
   if ((numVirtualFiles > 0)) {
@@ -785,8 +799,7 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFileEx(
         if (addVirtualSearchResult(FileInformationCurrent, FileInformationClass,
                                    infoIter->second, match.realPath, match.virtualName,
                                    QueryFlags & SL_RETURN_SINGLE_ENTRY, dataRead)) {
-          // a positive result here means the call returned data and there may
-          // be further objects to be retrieved by repeating the call
+          // Return this result before querying another redirection.
           dataReturned = true;
         } else {
           // proceed to next search handle
@@ -812,7 +825,7 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFileEx(
     res = STATUS_SUCCESS;
   }
   IoStatusBlock->Status      = res;
-  IoStatusBlock->Information = dataRead;
+  IoStatusBlock->Information = dataReturned ? dataRead : 0;
 
   size_t numVirtualFiles = infoIter->second.virtualMatches.size();
   if ((numVirtualFiles > 0)) {

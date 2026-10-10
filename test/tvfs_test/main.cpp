@@ -361,6 +361,12 @@ TEST_F(USVFSTest, NtQueryDirectoryFileFindsVirtualFile)
   ASSERT_EQ(STATUS_SUCCESS, status.Status);
   ASSERT_EQ(0, wcscmp(info->FileName, L"np.exe"));
 
+  ASSERT_EQ(STATUS_NO_MORE_FILES, usvfs::hook_NtQueryDirectoryFile(
+                                      hdl, nullptr, nullptr, nullptr, &status, buffer,
+                                      sizeof(buffer), FileDirectoryInformation, TRUE,
+                                      static_cast<PUNICODE_STRING>(fileName), FALSE));
+  ASSERT_EQ(0, status.Information);
+
   usvfs::hook_NtClose(hdl);
 }
 
@@ -407,6 +413,12 @@ TEST_F(USVFSTest, NtQueryDirectoryFileExVirtualFile)
   ASSERT_THAT(foundFiles,
               ::testing::IsSupersetOf({L"0123456789.txt", L"123456", L"abcdef",
                                        L"abcdefghijklmnopqrstuvwxyz.txt"}));
+  for (const auto* name :
+       {L"0123456789.txt", L"123456", L"abcdef", L"abcdefghijklmnopqrstuvwxyz.txt"}) {
+    ASSERT_EQ(1, std::count(foundFiles.begin(), foundFiles.end(), name));
+  }
+  ASSERT_EQ(STATUS_NO_MORE_FILES, status.Status);
+  ASSERT_EQ(0, status.Information);
 
   usvfs::hook_NtClose(hdl);
 }
