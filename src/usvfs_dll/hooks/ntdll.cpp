@@ -1415,7 +1415,10 @@ NTSTATUS WINAPI usvfs::hook_NtQueryAttributesFile(
   NTSTATUS res = STATUS_SUCCESS;
 
   HOOK_START_GROUP(MutExHookGroup::FILE_ATTRIBUTES)
-  // Why is the usual if (!callContext.active()... check missing?
+
+  if (!callContext.active()) {
+    return ::NtQueryAttributesFile(ObjectAttributes, FileInformation);
+  }
 
   UnicodeString inPath = CreateUnicodeString(ObjectAttributes);
 
