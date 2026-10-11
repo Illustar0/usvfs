@@ -192,7 +192,7 @@ RedirectionInfo applyReroute(const usvfs::HookContext::ConstPtr& context,
 RedirectionInfo applyReroute(const usvfs::CreateRerouter& rerouter)
 {
   RedirectionInfo result;
-  result.path       = rerouter.fileName();
+  result.path       = UnicodeString(rerouter.fileName());
   result.redirected = rerouter.wasRerouted();
 
   std::wstring reroutePath(static_cast<LPCWSTR>(result.path));
