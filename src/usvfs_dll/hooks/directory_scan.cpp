@@ -166,7 +166,8 @@ void gatherVirtualEntries(const UnicodeString& dirName,
   if (node.get() != nullptr) {
     std::string searchPattern =
         FileName != nullptr
-            ? ush::string_cast<std::string>(FileName->Buffer, ush::CodePage::UTF8)
+            ? ush::string_cast<std::string>(FileName->Buffer, ush::CodePage::UTF8,
+                                            FileName->Length / sizeof(WCHAR))
             : "*.*";
 
     boost::replace_all(searchPattern, "\"", ".");

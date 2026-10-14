@@ -66,6 +66,42 @@ TEST_F(USVFSTest, NtQueryDirectoryFileFindsVirtualFile)
   usvfs::hook_NtClose(hdl);
 }
 
+TEST_F(USVFSTest, NtQueryDirectoryFileHonorsFileNameLength)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  usvfs::RedirectionTreeContainer& tree = ctx->redirectionTable();
+
+  tree.addFile(L"C:\\np.exe", usvfs::RedirectionDataLocal(REAL_FILEA));
+
+  HANDLE hdl =
+      hooked_NtOpenFile(L"C:\\", FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hdl);
+
+  // the pattern is "np.exe": the characters past Length must be ignored
+  WCHAR patternBuffer[] = L"np.exe.bak";
+  UNICODE_STRING pattern;
+  pattern.Buffer        = patternBuffer;
+  pattern.Length        = static_cast<USHORT>(wcslen(L"np.exe") * sizeof(WCHAR));
+  pattern.MaximumLength = sizeof(patternBuffer);
+
+  IO_STATUS_BLOCK status;
+  char buffer[1024];
+
+  usvfs::hook_NtQueryDirectoryFile(hdl, nullptr, nullptr, nullptr, &status, buffer,
+                                   1024, FileDirectoryInformation, TRUE, &pattern,
+                                   TRUE);
+
+  const auto* info = reinterpret_cast<FILE_DIRECTORY_INFORMATION*>(buffer);
+  ASSERT_EQ(STATUS_SUCCESS, status.Status);
+  ASSERT_EQ(L"np.exe",
+            std::wstring(info->FileName, info->FileNameLength / sizeof(WCHAR)));
+
+  usvfs::hook_NtClose(hdl);
+}
+
 TEST_F(USVFSTest, NtQueryDirectoryFileExVirtualFile)
 {
   auto params = defaultUsvfsParams();
