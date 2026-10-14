@@ -102,6 +102,39 @@ TEST_F(USVFSTest, NtQueryDirectoryFileHonorsFileNameLength)
   usvfs::hook_NtClose(hdl);
 }
 
+TEST_F(USVFSTest, NtQueryDirectoryFileForwardsUnsupportedInformationClass)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+
+  HANDLE hdl =
+      hooked_NtOpenFile(L"C:\\", FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hdl);
+
+  IO_STATUS_BLOCK status;
+  char buffer[1024];
+
+  // not a directory information class; ntdll rejects it with a status that differs
+  // between architectures, so compare against a direct call
+  const auto nativeQuery = reinterpret_cast<NtQueryDirectoryFile_type>(
+      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQueryDirectoryFile"));
+  const auto hookedQuery = &usvfs::hook_NtQueryDirectoryFile;
+
+  const NTSTATUS expected =
+      nativeQuery(hdl, nullptr, nullptr, nullptr, &status, buffer, 1024,
+                  FileStandardInformation, TRUE, nullptr, TRUE);
+  const NTSTATUS actual =
+      hookedQuery(hdl, nullptr, nullptr, nullptr, &status, buffer, 1024,
+                  FileStandardInformation, TRUE, nullptr, TRUE);
+
+  ASSERT_LT(expected, 0);
+  ASSERT_EQ(expected, actual);
+
+  usvfs::hook_NtClose(hdl);
+}
+
 TEST_F(USVFSTest, NtQueryDirectoryFileExVirtualFile)
 {
   auto params = defaultUsvfsParams();

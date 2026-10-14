@@ -266,6 +266,29 @@ NTSTATUS queryNative(const DirectoryQuery& query)
       query.fileName, query.isRestart());
 }
 
+// Decides whether a query is virtualized; any other query goes to ntdll as is.
+bool shouldVirtualize(const DirectoryQuery& query)
+{
+  // the virtual listing can only filter and rename records that carry a FileName
+  switch (query.informationClass) {
+  case FileDirectoryInformation:
+  case FileFullDirectoryInformation:
+  case FileBothDirectoryInformation:
+  case FileNamesInformation:
+  case FileIdBothDirectoryInformation:
+  case FileIdFullDirectoryInformation:
+  case FileIdExtdDirectoryInformation:
+  case FileIdExtdBothDirectoryInformation:
+  case FileId64ExtdDirectoryInformation:
+  case FileId64ExtdBothDirectoryInformation:
+  case FileIdAllExtdDirectoryInformation:
+  case FileIdAllExtdBothDirectoryInformation:
+    return true;
+  default:
+    return false;
+  }
+}
+
 // this is quite messy...
 // first, this will gather the virtual locations mapping to the iterated one
 // then we return results from the real location, skipping those that exist
@@ -278,6 +301,10 @@ NTSTATUS queryNative(const DirectoryQuery& query)
 NTSTATUS queryDirectory(const DirectoryQuery& query)
 {
   using namespace usvfs;
+
+  if (!shouldVirtualize(query)) {
+    return queryNative(query);
+  }
 
   //  std::unique_lock<std::recursive_mutex> queryLock;
   std::map<HANDLE, Searches::Info>::iterator infoIter;
