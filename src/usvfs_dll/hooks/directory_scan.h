@@ -2,11 +2,6 @@
 
 #include <ntdll_declarations.h>
 
-namespace usvfs
-{
-class HookContext;
-}
-
 // A call to either directory query entry point. The BOOLEAN arguments of the
 // legacy entry point are folded into SL_* flags.
 struct DirectoryQuery
@@ -28,7 +23,10 @@ struct DirectoryQuery
 };
 
 NTSTATUS queryNative(const DirectoryQuery& query);
+// Routes a query: virtualizes it when shouldVirtualize allows, and forwards it to
+// ntdll otherwise. Like ntdll, reports the result both as the return value and in
+// the status block.
 NTSTATUS queryDirectory(const DirectoryQuery& query);
 
-// Releases the search state of a closed handle. Returns whether it had any.
-bool eraseDirectorySearch(const usvfs::HookContext& context, HANDLE handle);
+// Releases the scan of a closed handle. Returns whether it had one.
+bool eraseDirectoryScan(HANDLE handle);

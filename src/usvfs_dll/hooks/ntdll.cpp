@@ -815,10 +815,9 @@ NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
   bool log = false;
 
   if ((::GetFileType(Handle) == FILE_TYPE_DISK)) {
+    log = eraseDirectoryScan(Handle);
+
     HookContext::Ptr context = WRITE_CONTEXT();
-
-    log = eraseDirectorySearch(*context, Handle);
-
     {
       SearchHandleMap& searchHandles =
           context->customData<SearchHandleMap>(SearchHandles);

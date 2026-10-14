@@ -1,9 +1,11 @@
 #include "directory_scan.h"
 
-#include <map>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <set>
+#include <shared_mutex>
+#include <unordered_map>
 
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
@@ -113,47 +115,71 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
   return res;
 }
 
-DATA_ID(SearchInfo);
-
-struct Searches
+// The state of one scan: the queries on a handle from its first query or restart on.
+struct DirectoryScan
 {
-  struct Info
+  struct VirtualMatch
   {
-    struct VirtualMatch
-    {
-      // full path to where the file/directory actually is
-      std::wstring realPath;
-      // virtual filename (only filename since it has to be within the searched
-      // directory)
-      // this is left empty when a folder with all its content is mapped to the
-      // search directory
-      std::wstring virtualName;
-    };
-
-    Info() : currentSearchHandle(INVALID_HANDLE_VALUE) {}
-    std::set<std::wstring> foundFiles;
-    HANDLE currentSearchHandle;
-    std::queue<VirtualMatch> virtualMatches;
-    UnicodeString searchPattern;
-    bool regularComplete{false};
+    // full path to where the file/directory actually is
+    std::wstring realPath;
+    // virtual filename (only filename since it has to be within the searched
+    // directory)
+    // this is left empty when a folder with all its content is mapped to the
+    // search directory
+    std::wstring virtualName;
   };
 
-  Searches() = default;
-
-  // must provide a special copy constructor because boost::mutex is
-  // non-copyable
-  Searches(const Searches& reference) : info(reference.info) {}
-
-  Searches& operator=(const Searches&) = delete;
-
-  std::recursive_mutex queryMutex;
-
-  std::map<HANDLE, Info> info;
+  DirectoryScan() : currentSearchHandle(INVALID_HANDLE_VALUE) {}
+  std::set<std::wstring> foundFiles;
+  HANDLE currentSearchHandle;
+  std::queue<VirtualMatch> virtualMatches;
+  UnicodeString searchPattern;
+  bool regularComplete{false};
 };
+
+// The scans of all directory handles. The lock is a leaf: nothing else is called
+// while holding it, and no scan is destroyed under it.
+class DirectoryScans
+{
+public:
+  // Returns the scan of a handle, or an empty pointer if it has none.
+  std::shared_ptr<DirectoryScan> find(HANDLE handle) const
+  {
+    std::shared_lock lock(m_mutex);
+    const auto entry = m_scans.find(handle);
+    return entry != m_scans.end() ? entry->second : nullptr;
+  }
+
+  // Returns the scan of a handle, starting an empty one if it has none.
+  std::shared_ptr<DirectoryScan> findOrCreate(HANDLE handle)
+  {
+    // created before locking, so that an unused one is destroyed after unlocking
+    auto scan = std::make_shared<DirectoryScan>();
+    std::unique_lock lock(m_mutex);
+    return m_scans.try_emplace(handle, std::move(scan)).first->second;
+  }
+
+  // Removes the scan of a handle and returns it, so that the caller destroys it
+  // after the lock is released. Returns an empty pointer if the handle has none.
+  std::shared_ptr<DirectoryScan> erase(HANDLE handle)
+  {
+    std::unique_lock lock(m_mutex);
+    auto entry = m_scans.extract(handle);
+    return entry ? std::move(entry.mapped()) : nullptr;
+  }
+
+private:
+  mutable std::shared_mutex m_mutex;
+  std::unordered_map<HANDLE, std::shared_ptr<DirectoryScan>> m_scans;
+};
+
+// Shared by both query hooks and NtClose. Never destroyed, so that hooks still
+// running while the DLL unloads do not touch a destroyed registry.
+DirectoryScans& directoryScans = *new DirectoryScans;
 
 void gatherVirtualEntries(const UnicodeString& dirName,
                           const usvfs::RedirectionTreeContainer& redir,
-                          PUNICODE_STRING FileName, Searches::Info& info)
+                          PUNICODE_STRING FileName, DirectoryScan& info)
 {
   LPCWSTR dirNameW = static_cast<LPCWSTR>(dirName);
   // fix directory name. I'd love to know why microsoft sometimes uses "\??\" vs
@@ -178,7 +204,7 @@ void gatherVirtualEntries(const UnicodeString& dirName,
         std::wstring vName =
             ush::string_cast<std::wstring>(subNode->name(), ush::CodePage::UTF8);
 
-        Searches::Info::VirtualMatch m;
+        DirectoryScan::VirtualMatch m;
         if (subNode->data().linkTarget.length() > 0) {
           m = {ush::string_cast<std::wstring>(subNode->data().linkTarget.c_str(),
                                               ush::CodePage::UTF8),
@@ -211,7 +237,7 @@ void gatherVirtualEntries(const UnicodeString& dirName,
  */
 bool addVirtualSearchResult(PVOID& FileInformation,
                             FILE_INFORMATION_CLASS FileInformationClass,
-                            Searches::Info& info, const std::wstring& realPath,
+                            DirectoryScan& info, const std::wstring& realPath,
                             const std::wstring& virtualName, BOOLEAN ReturnSingleEntry,
                             ULONG& dataRead)
 {
@@ -266,7 +292,7 @@ NTSTATUS queryNative(const DirectoryQuery& query)
       query.fileName, query.isRestart());
 }
 
-// Decides whether a query is virtualized; any other query goes to ntdll as is.
+// Returns whether the virtual listing can serve this query.
 bool shouldVirtualize(const DirectoryQuery& query)
 {
   // the virtual listing can only filter and rename records that carry a FileName
@@ -306,54 +332,37 @@ NTSTATUS queryDirectory(const DirectoryQuery& query)
     return queryNative(query);
   }
 
-  //  std::unique_lock<std::recursive_mutex> queryLock;
-  std::map<HANDLE, Searches::Info>::iterator infoIter;
-  bool firstSearch = false;
-
-  {  // scope to limit context lifetime
-    HookContext::ConstPtr context = READ_CONTEXT();
-    Searches& activeSearches      = context->customData<Searches>(SearchInfo);
-    //    queryLock = std::unique_lock<std::recursive_mutex>(activeSearches.queryMutex);
-
-    if (query.isRestart()) {
-      auto iter = activeSearches.info.find(query.handle);
-      if (iter != activeSearches.info.end()) {
-        activeSearches.info.erase(iter);
-      }
-    }
-
-    // see if we already have a running search
-    infoIter    = activeSearches.info.find(query.handle);
-    firstSearch = (infoIter == activeSearches.info.end());
+  if (query.isRestart()) {
+    directoryScans.erase(query.handle);
   }
+
+  std::shared_ptr<DirectoryScan> scan = directoryScans.find(query.handle);
+  const bool firstSearch              = !scan;
 
   if (firstSearch) {
     HookContext::Ptr context = WRITE_CONTEXT();
-    Searches& activeSearches = context->customData<Searches>(SearchInfo);
     // tradeoff time: we store this search status even if no virtual results
     // were found. This causes a little extra cost here and in NtClose every
     // time a non-virtual dir is being searched. However if we don't,
     // whenever NtQueryDirectoryFile is called another time on the same handle,
     // this (expensive) block would be run again.
-    infoIter =
-        activeSearches.info.insert(std::make_pair(query.handle, Searches::Info()))
-            .first;
-    infoIter->second.searchPattern.appendPath(query.fileName);
+    scan = directoryScans.findOrCreate(query.handle);
+    scan->searchPattern.appendPath(query.fileName);
 
     SearchHandleMap& searchMap = context->customData<SearchHandleMap>(SearchHandles);
     SearchHandleMap::iterator iter = searchMap.find(query.handle);
 
     UnicodeString searchPath;
     if (iter != searchMap.end()) {
-      searchPath                           = UnicodeString(iter->second.c_str());
-      infoIter->second.currentSearchHandle = CreateFileW(
+      searchPath                = UnicodeString(iter->second.c_str());
+      scan->currentSearchHandle = CreateFileW(
           iter->second.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     } else {
       searchPath = ntdllHandleTracker.lookup(query.handle);
     }
     gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName,
-                         infoIter->second);
+                         *scan);
   }
 
   ULONG dataRead               = query.length;
@@ -361,39 +370,39 @@ NTSTATUS queryDirectory(const DirectoryQuery& query)
 
   // add regular search results, skipping those files we have in a virtual
   // location
-  bool moreRegular  = !infoIter->second.regularComplete;
+  bool moreRegular  = !scan->regularComplete;
   bool dataReturned = false;
   while (moreRegular && !dataReturned) {
     dataRead = query.length;
 
-    HANDLE handle = infoIter->second.currentSearchHandle;
+    HANDLE handle = scan->currentSearchHandle;
     if (handle == INVALID_HANDLE_VALUE) {
       handle = query.handle;
     }
-    NTSTATUS subRes = addNtSearchData(
-        handle, query.fileName, L"", query.informationClass, FileInformationCurrent,
-        dataRead, infoIter->second.foundFiles, query.event, query.apcRoutine,
-        query.apcContext, query.isSingleEntry());
+    NTSTATUS subRes =
+        addNtSearchData(handle, query.fileName, L"", query.informationClass,
+                        FileInformationCurrent, dataRead, scan->foundFiles, query.event,
+                        query.apcRoutine, query.apcContext, query.isSingleEntry());
     moreRegular = subRes == STATUS_SUCCESS;
     if (moreRegular) {
       dataReturned = dataRead != 0;
     } else {
-      infoIter->second.regularComplete = true;
-      infoIter->second.foundFiles.clear();
-      if (infoIter->second.currentSearchHandle != INVALID_HANDLE_VALUE) {
-        ::CloseHandle(infoIter->second.currentSearchHandle);
-        infoIter->second.currentSearchHandle = INVALID_HANDLE_VALUE;
+      scan->regularComplete = true;
+      scan->foundFiles.clear();
+      if (scan->currentSearchHandle != INVALID_HANDLE_VALUE) {
+        ::CloseHandle(scan->currentSearchHandle);
+        scan->currentSearchHandle = INVALID_HANDLE_VALUE;
       }
     }
   }
   if (!moreRegular) {
     // add virtual results
-    while (!dataReturned && infoIter->second.virtualMatches.size() > 0) {
-      auto match = infoIter->second.virtualMatches.front();
+    while (!dataReturned && scan->virtualMatches.size() > 0) {
+      auto match = scan->virtualMatches.front();
       if (match.realPath.size() != 0) {
         dataRead = query.length;
         if (addVirtualSearchResult(FileInformationCurrent, query.informationClass,
-                                   infoIter->second, match.realPath, match.virtualName,
+                                   *scan, match.realPath, match.virtualName,
                                    query.isSingleEntry(), dataRead)) {
           // a positive result here means the call returned data and there may
           // be further objects to be retrieved by repeating the call
@@ -404,9 +413,9 @@ NTSTATUS queryDirectory(const DirectoryQuery& query)
           // TODO: doesn't append search results from more than one redirection
           // per call. This is bad for performance but otherwise we'd need to
           // re-write the offsets between information objects
-          infoIter->second.virtualMatches.pop();
-          CloseHandle(infoIter->second.currentSearchHandle);
-          infoIter->second.currentSearchHandle = INVALID_HANDLE_VALUE;
+          scan->virtualMatches.pop();
+          CloseHandle(scan->currentSearchHandle);
+          scan->currentSearchHandle = INVALID_HANDLE_VALUE;
         }
       }
     }
@@ -425,7 +434,7 @@ NTSTATUS queryDirectory(const DirectoryQuery& query)
   query.statusBlock->Status      = res;
   query.statusBlock->Information = dataRead;
 
-  size_t numVirtualFiles = infoIter->second.virtualMatches.size();
+  size_t numVirtualFiles = scan->virtualMatches.size();
   if ((numVirtualFiles > 0)) {
     // log under the hook's name so both entry points stay distinguishable
     ulog::CallLogger(query.isEx ? "hook_NtQueryDirectoryFileEx"
@@ -441,16 +450,14 @@ NTSTATUS queryDirectory(const DirectoryQuery& query)
   return res;
 }
 
-bool eraseDirectorySearch(const usvfs::HookContext& context, HANDLE handle)
+bool eraseDirectoryScan(HANDLE handle)
 {
-  Searches& activeSearches = context.customData<Searches>(SearchInfo);
-  auto iter                = activeSearches.info.find(handle);
-  if (iter == activeSearches.info.end()) {
+  const std::shared_ptr<DirectoryScan> scan = directoryScans.erase(handle);
+  if (!scan) {
     return false;
   }
-  if (iter->second.currentSearchHandle != INVALID_HANDLE_VALUE) {
-    ::CloseHandle(iter->second.currentSearchHandle);
+  if (scan->currentSearchHandle != INVALID_HANDLE_VALUE) {
+    ::CloseHandle(scan->currentSearchHandle);
   }
-  activeSearches.info.erase(iter);
   return true;
 }
