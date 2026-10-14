@@ -517,30 +517,52 @@ bool addVirtualSearchResult(PVOID& FileInformation,
   }
 }
 
-NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
-    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
-    PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
-    FILE_INFORMATION_CLASS FileInformationClass, BOOLEAN ReturnSingleEntry,
-    PUNICODE_STRING FileName, BOOLEAN RestartScan)
+// A call to either directory query entry point. The BOOLEAN arguments of the
+// legacy entry point are folded into SL_* flags.
+struct DirectoryQuery
 {
-  PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
+  HANDLE handle;
+  HANDLE event;
+  PIO_APC_ROUTINE apcRoutine;
+  PVOID apcContext;
+  PIO_STATUS_BLOCK statusBlock;
+  PVOID buffer;
+  ULONG length;
+  FILE_INFORMATION_CLASS informationClass;
+  PUNICODE_STRING fileName;
+  ULONG flags;
+  bool isEx;
 
-  // this is quite messy...
-  // first, this will gather the virtual locations mapping to the iterated one
-  // then we return results from the real location, skipping those that exist
-  //   in the virtual locations, as those take precedence
-  // finally the virtual results are returned, adding each result to a skip
-  //   list, so they don't get added twice
-  //
-  // if we don't add the regular files first, "." and ".." wouldn't be in the
-  //   first search result of wildcard searches which may confuse the caller
-  NTSTATUS res = STATUS_NO_MORE_FILES;
-  HOOK_START_GROUP(MutExHookGroup::FIND_FILES)
-  if (!callContext.active()) {
-    return ::NtQueryDirectoryFile(
-        FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation,
-        Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
+  bool isRestart() const { return (flags & SL_RESTART_SCAN) != 0; }
+  bool isSingleEntry() const { return (flags & SL_RETURN_SINGLE_ENTRY) != 0; }
+};
+
+NTSTATUS queryNative(const DirectoryQuery& query)
+{
+  if (query.isEx) {
+    return ::NtQueryDirectoryFileEx(query.handle, query.event, query.apcRoutine,
+                                    query.apcContext, query.statusBlock, query.buffer,
+                                    query.length, query.informationClass, query.flags,
+                                    query.fileName);
   }
+  return ::NtQueryDirectoryFile(
+      query.handle, query.event, query.apcRoutine, query.apcContext, query.statusBlock,
+      query.buffer, query.length, query.informationClass, query.isSingleEntry(),
+      query.fileName, query.isRestart());
+}
+
+// this is quite messy...
+// first, this will gather the virtual locations mapping to the iterated one
+// then we return results from the real location, skipping those that exist
+//   in the virtual locations, as those take precedence
+// finally the virtual results are returned, adding each result to a skip
+//   list, so they don't get added twice
+//
+// if we don't add the regular files first, "." and ".." wouldn't be in the
+//   first search result of wildcard searches which may confuse the caller
+NTSTATUS queryDirectory(const DirectoryQuery& query)
+{
+  using namespace usvfs;
 
   //  std::unique_lock<std::recursive_mutex> queryLock;
   std::map<HANDLE, Searches::Info>::iterator infoIter;
@@ -551,15 +573,15 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
     Searches& activeSearches      = context->customData<Searches>(SearchInfo);
     //    queryLock = std::unique_lock<std::recursive_mutex>(activeSearches.queryMutex);
 
-    if (RestartScan) {
-      auto iter = activeSearches.info.find(FileHandle);
+    if (query.isRestart()) {
+      auto iter = activeSearches.info.find(query.handle);
       if (iter != activeSearches.info.end()) {
         activeSearches.info.erase(iter);
       }
     }
 
     // see if we already have a running search
-    infoIter    = activeSearches.info.find(FileHandle);
+    infoIter    = activeSearches.info.find(query.handle);
     firstSearch = (infoIter == activeSearches.info.end());
   }
 
@@ -572,11 +594,12 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
     // whenever NtQueryDirectoryFile is called another time on the same handle,
     // this (expensive) block would be run again.
     infoIter =
-        activeSearches.info.insert(std::make_pair(FileHandle, Searches::Info())).first;
-    infoIter->second.searchPattern.appendPath(FileName);
+        activeSearches.info.insert(std::make_pair(query.handle, Searches::Info()))
+            .first;
+    infoIter->second.searchPattern.appendPath(query.fileName);
 
     SearchHandleMap& searchMap = context->customData<SearchHandleMap>(SearchHandles);
-    SearchHandleMap::iterator iter = searchMap.find(FileHandle);
+    SearchHandleMap::iterator iter = searchMap.find(query.handle);
 
     UnicodeString searchPath;
     if (iter != searchMap.end()) {
@@ -585,29 +608,30 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
           iter->second.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     } else {
-      searchPath = ntdllHandleTracker.lookup(FileHandle);
+      searchPath = ntdllHandleTracker.lookup(query.handle);
     }
-    gatherVirtualEntries(searchPath, context->redirectionTable(), FileName,
+    gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName,
                          infoIter->second);
   }
 
-  ULONG dataRead               = Length;
-  PVOID FileInformationCurrent = FileInformation;
+  ULONG dataRead               = query.length;
+  PVOID FileInformationCurrent = query.buffer;
 
   // add regular search results, skipping those files we have in a virtual
   // location
   bool moreRegular  = !infoIter->second.regularComplete;
   bool dataReturned = false;
   while (moreRegular && !dataReturned) {
-    dataRead = Length;
+    dataRead = query.length;
 
     HANDLE handle = infoIter->second.currentSearchHandle;
     if (handle == INVALID_HANDLE_VALUE) {
-      handle = FileHandle;
+      handle = query.handle;
     }
     NTSTATUS subRes = addNtSearchData(
-        handle, FileName, L"", FileInformationClass, FileInformationCurrent, dataRead,
-        infoIter->second.foundFiles, Event, ApcRoutine, ApcContext, ReturnSingleEntry);
+        handle, query.fileName, L"", query.informationClass, FileInformationCurrent,
+        dataRead, infoIter->second.foundFiles, query.event, query.apcRoutine,
+        query.apcContext, query.isSingleEntry());
     moreRegular = subRes == STATUS_SUCCESS;
     if (moreRegular) {
       dataReturned = dataRead != 0;
@@ -625,10 +649,10 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
     while (!dataReturned && infoIter->second.virtualMatches.size() > 0) {
       auto match = infoIter->second.virtualMatches.front();
       if (match.realPath.size() != 0) {
-        dataRead = Length;
-        if (addVirtualSearchResult(FileInformationCurrent, FileInformationClass,
+        dataRead = query.length;
+        if (addVirtualSearchResult(FileInformationCurrent, query.informationClass,
                                    infoIter->second, match.realPath, match.virtualName,
-                                   ReturnSingleEntry, dataRead)) {
+                                   query.isSingleEntry(), dataRead)) {
           // a positive result here means the call returned data and there may
           // be further objects to be retrieved by repeating the call
           dataReturned = true;
@@ -646,6 +670,7 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
     }
   }
 
+  NTSTATUS res;
   if (!dataReturned) {
     if (firstSearch) {
       res = STATUS_NO_SUCH_FILE;
@@ -655,21 +680,53 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
   } else {
     res = STATUS_SUCCESS;
   }
-  IoStatusBlock->Status      = res;
-  IoStatusBlock->Information = dataRead;
+  query.statusBlock->Status      = res;
+  query.statusBlock->Information = dataRead;
 
   size_t numVirtualFiles = infoIter->second.virtualMatches.size();
   if ((numVirtualFiles > 0)) {
-    LOG_CALL()
-        .addParam("path", ntdllHandleTracker.lookup(FileHandle))
-        .PARAM(FileInformationClass)
-        .PARAM(FileName)
+    // log under the hook's name so both entry points stay distinguishable
+    ulog::CallLogger(query.isEx ? "hook_NtQueryDirectoryFileEx"
+                                : "hook_NtQueryDirectoryFile")
+        .addParam("path", ntdllHandleTracker.lookup(query.handle))
+        .addParam("FileInformationClass", query.informationClass)
+        .addParam("FileName", query.fileName)
+        .addParam("QueryFlags", query.flags)
         .PARAM(numVirtualFiles)
         .PARAMWRAP(res);
   }
 
-  HOOK_END
   return res;
+}
+
+NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    FILE_INFORMATION_CLASS FileInformationClass, BOOLEAN ReturnSingleEntry,
+    PUNICODE_STRING FileName, BOOLEAN RestartScan)
+{
+  PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
+  const ULONG queryFlags = (ReturnSingleEntry ? SL_RETURN_SINGLE_ENTRY : 0) |
+                           (RestartScan ? SL_RESTART_SCAN : 0);
+  const DirectoryQuery query{.handle           = FileHandle,
+                             .event            = Event,
+                             .apcRoutine       = ApcRoutine,
+                             .apcContext       = ApcContext,
+                             .statusBlock      = IoStatusBlock,
+                             .buffer           = FileInformation,
+                             .length           = Length,
+                             .informationClass = FileInformationClass,
+                             .fileName         = FileName,
+                             .flags            = queryFlags,
+                             .isEx             = false};
+
+  HOOK_START_GROUP(MutExHookGroup::FIND_FILES)
+  if (!callContext.active()) {
+    return queryNative(query);
+  }
+  return queryDirectory(query);
+  HOOK_END
+  return STATUS_NO_MORE_FILES;
 }
 
 NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFileEx(
@@ -679,154 +736,25 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFileEx(
     PUNICODE_STRING FileName)
 {
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
-  NTSTATUS res = STATUS_NO_MORE_FILES;
+  const DirectoryQuery query{.handle           = FileHandle,
+                             .event            = Event,
+                             .apcRoutine       = ApcRoutine,
+                             .apcContext       = ApcContext,
+                             .statusBlock      = IoStatusBlock,
+                             .buffer           = FileInformation,
+                             .length           = Length,
+                             .informationClass = FileInformationClass,
+                             .fileName         = FileName,
+                             .flags            = QueryFlags,
+                             .isEx             = true};
 
-  // this is quite messy...
-  // first, this will gather the virtual locations mapping to the iterated one
-  // then we return results from the real location, skipping those that exist
-  //   in the virtual locations, as those take precedence
-  // finally the virtual results are returned, adding each result to a skip
-  //   list, so they don't get added twice
-  //
-  // if we don't add the regular files first, "." and ".." wouldn't be in the
-  //   first search result of wildcard searches which may confuse the caller
   HOOK_START_GROUP(MutExHookGroup::FIND_FILES)
   if (!callContext.active()) {
-    return ::NtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext,
-                                    IoStatusBlock, FileInformation, Length,
-                                    FileInformationClass, QueryFlags, FileName);
+    return queryNative(query);
   }
-
-  //  std::unique_lock<std::recursive_mutex> queryLock;
-  std::map<HANDLE, Searches::Info>::iterator infoIter;
-  bool firstSearch = false;
-
-  {  // scope to limit context lifetime
-    HookContext::ConstPtr context = READ_CONTEXT();
-    Searches& activeSearches      = context->customData<Searches>(SearchInfo);
-    //    queryLock = std::unique_lock<std::recursive_mutex>(activeSearches.queryMutex);
-
-    if (QueryFlags & SL_RESTART_SCAN) {
-      auto iter = activeSearches.info.find(FileHandle);
-      if (iter != activeSearches.info.end()) {
-        activeSearches.info.erase(iter);
-      }
-    }
-
-    // see if we already have a running search
-    infoIter    = activeSearches.info.find(FileHandle);
-    firstSearch = (infoIter == activeSearches.info.end());
-  }
-
-  if (firstSearch) {
-    HookContext::Ptr context = WRITE_CONTEXT();
-    Searches& activeSearches = context->customData<Searches>(SearchInfo);
-    // tradeoff time: we store this search status even if no virtual results
-    // were found. This causes a little extra cost here and in NtClose every
-    // time a non-virtual dir is being searched. However if we don't,
-    // whenever NtQueryDirectoryFile is called another time on the same handle,
-    // this (expensive) block would be run again.
-    infoIter =
-        activeSearches.info.insert(std::make_pair(FileHandle, Searches::Info())).first;
-    infoIter->second.searchPattern.appendPath(FileName);
-
-    SearchHandleMap& searchMap = context->customData<SearchHandleMap>(SearchHandles);
-    SearchHandleMap::iterator iter = searchMap.find(FileHandle);
-
-    UnicodeString searchPath;
-    if (iter != searchMap.end()) {
-      searchPath                           = UnicodeString(iter->second.c_str());
-      infoIter->second.currentSearchHandle = CreateFileW(
-          iter->second.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-          nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    } else {
-      searchPath = ntdllHandleTracker.lookup(FileHandle);
-    }
-    gatherVirtualEntries(searchPath, context->redirectionTable(), FileName,
-                         infoIter->second);
-  }
-
-  ULONG dataRead               = Length;
-  PVOID FileInformationCurrent = FileInformation;
-
-  // add regular search results, skipping those files we have in a virtual
-  // location
-  bool moreRegular  = !infoIter->second.regularComplete;
-  bool dataReturned = false;
-  while (moreRegular && !dataReturned) {
-    dataRead = Length;
-
-    HANDLE handle = infoIter->second.currentSearchHandle;
-    if (handle == INVALID_HANDLE_VALUE) {
-      handle = FileHandle;
-    }
-    NTSTATUS subRes = addNtSearchData(handle, FileName, L"", FileInformationClass,
-                                      FileInformationCurrent, dataRead,
-                                      infoIter->second.foundFiles, Event, ApcRoutine,
-                                      ApcContext, QueryFlags & SL_RETURN_SINGLE_ENTRY);
-    moreRegular     = subRes == STATUS_SUCCESS;
-    if (moreRegular) {
-      dataReturned = dataRead != 0;
-    } else {
-      infoIter->second.regularComplete = true;
-      infoIter->second.foundFiles.clear();
-      if (infoIter->second.currentSearchHandle != INVALID_HANDLE_VALUE) {
-        ::CloseHandle(infoIter->second.currentSearchHandle);
-        infoIter->second.currentSearchHandle = INVALID_HANDLE_VALUE;
-      }
-    }
-  }
-  if (!moreRegular) {
-    // add virtual results
-    while (!dataReturned && infoIter->second.virtualMatches.size() > 0) {
-      auto match = infoIter->second.virtualMatches.front();
-      if (match.realPath.size() != 0) {
-        dataRead = Length;
-        if (addVirtualSearchResult(FileInformationCurrent, FileInformationClass,
-                                   infoIter->second, match.realPath, match.virtualName,
-                                   QueryFlags & SL_RETURN_SINGLE_ENTRY, dataRead)) {
-          // a positive result here means the call returned data and there may
-          // be further objects to be retrieved by repeating the call
-          dataReturned = true;
-        } else {
-          // proceed to next search handle
-
-          // TODO: doesn't append search results from more than one redirection
-          // per call. This is bad for performance but otherwise we'd need to
-          // re-write the offsets between information objects
-          infoIter->second.virtualMatches.pop();
-          CloseHandle(infoIter->second.currentSearchHandle);
-          infoIter->second.currentSearchHandle = INVALID_HANDLE_VALUE;
-        }
-      }
-    }
-  }
-
-  if (!dataReturned) {
-    if (firstSearch) {
-      res = STATUS_NO_SUCH_FILE;
-    } else {
-      res = STATUS_NO_MORE_FILES;
-    }
-  } else {
-    res = STATUS_SUCCESS;
-  }
-  IoStatusBlock->Status      = res;
-  IoStatusBlock->Information = dataRead;
-
-  size_t numVirtualFiles = infoIter->second.virtualMatches.size();
-  if ((numVirtualFiles > 0)) {
-    LOG_CALL()
-        .addParam("path", ntdllHandleTracker.lookup(FileHandle))
-        .PARAM(FileInformationClass)
-        .PARAM(FileName)
-        .PARAM(QueryFlags)
-        .PARAM(numVirtualFiles)
-        .PARAMWRAP(res);
-  }
-
+  return queryDirectory(query);
   HOOK_END
-  return res;
+  return STATUS_NO_MORE_FILES;
 }
 
 DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryObject(
