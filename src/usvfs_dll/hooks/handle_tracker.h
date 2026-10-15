@@ -7,6 +7,11 @@
 #include <ntdll_declarations.h>
 #include <unicodestring.h>
 
+inline bool isValidHandle(HANDLE handle)
+{
+  return handle && handle != INVALID_HANDLE_VALUE;
+}
+
 class HandleTracker
 {
 public:
@@ -17,7 +22,7 @@ public:
 
   info_type lookup(handle_type handle) const
   {
-    if (valid_handle(handle)) {
+    if (isValidHandle(handle)) {
       std::shared_lock<std::shared_mutex> lock(m_mutex);
       auto find = m_map.find(handle);
       if (find != m_map.end())
@@ -28,7 +33,7 @@ public:
 
   void insert(handle_type handle, const info_type& info)
   {
-    if (!valid_handle(handle))
+    if (!isValidHandle(handle))
       return;
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     m_map[handle] = info;
@@ -36,18 +41,13 @@ public:
 
   void erase(handle_type handle)
   {
-    if (!valid_handle(handle))
+    if (!isValidHandle(handle))
       return;
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     m_map.erase(handle);
   }
 
 private:
-  static bool valid_handle(handle_type handle)
-  {
-    return handle && handle != INVALID_HANDLE_VALUE;
-  }
-
   void insert_current_directory()
   {
     ntdll_declarations_init();

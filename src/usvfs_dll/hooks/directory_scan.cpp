@@ -1,5 +1,6 @@
 #include "directory_scan.h"
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -134,6 +135,47 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
   return res;
 }
 
+// A handle the scan opened itself. Move-only; closes the handle when destroyed, so
+// that a scan replaced by a restart or dropped by NtClose does not leak it.
+class OwnedHandle
+{
+public:
+  OwnedHandle() = default;
+  explicit OwnedHandle(HANDLE handle) : m_handle(handle) {}
+
+  OwnedHandle(OwnedHandle&& other) noexcept
+      : m_handle(std::exchange(other.m_handle, INVALID_HANDLE_VALUE))
+  {}
+
+  OwnedHandle& operator=(OwnedHandle&& other) noexcept
+  {
+    if (this != &other) {
+      reset();
+      m_handle = std::exchange(other.m_handle, INVALID_HANDLE_VALUE);
+    }
+    return *this;
+  }
+
+  ~OwnedHandle() { reset(); }
+
+  HANDLE get() const { return m_handle; }
+  bool isValid() const { return isValidHandle(m_handle); }
+
+  // Closes the handle, if there is one.
+  void reset()
+  {
+    if (isValid() && !::CloseHandle(m_handle)) {
+      spdlog::get("hooks")->warn("failed to close handle {0:x}: {1}",
+                                 reinterpret_cast<std::uintptr_t>(m_handle),
+                                 ::GetLastError());
+    }
+    m_handle = INVALID_HANDLE_VALUE;
+  }
+
+private:
+  HANDLE m_handle = INVALID_HANDLE_VALUE;
+};
+
 // A virtual entry of the scanned directory.
 struct VirtualMatch
 {
@@ -158,9 +200,6 @@ public:
   // result both as the return value and in the status block.
   NTSTATUS query(const DirectoryQuery& query);
 
-  // Closes the directory the scan currently reads from, if it opened one.
-  void closeSearchHandle();
-
 private:
   NTSTATUS fill(const DirectoryQuery& query, ULONG& dataRead);
   bool addVirtualSearchResult(PVOID& FileInformation,
@@ -170,7 +209,7 @@ private:
                               BOOLEAN ReturnSingleEntry, ULONG& dataRead);
 
   CaseInsensitiveNameSet m_foundFiles;
-  HANDLE m_currentSearchHandle{INVALID_HANDLE_VALUE};
+  OwnedHandle m_currentSearchHandle;
   std::vector<VirtualMatch> m_virtualMatches;
   // index of the next match to return; the ones before it are done
   size_t m_nextVirtualMatch{0};
@@ -286,16 +325,16 @@ gatherVirtualEntries(const UnicodeString& dirName,
 }
 
 // Opens the directory the regular entries are read from: the search path a hook
-// stored for the handle. Returns INVALID_HANDLE_VALUE if there is none or opening
-// it fails, in which case the caller's handle is read instead.
-HANDLE openRegularSource(const std::optional<std::wstring>& storedSearchPath)
+// stored for the handle. Returns an invalid handle if there is none or opening it
+// fails, in which case the caller's handle is read instead.
+OwnedHandle openRegularSource(const std::optional<std::wstring>& storedSearchPath)
 {
   if (!storedSearchPath) {
-    return INVALID_HANDLE_VALUE;
+    return OwnedHandle();
   }
-  return CreateFileW(storedSearchPath->c_str(), GENERIC_READ,
-                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                     FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  return OwnedHandle(CreateFileW(storedSearchPath->c_str(), GENERIC_READ,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
 }
 
 DirectoryScan::DirectoryScan(const DirectoryQuery& query)
@@ -326,14 +365,6 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query)
   m_currentSearchHandle = openRegularSource(storedSearchPath);
 }
 
-void DirectoryScan::closeSearchHandle()
-{
-  if (m_currentSearchHandle != INVALID_HANDLE_VALUE) {
-    ::CloseHandle(m_currentSearchHandle);
-    m_currentSearchHandle = INVALID_HANDLE_VALUE;
-  }
-}
-
 /**
  * @brief insert a virtual entry into the search result
  * @param FileInformation
@@ -359,18 +390,18 @@ bool DirectoryScan::addVirtualSearchResult(PVOID& FileInformation,
   if (fullPath.filename().wstring() == L".") {
     fullPath = fullPath.parent_path();
   }
-  if (m_currentSearchHandle == INVALID_HANDLE_VALUE) {
+  if (!m_currentSearchHandle.isValid()) {
     std::wstring dirName = fullPath.parent_path().wstring();
     if (dirName.length() >= MAX_PATH && !ush::startswith(dirName.c_str(), LR"(\\?\)"))
       dirName = LR"(\\?\)" + dirName;
-    m_currentSearchHandle =
+    m_currentSearchHandle = OwnedHandle(
         CreateFileW(dirName.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
   }
   std::wstring fileName =
       ush::string_cast<std::wstring>(fullPath.filename().string(), ush::CodePage::UTF8);
   NTSTATUS subRes = addNtSearchData(
-      m_currentSearchHandle,
+      m_currentSearchHandle.get(),
       (fileName != L".") ? static_cast<PUNICODE_STRING>(UnicodeString(fileName.c_str()))
                          : nullptr,
       virtualName, FileInformationClass, FileInformation, dataRead, m_foundFiles,
@@ -451,10 +482,8 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
   while (moreRegular && !dataReturned) {
     dataRead = query.length;
 
-    HANDLE handle = m_currentSearchHandle;
-    if (handle == INVALID_HANDLE_VALUE) {
-      handle = query.handle;
-    }
+    const HANDLE handle =
+        m_currentSearchHandle.isValid() ? m_currentSearchHandle.get() : query.handle;
     NTSTATUS subRes =
         addNtSearchData(handle, query.fileName, L"", query.informationClass,
                         FileInformationCurrent, dataRead, m_foundFiles, query.event,
@@ -465,7 +494,7 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
     } else {
       m_regularComplete = true;
       m_foundFiles.clear();
-      closeSearchHandle();
+      m_currentSearchHandle.reset();
     }
   }
   if (!moreRegular) {
@@ -487,8 +516,7 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
           // per call. This is bad for performance but otherwise we'd need to
           // re-write the offsets between information objects
           ++m_nextVirtualMatch;
-          CloseHandle(m_currentSearchHandle);
-          m_currentSearchHandle = INVALID_HANDLE_VALUE;
+          m_currentSearchHandle.reset();
         }
       }
     }
@@ -534,10 +562,6 @@ NTSTATUS queryDirectory(const DirectoryQuery& query)
 
 bool eraseDirectoryScan(HANDLE handle)
 {
-  const std::shared_ptr<DirectoryScan> scan = directoryScans.erase(handle);
-  if (!scan) {
-    return false;
-  }
-  scan->closeSearchHandle();
-  return true;
+  // a query still running on the scan keeps it, and its handle, open until it returns
+  return directoryScans.erase(handle) != nullptr;
 }

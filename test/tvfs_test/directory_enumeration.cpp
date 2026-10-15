@@ -181,3 +181,41 @@ TEST_F(USVFSTest, NtQueryDirectoryFileExVirtualFile)
 
   usvfs::hook_NtClose(hdl);
 }
+
+TEST_F(USVFSTest, NtQueryDirectoryFileRestartClosesReopenedHandle)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+
+  // backup intent makes the scan reopen the directory into a handle of its own
+  HANDLE hdl = hooked_NtOpenFile(
+      L"C:\\", FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+      FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hdl);
+
+  IO_STATUS_BLOCK status;
+  char buffer[1024];
+
+  // a single entry leaves the regular phase, and so the reopened handle, open
+  usvfs::hook_NtQueryDirectoryFile(hdl, nullptr, nullptr, nullptr, &status, buffer,
+                                   sizeof(buffer), FileDirectoryInformation, TRUE,
+                                   nullptr, FALSE);
+  ASSERT_EQ(STATUS_SUCCESS, status.Status);
+
+  DWORD handleCountBefore = 0;
+  ASSERT_TRUE(::GetProcessHandleCount(::GetCurrentProcess(), &handleCountBefore));
+
+  for (int restart = 0; restart < 10; ++restart) {
+    usvfs::hook_NtQueryDirectoryFile(hdl, nullptr, nullptr, nullptr, &status, buffer,
+                                     sizeof(buffer), FileDirectoryInformation, TRUE,
+                                     nullptr, TRUE);
+    ASSERT_EQ(STATUS_SUCCESS, status.Status);
+  }
+
+  DWORD handleCountAfter = 0;
+  ASSERT_TRUE(::GetProcessHandleCount(::GetCurrentProcess(), &handleCountAfter));
+  EXPECT_EQ(handleCountBefore, handleCountAfter);
+
+  usvfs::hook_NtClose(hdl);
+}
