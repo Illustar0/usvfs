@@ -132,6 +132,8 @@ public:
   void closeSearchHandle();
 
 private:
+  NTSTATUS fill(const DirectoryQuery& query, ULONG& dataRead);
+
   struct VirtualMatch
   {
     // full path to where the file/directory actually is
@@ -393,11 +395,13 @@ bool shouldVirtualize(const DirectoryQuery& query)
 //
 // if we don't add the regular files first, "." and ".." wouldn't be in the
 //   first search result of wildcard searches which may confuse the caller
-NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
+//
+// Writes the next entries into the buffer of the query and their size into
+// dataRead. Returns STATUS_SUCCESS if it wrote any, and STATUS_NO_MORE_FILES once
+// both the regular and the virtual entries are exhausted.
+NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
 {
-  const bool isFirstCall = std::exchange(m_isFirstCall, false);
-
-  ULONG dataRead               = query.length;
+  dataRead                     = query.length;
   PVOID FileInformationCurrent = query.buffer;
 
   // add regular search results, skipping those files we have in a virtual
@@ -449,16 +453,17 @@ NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
       }
     }
   }
+  return dataReturned ? STATUS_SUCCESS : STATUS_NO_MORE_FILES;
+}
 
-  NTSTATUS res;
-  if (!dataReturned) {
-    if (isFirstCall) {
-      res = STATUS_NO_SUCH_FILE;
-    } else {
-      res = STATUS_NO_MORE_FILES;
-    }
-  } else {
-    res = STATUS_SUCCESS;
+NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
+{
+  const bool isFirstCall = std::exchange(m_isFirstCall, false);
+
+  ULONG dataRead;
+  NTSTATUS res = fill(query, dataRead);
+  if (res == STATUS_NO_MORE_FILES && isFirstCall) {
+    res = STATUS_NO_SUCH_FILE;
   }
   query.statusBlock->Status      = res;
   query.statusBlock->Information = dataRead;
