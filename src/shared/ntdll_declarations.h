@@ -375,6 +375,7 @@ typedef enum _FILE_INFORMATION_CLASS
   FileNameInformation                   = 9,
   FileRenameInformation                 = 10,
   FileNamesInformation                  = 12,
+  FileModeInformation                   = 16,
   FileAllInformation                    = 18,
   FileObjectIdInformation               = 29,
   FileReparsePointInformation           = 33,

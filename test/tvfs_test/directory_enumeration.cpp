@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <latch>
 #include <mutex>
+#include <ostream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -299,4 +300,241 @@ TEST_F(USVFSTest, NtQueryDirectoryFileSerializesConcurrentQueries)
     std::sort(names.begin(), names.end());
     ASSERT_EQ(expected, names) << "attempt " << attempt;
   }
+}
+
+namespace
+{
+
+enum class CompletionNotification
+{
+  Event,
+  Apc,
+  CompletionPort,
+};
+
+const auto QUERY_CONTEXT                  = reinterpret_cast<PVOID>(0x5A5A);
+constexpr ULONG_PTR COMPLETION_KEY        = 0x1234;
+constexpr DWORD COMPLETION_TIMEOUT        = 5000;
+const auto UNWRITTEN_STATUS               = static_cast<NTSTATUS>(0xDEADBEEF);
+constexpr ULONG_PTR UNWRITTEN_INFORMATION = 0xDEADBEEF;
+
+struct ApcRecord
+{
+  int count;
+  PVOID context;
+  PIO_STATUS_BLOCK statusBlock;
+};
+
+ApcRecord apcRecord;
+
+VOID NTAPI recordApc(PVOID context, PIO_STATUS_BLOCK statusBlock, ULONG)
+{
+  ++apcRecord.count;
+  apcRecord.context     = context;
+  apcRecord.statusBlock = statusBlock;
+}
+
+// How one query completed, in terms that do not depend on the entries it returned,
+// so that listings of different directories can be compared call by call.
+struct CompletionRecord
+{
+  // from the status block, or the returned status if the query left it alone
+  NTSTATUS status;
+  bool isStatusBlockWritten;
+  // returning STATUS_PENDING instead is consistent too: a query may pend or not
+  bool isReturnedStatusFinal;
+  bool isEventSignaled;
+  int apcCount;
+  bool isApcForQuery;
+  int packetCount;
+  bool isPacketForQuery;
+  bool isPacketByteCountInformation;
+
+  bool operator==(const CompletionRecord&) const = default;
+};
+
+std::ostream& operator<<(std::ostream& out, const CompletionRecord& record)
+{
+  return out << "{status " << std::hex << static_cast<ULONG>(record.status) << std::dec
+             << ", status block written " << record.isStatusBlockWritten
+             << ", returned status final " << record.isReturnedStatusFinal
+             << ", event signaled " << record.isEventSignaled << ", APCs "
+             << record.apcCount << ", APC for query " << record.isApcForQuery
+             << ", packets " << record.packetCount << ", packet for query "
+             << record.isPacketForQuery << ", packet byte count is Information "
+             << record.isPacketByteCountInformation << "}";
+}
+
+// Lists a directory one entry per call, asking to be notified of each completion,
+// and records how each call completed, up to the first one that returns nothing.
+std::vector<CompletionRecord> recordNotifiedListing(NtQueryDirectoryFile_type query,
+                                                    HANDLE directory,
+                                                    CompletionNotification notification,
+                                                    HANDLE port)
+{
+  const HANDLE event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::vector<CompletionRecord> records;
+  for (int call = 0; call < 10000; ++call) {
+    IO_STATUS_BLOCK status;
+    status.Status      = UNWRITTEN_STATUS;
+    status.Information = UNWRITTEN_INFORMATION;
+    alignas(8) char buffer[1024];
+    ::ResetEvent(event);
+    apcRecord = {};
+
+    const NTSTATUS result = query(
+        directory, notification == CompletionNotification::Event ? event : nullptr,
+        notification == CompletionNotification::Apc ? recordApc : nullptr,
+        notification == CompletionNotification::Event ? nullptr : QUERY_CONTEXT,
+        &status, buffer, sizeof(buffer), FileDirectoryInformation, TRUE, nullptr,
+        FALSE);
+    // a query that did not pend has delivered its notifications before returning
+    const DWORD timeout = result == STATUS_PENDING ? COMPLETION_TIMEOUT : 0;
+
+    CompletionRecord record{};
+    switch (notification) {
+    case CompletionNotification::Event:
+      record.isEventSignaled = ::WaitForSingleObject(event, timeout) == WAIT_OBJECT_0;
+      break;
+    case CompletionNotification::Apc: {
+      const ULONGLONG deadline = ::GetTickCount64() + timeout;
+      while (apcRecord.count == 0 && ::GetTickCount64() < deadline) {
+        ::SleepEx(10, TRUE);
+      }
+      ::SleepEx(0, TRUE);
+      record.apcCount = apcRecord.count;
+      record.isApcForQuery =
+          apcRecord.context == QUERY_CONTEXT && apcRecord.statusBlock == &status;
+      break;
+    }
+    case CompletionNotification::CompletionPort: {
+      // a packet of a warning or error dequeues as a failure, so look at the
+      // context to tell a packet from a timeout
+      DWORD bytes = 0;
+      for (DWORD packetTimeout = timeout;; packetTimeout = 0) {
+        ULONG_PTR key        = 0;
+        LPOVERLAPPED context = nullptr;
+        ::GetQueuedCompletionStatus(port, &bytes, &key, &context, packetTimeout);
+        if (context == nullptr) {
+          break;
+        }
+        ++record.packetCount;
+        record.isPacketForQuery = key == COMPLETION_KEY && context == QUERY_CONTEXT;
+      }
+      record.isPacketByteCountInformation =
+          record.packetCount != 0 && bytes == status.Information;
+      break;
+    }
+    }
+
+    record.isStatusBlockWritten  = status.Status != UNWRITTEN_STATUS;
+    record.status                = record.isStatusBlockWritten ? status.Status : result;
+    record.isReturnedStatusFinal = result == STATUS_PENDING || result == record.status;
+    records.push_back(record);
+    if (record.status != STATUS_SUCCESS) {
+      break;
+    }
+  }
+  ::CloseHandle(event);
+  return records;
+}
+
+// The virtual entries make the listing reach the virtual phase, which completes
+// the queries itself.
+void addVirtualEntries(usvfs::RedirectionTreeContainer& tree)
+{
+  tree.addFile(L"C:\\usvfs_notified_a.txt", usvfs::RedirectionDataLocal(REAL_FILEA));
+  tree.addFile(L"C:\\usvfs_notified_b.txt", usvfs::RedirectionDataLocal(REAL_FILEA));
+}
+
+HANDLE openRootDirectory(bool isSynchronous)
+{
+  return hooked_NtOpenFile(
+      L"C:\\", FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+      FILE_DIRECTORY_FILE | (isSynchronous ? FILE_SYNCHRONOUS_IO_NONALERT : 0));
+}
+
+NtQueryDirectoryFile_type nativeQueryDirectoryFile()
+{
+  return reinterpret_cast<NtQueryDirectoryFile_type>(
+      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQueryDirectoryFile"));
+}
+
+// Lists the root directory through ntdll and through the hook, each with a handle
+// of its own, and expects every call under the hook to complete the way ntdll
+// completes a call with the same result.
+void expectNativeCompletions(bool isSynchronous, CompletionNotification notification)
+{
+  // a query moves its handle through the directory and completes to the port of
+  // its handle, so each listing gets a handle and a port of its own
+  HANDLE nativeHandle = openRootDirectory(isSynchronous);
+  HANDLE hookedHandle = openRootDirectory(isSynchronous);
+  ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+  HANDLE nativePort = nullptr;
+  HANDLE hookedPort = nullptr;
+  if (notification == CompletionNotification::CompletionPort) {
+    nativePort = ::CreateIoCompletionPort(nativeHandle, nullptr, COMPLETION_KEY, 0);
+    hookedPort = ::CreateIoCompletionPort(hookedHandle, nullptr, COMPLETION_KEY, 0);
+    ASSERT_NE(nullptr, nativePort);
+    ASSERT_NE(nullptr, hookedPort);
+  }
+
+  const std::vector<CompletionRecord> expected = recordNotifiedListing(
+      nativeQueryDirectoryFile(), nativeHandle, notification, nativePort);
+  const std::vector<CompletionRecord> actual = recordNotifiedListing(
+      &usvfs::hook_NtQueryDirectoryFile, hookedHandle, notification, hookedPort);
+
+  ASSERT_LE(2u, expected.size());
+  ASSERT_EQ(STATUS_SUCCESS, expected.front().status);
+  ASSERT_EQ(STATUS_NO_MORE_FILES, expected.back().status);
+  for (size_t call = 0; call + 1 < actual.size(); ++call) {
+    ASSERT_EQ(expected.front(), actual[call]) << "call " << call;
+  }
+  ASSERT_EQ(expected.back(), actual.back()) << "the end of the listing";
+
+  usvfs::hook_NtClose(nativeHandle);
+  usvfs::hook_NtClose(hookedHandle);
+  if (notification == CompletionNotification::CompletionPort) {
+    ::CloseHandle(nativePort);
+    ::CloseHandle(hookedPort);
+  }
+}
+
+}  // namespace
+
+TEST_F(USVFSTest, NtQueryDirectoryFileSignalsEventOnSynchronousHandle)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  addVirtualEntries(ctx->redirectionTable());
+  expectNativeCompletions(true, CompletionNotification::Event);
+}
+
+TEST_F(USVFSTest, NtQueryDirectoryFileSignalsEventOnAsynchronousHandle)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  addVirtualEntries(ctx->redirectionTable());
+  expectNativeCompletions(false, CompletionNotification::Event);
+}
+
+TEST_F(USVFSTest, NtQueryDirectoryFileQueuesApcOnAsynchronousHandle)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  addVirtualEntries(ctx->redirectionTable());
+  expectNativeCompletions(false, CompletionNotification::Apc);
+}
+
+TEST_F(USVFSTest, NtQueryDirectoryFilePostsCompletionPackets)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  addVirtualEntries(ctx->redirectionTable());
+  expectNativeCompletions(false, CompletionNotification::CompletionPort);
 }

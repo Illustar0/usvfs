@@ -52,15 +52,16 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
                          const std::wstring& fakeName,
                          FILE_INFORMATION_CLASS FileInformationClass, PVOID& buffer,
                          ULONG& bufferSize, CaseInsensitiveNameSet& foundFiles,
-                         HANDLE event, PIO_APC_ROUTINE apcRoutine, PVOID apcContext,
                          BOOLEAN returnSingleEntry)
 {
   NTSTATUS res = STATUS_NO_SUCH_FILE;
   if (hdl != INVALID_HANDLE_VALUE) {
     PVOID lastValidRecord = nullptr;
     PVOID bufferInit      = buffer;
+    // the handle completes synchronously and the caller's notifications belong to
+    // the caller's query, so this read asks for none
     IO_STATUS_BLOCK status;
-    res = NtQueryDirectoryFile(hdl, event, apcRoutine, apcContext, &status, buffer,
+    res = NtQueryDirectoryFile(hdl, nullptr, nullptr, nullptr, &status, buffer,
                                bufferSize, FileInformationClass, returnSingleEntry,
                                FileName, FALSE);
 
@@ -209,6 +210,10 @@ private:
                               const std::wstring& virtualName,
                               BOOLEAN ReturnSingleEntry, ULONG& dataRead);
 
+  // whether the queries go straight to ntdll; fixed at construction, so read
+  // without the lock
+  const bool m_isPassthrough;
+
   // Guards the state below. Taken after the registry lock is released; nested
   // directory queries made while holding it go straight to ntdll, so it is never
   // taken twice by one thread.
@@ -342,9 +347,32 @@ OwnedHandle openRegularSource(const std::optional<std::wstring>& storedSearchPat
                                  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
 }
 
+// Returns whether every I/O on the handle completes before returning. Only then may
+// the virtual listing read regular entries through it and complete the query
+// itself. A read on an asynchronous handle can pend, and is not waited for: ntdll
+// writes its status block after the read returned, into a stack frame that is
+// gone. And the handle may be bound to a completion port, whose packets the
+// virtual listing does not post.
+bool isSynchronousHandle(HANDLE handle)
+{
+  FILE_MODE_INFORMATION mode{};
+  IO_STATUS_BLOCK status;
+  const NTSTATUS result = ::NtQueryInformationFile(handle, &status, &mode, sizeof(mode),
+                                                   FileModeInformation);
+  return result >= 0 &&
+         (mode.Mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
+}
+
+// An asynchronous handle gets a scan that only forwards its queries, so that the
+// handle is checked once rather than on every query.
 DirectoryScan::DirectoryScan(const DirectoryQuery& query)
+    : m_isPassthrough(!isSynchronousHandle(query.handle))
 {
   using namespace usvfs;
+
+  if (m_isPassthrough) {
+    return;
+  }
 
   // The stored search path also names the virtual directory, so it is looked up
   // under the same context lock as the virtual entries.
@@ -410,7 +438,7 @@ bool DirectoryScan::addVirtualSearchResult(PVOID& FileInformation,
       (fileName != L".") ? static_cast<PUNICODE_STRING>(UnicodeString(fileName.c_str()))
                          : nullptr,
       virtualName, FileInformationClass, FileInformation, dataRead, m_foundFiles,
-      nullptr, nullptr, nullptr, ReturnSingleEntry);
+      ReturnSingleEntry);
   if (subRes == STATUS_SUCCESS) {
     return true;
   } else {
@@ -442,6 +470,23 @@ NTSTATUS queryNative(const DirectoryQuery& query)
 // Returns whether the virtual listing can serve this query.
 bool shouldVirtualize(const DirectoryQuery& query)
 {
+  // A query asking for an event, an APC or a completion packet is left to ntdll:
+  // the virtual listing completes the query itself and delivers none of them.
+  // Passing them on to the internal reads does not work either. The notifications
+  // then report the internal read instead of the query: the APC gets the read's
+  // status block on our stack, the packet the read's byte count. And an internal
+  // read can pend, as NTFS does at the end of a directory on a handle bound to a
+  // completion port; ntdll then writes its status block after the read returned,
+  // into a stack frame that is gone.
+  //
+  // TODO: virtualize these queries and those on asynchronous handles too, by
+  // delivering the notifications ourselves after completing the query: NtSetEvent,
+  // NtQueueApcThread(ApcRoutine, ApcContext, IoStatusBlock), and NtSetIoCompletion
+  // with the port and key a NtSetInformationFile hook recorded for the handle (they
+  // cannot be queried). Until then, these callers see only the physical directory.
+  if (query.event || query.apcRoutine || query.apcContext) {
+    return false;
+  }
   // the virtual listing can only filter and rename records that carry a FileName
   switch (query.informationClass) {
   case FileDirectoryInformation:
@@ -489,11 +534,10 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
 
     const HANDLE handle =
         m_currentSearchHandle.isValid() ? m_currentSearchHandle.get() : query.handle;
-    NTSTATUS subRes =
-        addNtSearchData(handle, query.fileName, L"", query.informationClass,
-                        FileInformationCurrent, dataRead, m_foundFiles, query.event,
-                        query.apcRoutine, query.apcContext, query.isSingleEntry());
-    moreRegular = subRes == STATUS_SUCCESS;
+    NTSTATUS subRes = addNtSearchData(handle, query.fileName, L"",
+                                      query.informationClass, FileInformationCurrent,
+                                      dataRead, m_foundFiles, query.isSingleEntry());
+    moreRegular     = subRes == STATUS_SUCCESS;
     if (moreRegular) {
       dataReturned = dataRead != 0;
     } else {
@@ -531,6 +575,9 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
 
 NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
 {
+  if (m_isPassthrough) {
+    return queryNative(query);
+  }
   std::lock_guard lock(m_mutex);
   const bool isFirstCall = std::exchange(m_isFirstCall, false);
 
