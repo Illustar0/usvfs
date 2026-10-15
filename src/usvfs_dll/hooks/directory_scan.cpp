@@ -117,8 +117,21 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
 }
 
 // The state of one scan: the queries on a handle from its first query or restart on.
-struct DirectoryScan
+class DirectoryScan
 {
+public:
+  // Starts the scan: picks the directory the regular entries are read from and
+  // gathers the virtual entries matching the pattern of the query.
+  explicit DirectoryScan(const DirectoryQuery& query);
+
+  // Answers a query with the next entries of the scan. Like ntdll, reports the
+  // result both as the return value and in the status block.
+  NTSTATUS query(const DirectoryQuery& query);
+
+  // Closes the directory the scan currently reads from, if it opened one.
+  void closeSearchHandle();
+
+private:
   struct VirtualMatch
   {
     // full path to where the file/directory actually is
@@ -130,17 +143,21 @@ struct DirectoryScan
     std::wstring virtualName;
   };
 
-  // Starts the scan: picks the directory the regular entries are read from and
-  // gathers the virtual entries matching the pattern of the query.
-  explicit DirectoryScan(const DirectoryQuery& query);
+  void gatherVirtualEntries(const UnicodeString& dirName,
+                            const usvfs::RedirectionTreeContainer& redir,
+                            PUNICODE_STRING FileName);
+  bool addVirtualSearchResult(PVOID& FileInformation,
+                              FILE_INFORMATION_CLASS FileInformationClass,
+                              const std::wstring& realPath,
+                              const std::wstring& virtualName,
+                              BOOLEAN ReturnSingleEntry, ULONG& dataRead);
 
-  std::set<std::wstring> foundFiles;
-  HANDLE currentSearchHandle{INVALID_HANDLE_VALUE};
-  std::queue<VirtualMatch> virtualMatches;
-  UnicodeString searchPattern;
-  bool regularComplete{false};
+  std::set<std::wstring> m_foundFiles;
+  HANDLE m_currentSearchHandle{INVALID_HANDLE_VALUE};
+  std::queue<VirtualMatch> m_virtualMatches;
+  bool m_regularComplete{false};
   // an empty result is STATUS_NO_SUCH_FILE on the first call only
-  bool isFirstCall{true};
+  bool m_isFirstCall{true};
 };
 
 // The scans of all directory handles. The lock is a leaf: nothing else is called
@@ -201,9 +218,9 @@ private:
 // running while the DLL unloads do not touch a destroyed registry.
 DirectoryScans& directoryScans = *new DirectoryScans;
 
-void gatherVirtualEntries(const UnicodeString& dirName,
-                          const usvfs::RedirectionTreeContainer& redir,
-                          PUNICODE_STRING FileName, DirectoryScan& info)
+void DirectoryScan::gatherVirtualEntries(const UnicodeString& dirName,
+                                         const usvfs::RedirectionTreeContainer& redir,
+                                         PUNICODE_STRING FileName)
 {
   LPCWSTR dirNameW = static_cast<LPCWSTR>(dirName);
   // fix directory name. I'd love to know why microsoft sometimes uses "\??\" vs
@@ -228,7 +245,7 @@ void gatherVirtualEntries(const UnicodeString& dirName,
         std::wstring vName =
             ush::string_cast<std::wstring>(subNode->name(), ush::CodePage::UTF8);
 
-        DirectoryScan::VirtualMatch m;
+        VirtualMatch m;
         if (subNode->data().linkTarget.length() > 0) {
           m = {ush::string_cast<std::wstring>(subNode->data().linkTarget.c_str(),
                                               ush::CodePage::UTF8),
@@ -239,8 +256,8 @@ void gatherVirtualEntries(const UnicodeString& dirName,
                vName};
         }
 
-        info.virtualMatches.push(m);
-        info.foundFiles.insert(ush::to_upper(vName));
+        m_virtualMatches.push(m);
+        m_foundFiles.insert(ush::to_upper(vName));
       }
     }
   }
@@ -251,41 +268,47 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query)
   using namespace usvfs;
 
   HookContext::Ptr context = WRITE_CONTEXT();
-  searchPattern.appendPath(query.fileName);
 
   SearchHandleMap& searchMap     = context->customData<SearchHandleMap>(SearchHandles);
   SearchHandleMap::iterator iter = searchMap.find(query.handle);
 
   UnicodeString searchPath;
   if (iter != searchMap.end()) {
-    searchPath          = UnicodeString(iter->second.c_str());
-    currentSearchHandle = CreateFileW(
+    searchPath            = UnicodeString(iter->second.c_str());
+    m_currentSearchHandle = CreateFileW(
         iter->second.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   } else {
     searchPath = ntdllHandleTracker.lookup(query.handle);
   }
-  gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName, *this);
+  gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName);
+}
+
+void DirectoryScan::closeSearchHandle()
+{
+  if (m_currentSearchHandle != INVALID_HANDLE_VALUE) {
+    ::CloseHandle(m_currentSearchHandle);
+    m_currentSearchHandle = INVALID_HANDLE_VALUE;
+  }
 }
 
 /**
  * @brief insert a virtual entry into the search result
  * @param FileInformation
  * @param FileInformationClass
- * @param info
  * @param realPath path were the actual file resides
  * @param virtualName virtual file name (without path). will often be the same
  *        as the name component of realpath
  * @param ReturnSingleEntry
  * @param dataRead
- * @return true if a virtual result was added, false if the search handle in the
- *         info object yields no more results
+ * @return true if a virtual result was added, false if the current search handle
+ *         yields no more results
  */
-bool addVirtualSearchResult(PVOID& FileInformation,
-                            FILE_INFORMATION_CLASS FileInformationClass,
-                            DirectoryScan& info, const std::wstring& realPath,
-                            const std::wstring& virtualName, BOOLEAN ReturnSingleEntry,
-                            ULONG& dataRead)
+bool DirectoryScan::addVirtualSearchResult(PVOID& FileInformation,
+                                           FILE_INFORMATION_CLASS FileInformationClass,
+                                           const std::wstring& realPath,
+                                           const std::wstring& virtualName,
+                                           BOOLEAN ReturnSingleEntry, ULONG& dataRead)
 {
   // this opens a search in the real location, then copies the information about
   // files we care about (the ones being mapped) to the result we intend to
@@ -294,21 +317,21 @@ bool addVirtualSearchResult(PVOID& FileInformation,
   if (fullPath.filename().wstring() == L".") {
     fullPath = fullPath.parent_path();
   }
-  if (info.currentSearchHandle == INVALID_HANDLE_VALUE) {
+  if (m_currentSearchHandle == INVALID_HANDLE_VALUE) {
     std::wstring dirName = fullPath.parent_path().wstring();
     if (dirName.length() >= MAX_PATH && !ush::startswith(dirName.c_str(), LR"(\\?\)"))
       dirName = LR"(\\?\)" + dirName;
-    info.currentSearchHandle =
+    m_currentSearchHandle =
         CreateFileW(dirName.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                     nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   }
   std::wstring fileName =
       ush::string_cast<std::wstring>(fullPath.filename().string(), ush::CodePage::UTF8);
   NTSTATUS subRes = addNtSearchData(
-      info.currentSearchHandle,
+      m_currentSearchHandle,
       (fileName != L".") ? static_cast<PUNICODE_STRING>(UnicodeString(fileName.c_str()))
                          : nullptr,
-      virtualName, FileInformationClass, FileInformation, dataRead, info.foundFiles,
+      virtualName, FileInformationClass, FileInformation, dataRead, m_foundFiles,
       nullptr, nullptr, nullptr, ReturnSingleEntry);
   if (subRes == STATUS_SUCCESS) {
     return true;
@@ -370,53 +393,45 @@ bool shouldVirtualize(const DirectoryQuery& query)
 //
 // if we don't add the regular files first, "." and ".." wouldn't be in the
 //   first search result of wildcard searches which may confuse the caller
-NTSTATUS queryDirectory(const DirectoryQuery& query)
+NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
 {
-  if (!shouldVirtualize(query)) {
-    return queryNative(query);
-  }
-
-  const std::shared_ptr<DirectoryScan> scan = directoryScans.scanFor(query);
-  const bool isFirstCall                    = std::exchange(scan->isFirstCall, false);
+  const bool isFirstCall = std::exchange(m_isFirstCall, false);
 
   ULONG dataRead               = query.length;
   PVOID FileInformationCurrent = query.buffer;
 
   // add regular search results, skipping those files we have in a virtual
   // location
-  bool moreRegular  = !scan->regularComplete;
+  bool moreRegular  = !m_regularComplete;
   bool dataReturned = false;
   while (moreRegular && !dataReturned) {
     dataRead = query.length;
 
-    HANDLE handle = scan->currentSearchHandle;
+    HANDLE handle = m_currentSearchHandle;
     if (handle == INVALID_HANDLE_VALUE) {
       handle = query.handle;
     }
     NTSTATUS subRes =
         addNtSearchData(handle, query.fileName, L"", query.informationClass,
-                        FileInformationCurrent, dataRead, scan->foundFiles, query.event,
+                        FileInformationCurrent, dataRead, m_foundFiles, query.event,
                         query.apcRoutine, query.apcContext, query.isSingleEntry());
     moreRegular = subRes == STATUS_SUCCESS;
     if (moreRegular) {
       dataReturned = dataRead != 0;
     } else {
-      scan->regularComplete = true;
-      scan->foundFiles.clear();
-      if (scan->currentSearchHandle != INVALID_HANDLE_VALUE) {
-        ::CloseHandle(scan->currentSearchHandle);
-        scan->currentSearchHandle = INVALID_HANDLE_VALUE;
-      }
+      m_regularComplete = true;
+      m_foundFiles.clear();
+      closeSearchHandle();
     }
   }
   if (!moreRegular) {
     // add virtual results
-    while (!dataReturned && scan->virtualMatches.size() > 0) {
-      auto match = scan->virtualMatches.front();
+    while (!dataReturned && m_virtualMatches.size() > 0) {
+      auto match = m_virtualMatches.front();
       if (match.realPath.size() != 0) {
         dataRead = query.length;
         if (addVirtualSearchResult(FileInformationCurrent, query.informationClass,
-                                   *scan, match.realPath, match.virtualName,
+                                   match.realPath, match.virtualName,
                                    query.isSingleEntry(), dataRead)) {
           // a positive result here means the call returned data and there may
           // be further objects to be retrieved by repeating the call
@@ -427,9 +442,9 @@ NTSTATUS queryDirectory(const DirectoryQuery& query)
           // TODO: doesn't append search results from more than one redirection
           // per call. This is bad for performance but otherwise we'd need to
           // re-write the offsets between information objects
-          scan->virtualMatches.pop();
-          CloseHandle(scan->currentSearchHandle);
-          scan->currentSearchHandle = INVALID_HANDLE_VALUE;
+          m_virtualMatches.pop();
+          CloseHandle(m_currentSearchHandle);
+          m_currentSearchHandle = INVALID_HANDLE_VALUE;
         }
       }
     }
@@ -448,7 +463,7 @@ NTSTATUS queryDirectory(const DirectoryQuery& query)
   query.statusBlock->Status      = res;
   query.statusBlock->Information = dataRead;
 
-  size_t numVirtualFiles = scan->virtualMatches.size();
+  size_t numVirtualFiles = m_virtualMatches.size();
   if ((numVirtualFiles > 0)) {
     // log under the hook's name so both entry points stay distinguishable
     ulog::CallLogger(query.isEx ? "hook_NtQueryDirectoryFileEx"
@@ -464,14 +479,20 @@ NTSTATUS queryDirectory(const DirectoryQuery& query)
   return res;
 }
 
+NTSTATUS queryDirectory(const DirectoryQuery& query)
+{
+  if (!shouldVirtualize(query)) {
+    return queryNative(query);
+  }
+  return directoryScans.scanFor(query)->query(query);
+}
+
 bool eraseDirectoryScan(HANDLE handle)
 {
   const std::shared_ptr<DirectoryScan> scan = directoryScans.erase(handle);
   if (!scan) {
     return false;
   }
-  if (scan->currentSearchHandle != INVALID_HANDLE_VALUE) {
-    ::CloseHandle(scan->currentSearchHandle);
-  }
+  scan->closeSearchHandle();
   return true;
 }
