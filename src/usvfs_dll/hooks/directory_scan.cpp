@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <unordered_map>
@@ -267,29 +268,45 @@ gatherVirtualEntries(const UnicodeString& dirName,
   return matches;
 }
 
+// Opens the directory the regular entries are read from: the search path a hook
+// stored for the handle. Returns INVALID_HANDLE_VALUE if there is none or opening
+// it fails, in which case the caller's handle is read instead.
+HANDLE openRegularSource(const std::optional<std::wstring>& storedSearchPath)
+{
+  if (!storedSearchPath) {
+    return INVALID_HANDLE_VALUE;
+  }
+  return CreateFileW(storedSearchPath->c_str(), GENERIC_READ,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                     FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+}
+
 DirectoryScan::DirectoryScan(const DirectoryQuery& query)
 {
   using namespace usvfs;
 
-  HookContext::Ptr context = WRITE_CONTEXT();
+  // The stored search path also names the virtual directory, so it is looked up
+  // under the same context lock as the virtual entries.
+  std::optional<std::wstring> storedSearchPath;
+  {
+    HookContext::Ptr context = WRITE_CONTEXT();
 
-  SearchHandleMap& searchMap     = context->customData<SearchHandleMap>(SearchHandles);
-  SearchHandleMap::iterator iter = searchMap.find(query.handle);
-
-  UnicodeString searchPath;
-  if (iter != searchMap.end()) {
-    searchPath            = UnicodeString(iter->second.c_str());
-    m_currentSearchHandle = CreateFileW(
-        iter->second.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-  } else {
-    searchPath = ntdllHandleTracker.lookup(query.handle);
+    const SearchHandleMap& searchMap =
+        context->customData<SearchHandleMap>(SearchHandles);
+    if (const auto iter = searchMap.find(query.handle); iter != searchMap.end()) {
+      storedSearchPath = iter->second;
+    }
+    const UnicodeString searchPath = storedSearchPath
+                                         ? UnicodeString(storedSearchPath->c_str())
+                                         : ntdllHandleTracker.lookup(query.handle);
+    m_virtualMatches =
+        gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName);
   }
-  m_virtualMatches =
-      gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName);
   for (const VirtualMatch& match : m_virtualMatches) {
     m_foundFiles.insert(ush::to_upper(match.virtualName));
   }
+  // opened without the context lock, since CreateFileW reenters the hooks
+  m_currentSearchHandle = openRegularSource(storedSearchPath);
 }
 
 void DirectoryScan::closeSearchHandle()
