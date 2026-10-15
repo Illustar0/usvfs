@@ -2,6 +2,11 @@
 // pch.h from shared
 #include "pch.h"
 
+#include <algorithm>
+#include <latch>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include <hookcontext.h>
@@ -218,4 +223,80 @@ TEST_F(USVFSTest, NtQueryDirectoryFileRestartClosesReopenedHandle)
   EXPECT_EQ(handleCountBefore, handleCountAfter);
 
   usvfs::hook_NtClose(hdl);
+}
+
+namespace
+{
+
+// Lists a directory one entry per call, as long as the query succeeds.
+std::vector<std::wstring> listSingleEntries(HANDLE directory)
+{
+  std::vector<std::wstring> names;
+  IO_STATUS_BLOCK status;
+  char buffer[1024];
+  while (usvfs::hook_NtQueryDirectoryFile(
+             directory, nullptr, nullptr, nullptr, &status, buffer, sizeof(buffer),
+             FileDirectoryInformation, TRUE, nullptr, FALSE) == STATUS_SUCCESS) {
+    const auto* info = reinterpret_cast<FILE_DIRECTORY_INFORMATION*>(buffer);
+    names.emplace_back(info->FileName, info->FileNameLength / sizeof(WCHAR));
+  }
+  return names;
+}
+
+}  // namespace
+
+TEST_F(USVFSTest, NtQueryDirectoryFileSerializesConcurrentQueries)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  usvfs::RedirectionTreeContainer& tree = ctx->redirectionTable();
+
+  // virtual entries make each call long enough for the threads to overlap
+  for (int file = 0; file < 64; ++file) {
+    tree.addFile((L"C:\\usvfs_concurrent_" + std::to_wstring(file) + L".txt").c_str(),
+                 usvfs::RedirectionDataLocal(REAL_FILEA));
+  }
+
+  const auto openRoot = [] {
+    return hooked_NtOpenFile(L"C:\\", FILE_GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+  };
+
+  HANDLE serialHandle = openRoot();
+  ASSERT_NE(INVALID_HANDLE_VALUE, serialHandle);
+  std::vector<std::wstring> expected = listSingleEntries(serialHandle);
+  usvfs::hook_NtClose(serialHandle);
+  std::sort(expected.begin(), expected.end());
+  ASSERT_TRUE(std::binary_search(expected.begin(), expected.end(),
+                                 std::wstring(L"usvfs_concurrent_63.txt")))
+      << "the virtual entries must be listed, " << expected.size() << " names found";
+
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    HANDLE sharedHandle = openRoot();
+    ASSERT_NE(INVALID_HANDLE_VALUE, sharedHandle);
+
+    constexpr int THREAD_COUNT = 8;
+    std::latch start(THREAD_COUNT);
+    std::mutex namesMutex;
+    std::vector<std::wstring> names;
+    std::vector<std::thread> threads;
+    for (int thread = 0; thread < THREAD_COUNT; ++thread) {
+      threads.emplace_back([&] {
+        start.arrive_and_wait();
+        std::vector<std::wstring> threadNames = listSingleEntries(sharedHandle);
+        std::lock_guard lock(namesMutex);
+        names.insert(names.end(), threadNames.begin(), threadNames.end());
+      });
+    }
+    for (std::thread& thread : threads) {
+      thread.join();
+    }
+    usvfs::hook_NtClose(sharedHandle);
+
+    // every entry exactly once across all threads, like a single caller sees them
+    std::sort(names.begin(), names.end());
+    ASSERT_EQ(expected, names) << "attempt " << attempt;
+  }
 }

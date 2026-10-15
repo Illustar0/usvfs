@@ -197,7 +197,8 @@ public:
   explicit DirectoryScan(const DirectoryQuery& query);
 
   // Answers a query with the next entries of the scan. Like ntdll, reports the
-  // result both as the return value and in the status block.
+  // result both as the return value and in the status block. Queries on the same
+  // scan run one at a time, as ntdll runs them on a synchronous handle.
   NTSTATUS query(const DirectoryQuery& query);
 
 private:
@@ -208,6 +209,10 @@ private:
                               const std::wstring& virtualName,
                               BOOLEAN ReturnSingleEntry, ULONG& dataRead);
 
+  // Guards the state below. Taken after the registry lock is released; nested
+  // directory queries made while holding it go straight to ntdll, so it is never
+  // taken twice by one thread.
+  std::mutex m_mutex;
   CaseInsensitiveNameSet m_foundFiles;
   OwnedHandle m_currentSearchHandle;
   std::vector<VirtualMatch> m_virtualMatches;
@@ -526,6 +531,7 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
 
 NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
 {
+  std::lock_guard lock(m_mutex);
   const bool isFirstCall = std::exchange(m_isFirstCall, false);
 
   ULONG dataRead;
