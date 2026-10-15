@@ -6,6 +6,7 @@
 #include <set>
 #include <shared_mutex>
 #include <unordered_map>
+#include <utility>
 
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
@@ -129,12 +130,17 @@ struct DirectoryScan
     std::wstring virtualName;
   };
 
-  DirectoryScan() : currentSearchHandle(INVALID_HANDLE_VALUE) {}
+  // Starts the scan: picks the directory the regular entries are read from and
+  // gathers the virtual entries matching the pattern of the query.
+  explicit DirectoryScan(const DirectoryQuery& query);
+
   std::set<std::wstring> foundFiles;
-  HANDLE currentSearchHandle;
+  HANDLE currentSearchHandle{INVALID_HANDLE_VALUE};
   std::queue<VirtualMatch> virtualMatches;
   UnicodeString searchPattern;
   bool regularComplete{false};
+  // an empty result is STATUS_NO_SUCH_FILE on the first call only
+  bool isFirstCall{true};
 };
 
 // The scans of all directory handles. The lock is a leaf: nothing else is called
@@ -142,21 +148,31 @@ struct DirectoryScan
 class DirectoryScans
 {
 public:
-  // Returns the scan of a handle, or an empty pointer if it has none.
-  std::shared_ptr<DirectoryScan> find(HANDLE handle) const
+  // Returns the scan serving a query: a new one on the first query of a handle or
+  // on a restart, the current one otherwise.
+  std::shared_ptr<DirectoryScan> scanFor(const DirectoryQuery& query)
   {
-    std::shared_lock lock(m_mutex);
-    const auto entry = m_scans.find(handle);
-    return entry != m_scans.end() ? entry->second : nullptr;
-  }
-
-  // Returns the scan of a handle, starting an empty one if it has none.
-  std::shared_ptr<DirectoryScan> findOrCreate(HANDLE handle)
-  {
-    // created before locking, so that an unused one is destroyed after unlocking
-    auto scan = std::make_shared<DirectoryScan>();
+    std::shared_ptr<DirectoryScan> current = find(query.handle);
+    if (current && !query.isRestart()) {
+      return current;
+    }
+    // tradeoff time: we store this search status even if no virtual results
+    // were found. This causes a little extra cost here and in NtClose every
+    // time a non-virtual dir is being searched. However if we don't,
+    // whenever NtQueryDirectoryFile is called another time on the same handle,
+    // this (expensive) construction would be run again.
+    //
+    // Constructed without the lock, since construction takes the hook context
+    // lock and reenters hooks. Declared before the lock, so that a scan that is
+    // unused or replaced is destroyed after unlocking.
+    auto scan = std::make_shared<DirectoryScan>(query);
     std::unique_lock lock(m_mutex);
-    return m_scans.try_emplace(handle, std::move(scan)).first->second;
+    const auto [entry, isInserted] = m_scans.try_emplace(query.handle, scan);
+    if (!isInserted && query.isRestart()) {
+      entry->second.swap(scan);
+    }
+    // concurrent first queries on one handle: the first scan inserted wins
+    return entry->second;
   }
 
   // Removes the scan of a handle and returns it, so that the caller destroys it
@@ -169,6 +185,14 @@ public:
   }
 
 private:
+  // Returns the scan of a handle, or an empty pointer if it has none.
+  std::shared_ptr<DirectoryScan> find(HANDLE handle) const
+  {
+    std::shared_lock lock(m_mutex);
+    const auto entry = m_scans.find(handle);
+    return entry != m_scans.end() ? entry->second : nullptr;
+  }
+
   mutable std::shared_mutex m_mutex;
   std::unordered_map<HANDLE, std::shared_ptr<DirectoryScan>> m_scans;
 };
@@ -220,6 +244,28 @@ void gatherVirtualEntries(const UnicodeString& dirName,
       }
     }
   }
+}
+
+DirectoryScan::DirectoryScan(const DirectoryQuery& query)
+{
+  using namespace usvfs;
+
+  HookContext::Ptr context = WRITE_CONTEXT();
+  searchPattern.appendPath(query.fileName);
+
+  SearchHandleMap& searchMap     = context->customData<SearchHandleMap>(SearchHandles);
+  SearchHandleMap::iterator iter = searchMap.find(query.handle);
+
+  UnicodeString searchPath;
+  if (iter != searchMap.end()) {
+    searchPath          = UnicodeString(iter->second.c_str());
+    currentSearchHandle = CreateFileW(
+        iter->second.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  } else {
+    searchPath = ntdllHandleTracker.lookup(query.handle);
+  }
+  gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName, *this);
 }
 
 /**
@@ -326,44 +372,12 @@ bool shouldVirtualize(const DirectoryQuery& query)
 //   first search result of wildcard searches which may confuse the caller
 NTSTATUS queryDirectory(const DirectoryQuery& query)
 {
-  using namespace usvfs;
-
   if (!shouldVirtualize(query)) {
     return queryNative(query);
   }
 
-  if (query.isRestart()) {
-    directoryScans.erase(query.handle);
-  }
-
-  std::shared_ptr<DirectoryScan> scan = directoryScans.find(query.handle);
-  const bool firstSearch              = !scan;
-
-  if (firstSearch) {
-    HookContext::Ptr context = WRITE_CONTEXT();
-    // tradeoff time: we store this search status even if no virtual results
-    // were found. This causes a little extra cost here and in NtClose every
-    // time a non-virtual dir is being searched. However if we don't,
-    // whenever NtQueryDirectoryFile is called another time on the same handle,
-    // this (expensive) block would be run again.
-    scan = directoryScans.findOrCreate(query.handle);
-    scan->searchPattern.appendPath(query.fileName);
-
-    SearchHandleMap& searchMap = context->customData<SearchHandleMap>(SearchHandles);
-    SearchHandleMap::iterator iter = searchMap.find(query.handle);
-
-    UnicodeString searchPath;
-    if (iter != searchMap.end()) {
-      searchPath                = UnicodeString(iter->second.c_str());
-      scan->currentSearchHandle = CreateFileW(
-          iter->second.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-          nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    } else {
-      searchPath = ntdllHandleTracker.lookup(query.handle);
-    }
-    gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName,
-                         *scan);
-  }
+  const std::shared_ptr<DirectoryScan> scan = directoryScans.scanFor(query);
+  const bool isFirstCall                    = std::exchange(scan->isFirstCall, false);
 
   ULONG dataRead               = query.length;
   PVOID FileInformationCurrent = query.buffer;
@@ -423,7 +437,7 @@ NTSTATUS queryDirectory(const DirectoryQuery& query)
 
   NTSTATUS res;
   if (!dataReturned) {
-    if (firstSearch) {
+    if (isFirstCall) {
       res = STATUS_NO_SUCH_FILE;
     } else {
       res = STATUS_NO_MORE_FILES;
