@@ -30,10 +30,27 @@ namespace bfs  = boost::filesystem;
 
 using usvfs::UnicodeString;
 
+// File names compared without regard to case, as shadowing and deduplication
+// compare them.
+class CaseInsensitiveNameSet
+{
+public:
+  // Returns whether the name was not in the set yet.
+  bool insert(const std::wstring& name)
+  {
+    return m_upperNames.insert(ush::to_upper(name)).second;
+  }
+
+  void clear() { m_upperNames.clear(); }
+
+private:
+  std::set<std::wstring> m_upperNames;
+};
+
 NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
                          const std::wstring& fakeName,
                          FILE_INFORMATION_CLASS FileInformationClass, PVOID& buffer,
-                         ULONG& bufferSize, std::set<std::wstring>& foundFiles,
+                         ULONG& bufferSize, CaseInsensitiveNameSet& foundFiles,
                          HANDLE event, PIO_APC_ROUTINE apcRoutine, PVOID apcContext,
                          BOOLEAN returnSingleEntry)
 {
@@ -75,8 +92,8 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
         }
         bool add = true;
         if (fileName.length() > 0) {
-          auto insertRes = foundFiles.insert(ush::to_upper(fileName));
-          add = insertRes.second;  // add only if we didn't find this file before
+          // add only if we didn't find this file before
+          add = foundFiles.insert(fileName);
         }
         if (!add) {
           if (lastSkipPos == nullptr) {
@@ -152,7 +169,7 @@ private:
                               const std::wstring& virtualName,
                               BOOLEAN ReturnSingleEntry, ULONG& dataRead);
 
-  std::set<std::wstring> m_foundFiles;
+  CaseInsensitiveNameSet m_foundFiles;
   HANDLE m_currentSearchHandle{INVALID_HANDLE_VALUE};
   std::vector<VirtualMatch> m_virtualMatches;
   // index of the next match to return; the ones before it are done
@@ -303,7 +320,7 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query)
         gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName);
   }
   for (const VirtualMatch& match : m_virtualMatches) {
-    m_foundFiles.insert(ush::to_upper(match.virtualName));
+    m_foundFiles.insert(match.virtualName);
   }
   // opened without the context lock, since CreateFileW reenters the hooks
   m_currentSearchHandle = openRegularSource(storedSearchPath);
