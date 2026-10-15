@@ -2,11 +2,11 @@
 
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <set>
 #include <shared_mutex>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
@@ -116,6 +116,18 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
   return res;
 }
 
+// A virtual entry of the scanned directory.
+struct VirtualMatch
+{
+  // full path to where the file/directory actually is
+  std::wstring realPath;
+  // virtual filename (only filename since it has to be within the searched
+  // directory)
+  // this is left empty when a folder with all its content is mapped to the
+  // search directory
+  std::wstring virtualName;
+};
+
 // The state of one scan: the queries on a handle from its first query or restart on.
 class DirectoryScan
 {
@@ -133,21 +145,6 @@ public:
 
 private:
   NTSTATUS fill(const DirectoryQuery& query, ULONG& dataRead);
-
-  struct VirtualMatch
-  {
-    // full path to where the file/directory actually is
-    std::wstring realPath;
-    // virtual filename (only filename since it has to be within the searched
-    // directory)
-    // this is left empty when a folder with all its content is mapped to the
-    // search directory
-    std::wstring virtualName;
-  };
-
-  void gatherVirtualEntries(const UnicodeString& dirName,
-                            const usvfs::RedirectionTreeContainer& redir,
-                            PUNICODE_STRING FileName);
   bool addVirtualSearchResult(PVOID& FileInformation,
                               FILE_INFORMATION_CLASS FileInformationClass,
                               const std::wstring& realPath,
@@ -156,7 +153,9 @@ private:
 
   std::set<std::wstring> m_foundFiles;
   HANDLE m_currentSearchHandle{INVALID_HANDLE_VALUE};
-  std::queue<VirtualMatch> m_virtualMatches;
+  std::vector<VirtualMatch> m_virtualMatches;
+  // index of the next match to return; the ones before it are done
+  size_t m_nextVirtualMatch{0};
   bool m_regularComplete{false};
   // an empty result is STATUS_NO_SUCH_FILE on the first call only
   bool m_isFirstCall{true};
@@ -220,10 +219,13 @@ private:
 // running while the DLL unloads do not touch a destroyed registry.
 DirectoryScans& directoryScans = *new DirectoryScans;
 
-void DirectoryScan::gatherVirtualEntries(const UnicodeString& dirName,
-                                         const usvfs::RedirectionTreeContainer& redir,
-                                         PUNICODE_STRING FileName)
+// Returns the virtual entries of a directory that match the pattern of a query.
+std::vector<VirtualMatch>
+gatherVirtualEntries(const UnicodeString& dirName,
+                     const usvfs::RedirectionTreeContainer& redir,
+                     PUNICODE_STRING FileName)
 {
+  std::vector<VirtualMatch> matches;
   LPCWSTR dirNameW = static_cast<LPCWSTR>(dirName);
   // fix directory name. I'd love to know why microsoft sometimes uses "\??\" vs
   // "\\?\"
@@ -258,11 +260,11 @@ void DirectoryScan::gatherVirtualEntries(const UnicodeString& dirName,
                vName};
         }
 
-        m_virtualMatches.push(m);
-        m_foundFiles.insert(ush::to_upper(vName));
+        matches.push_back(std::move(m));
       }
     }
   }
+  return matches;
 }
 
 DirectoryScan::DirectoryScan(const DirectoryQuery& query)
@@ -283,7 +285,11 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query)
   } else {
     searchPath = ntdllHandleTracker.lookup(query.handle);
   }
-  gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName);
+  m_virtualMatches =
+      gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName);
+  for (const VirtualMatch& match : m_virtualMatches) {
+    m_foundFiles.insert(ush::to_upper(match.virtualName));
+  }
 }
 
 void DirectoryScan::closeSearchHandle()
@@ -430,8 +436,8 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
   }
   if (!moreRegular) {
     // add virtual results
-    while (!dataReturned && m_virtualMatches.size() > 0) {
-      auto match = m_virtualMatches.front();
+    while (!dataReturned && m_nextVirtualMatch < m_virtualMatches.size()) {
+      const VirtualMatch& match = m_virtualMatches[m_nextVirtualMatch];
       if (match.realPath.size() != 0) {
         dataRead = query.length;
         if (addVirtualSearchResult(FileInformationCurrent, query.informationClass,
@@ -446,7 +452,7 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
           // TODO: doesn't append search results from more than one redirection
           // per call. This is bad for performance but otherwise we'd need to
           // re-write the offsets between information objects
-          m_virtualMatches.pop();
+          ++m_nextVirtualMatch;
           CloseHandle(m_currentSearchHandle);
           m_currentSearchHandle = INVALID_HANDLE_VALUE;
         }
@@ -468,7 +474,7 @@ NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
   query.statusBlock->Status      = res;
   query.statusBlock->Information = dataRead;
 
-  size_t numVirtualFiles = m_virtualMatches.size();
+  size_t numVirtualFiles = m_virtualMatches.size() - m_nextVirtualMatch;
   if ((numVirtualFiles > 0)) {
     // log under the hook's name so both entry points stay distinguishable
     ulog::CallLogger(query.isEx ? "hook_NtQueryDirectoryFileEx"
