@@ -21,6 +21,7 @@
 
 #include "../hookcontext.h"
 
+#include "directory_records.h"
 #include "file_information_utils.h"
 #include "handle_tracker.h"
 #include "sharedids.h"
@@ -467,6 +468,20 @@ NTSTATUS queryNative(const DirectoryQuery& query)
       query.fileName, query.isRestart());
 }
 
+// Returns the alignment ntdll requires of the buffer of a query.
+ULONG requiredBufferAlignment(const DirectoryQuery& query,
+                              const DirectoryRecordLayout& layout)
+{
+  if constexpr (sizeof(void*) == 8) {
+    return layout.alignment;
+  } else {
+    // usvfs_x86 runs under WOW64, where the kernel requires only 4-byte alignment,
+    // and wow64.dll copies a legacy query whose buffer is not 8-byte aligned through
+    // an aligned buffer of its own; it passes the buffer of an Ex query on as it is
+    return query.isEx ? 4 : 1;
+  }
+}
+
 // Returns whether the virtual listing can serve this query.
 bool shouldVirtualize(const DirectoryQuery& query)
 {
@@ -487,24 +502,18 @@ bool shouldVirtualize(const DirectoryQuery& query)
   if (query.event || query.apcRoutine || query.apcContext) {
     return false;
   }
-  // the virtual listing can only filter and rename records that carry a FileName
-  switch (query.informationClass) {
-  case FileDirectoryInformation:
-  case FileFullDirectoryInformation:
-  case FileBothDirectoryInformation:
-  case FileNamesInformation:
-  case FileIdBothDirectoryInformation:
-  case FileIdFullDirectoryInformation:
-  case FileIdExtdDirectoryInformation:
-  case FileIdExtdBothDirectoryInformation:
-  case FileId64ExtdDirectoryInformation:
-  case FileId64ExtdBothDirectoryInformation:
-  case FileIdAllExtdDirectoryInformation:
-  case FileIdAllExtdBothDirectoryInformation:
-    return true;
-  default:
+  const std::optional<DirectoryRecordLayout> layout =
+      findDirectoryRecordLayout(query.informationClass);
+  if (!layout) {
     return false;
   }
+  // ntdll rejects a buffer that cannot hold a record or is misaligned, so it is left
+  // to: the internal reads into that buffer would fail too, and the virtual listing
+  // would then report an empty directory instead of the error
+  return query.length >= layout->minimumLength &&
+         reinterpret_cast<uintptr_t>(query.buffer) %
+                 requiredBufferAlignment(query, *layout) ==
+             0;
 }
 
 // this is quite messy...

@@ -3,6 +3,7 @@
 #include "pch.h"
 
 #include <algorithm>
+#include <format>
 #include <latch>
 #include <mutex>
 #include <ostream>
@@ -641,4 +642,123 @@ TEST_F(USVFSTest, NtQueryDirectoryFileReportsNoBytesPastTheLastEntry)
 
   usvfs::hook_NtClose(nativeHandle);
   usvfs::hook_NtClose(hookedHandle);
+}
+
+namespace
+{
+
+const FILE_INFORMATION_CLASS DIRECTORY_INFORMATION_CLASSES[] = {
+    FileDirectoryInformation,          FileFullDirectoryInformation,
+    FileBothDirectoryInformation,      FileNamesInformation,
+    FileIdBothDirectoryInformation,    FileIdFullDirectoryInformation,
+    FileIdExtdDirectoryInformation,    FileIdExtdBothDirectoryInformation,
+    FileId64ExtdDirectoryInformation,  FileId64ExtdBothDirectoryInformation,
+    FileIdAllExtdDirectoryInformation, FileIdAllExtdBothDirectoryInformation,
+};
+
+struct BufferQuery
+{
+  FILE_INFORMATION_CLASS informationClass;
+  bool isEx;
+  // bytes past an 8-byte boundary
+  size_t offset;
+  ULONG length;
+};
+
+std::string describe(const BufferQuery& query)
+{
+  return std::format("class {}, {} entry point, offset {}, length {:#x}",
+                     static_cast<int>(query.informationClass),
+                     query.isEx ? "Ex" : "legacy", query.offset, query.length);
+}
+
+// Queries through the entry point of the query, restarting the scan so that every
+// query starts from the same state.
+QueryOutcome queryBuffer(bool isNative, HANDLE directory, const BufferQuery& query,
+                         PUNICODE_STRING fileName)
+{
+  QueryOutcome outcome;
+  outcome.statusBlock.Status      = UNWRITTEN_STATUS;
+  outcome.statusBlock.Information = UNWRITTEN_INFORMATION;
+  alignas(8) char storage[0x1000 + 8];
+  PVOID buffer = storage + query.offset;
+
+  if (query.isEx) {
+    const auto exQuery =
+        isNative ? reinterpret_cast<NtQueryDirectoryFileEx_type>(::GetProcAddress(
+                       ::GetModuleHandleW(L"ntdll.dll"), "NtQueryDirectoryFileEx"))
+                 : &usvfs::hook_NtQueryDirectoryFileEx;
+    outcome.result =
+        exQuery(directory, nullptr, nullptr, nullptr, &outcome.statusBlock, buffer,
+                query.length, query.informationClass, SL_RESTART_SCAN, fileName);
+  } else {
+    const auto legacyQuery =
+        isNative ? nativeQueryDirectoryFile() : &usvfs::hook_NtQueryDirectoryFile;
+    outcome.result =
+        legacyQuery(directory, nullptr, nullptr, nullptr, &outcome.statusBlock, buffer,
+                    query.length, query.informationClass, FALSE, fileName, TRUE);
+  }
+  return outcome;
+}
+
+// Expects the hook to reject a buffer that ntdll rejects, with the same result,
+// and, if asked to, to list the virtual entries into a buffer that ntdll accepts.
+void expectBufferHandledLikeNtdll(const BufferQuery& query, bool shouldListIfAccepted)
+{
+  SCOPED_TRACE(describe(query));
+  HANDLE nativeHandle = openRootDirectory(true);
+  HANDLE hookedHandle = openRootDirectory(true);
+  ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+  const QueryOutcome expected = queryBuffer(true, nativeHandle, query, nullptr);
+  // ntdll leaves the status block alone when it rejects the buffer, and fills it
+  // for a buffer it accepts, the root directory not being empty
+  if (expected.statusBlock.Status == UNWRITTEN_STATUS) {
+    expectSameOutcome(expected, queryBuffer(false, hookedHandle, query, nullptr));
+  } else if (shouldListIfAccepted) {
+    usvfs::UnicodeString pattern(L"usvfs_notified_a.txt");
+    const QueryOutcome actual =
+        queryBuffer(false, hookedHandle, query, static_cast<PUNICODE_STRING>(pattern));
+    EXPECT_EQ(STATUS_SUCCESS, actual.result) << "the virtual entry is not listed";
+  }
+
+  usvfs::hook_NtClose(nativeHandle);
+  usvfs::hook_NtClose(hookedHandle);
+}
+
+}  // namespace
+
+TEST_F(USVFSTest, NtQueryDirectoryFileRejectsUndersizedBuffersLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  addVirtualEntries(ctx->redirectionTable());
+
+  // every length up to past the largest minimum, 0x80; whether a small buffer that
+  // ntdll accepts lists the virtual entries is up to how the hook fills it
+  for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
+    for (const bool isEx : {false, true}) {
+      for (ULONG length = 0; length <= 0x88; ++length) {
+        expectBufferHandledLikeNtdll({informationClass, isEx, 0, length}, false);
+      }
+    }
+  }
+}
+
+TEST_F(USVFSTest, NtQueryDirectoryFileRejectsMisalignedBuffersLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  addVirtualEntries(ctx->redirectionTable());
+
+  for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
+    for (const bool isEx : {false, true}) {
+      for (size_t offset = 0; offset < 8; ++offset) {
+        expectBufferHandledLikeNtdll({informationClass, isEx, offset, 0x1000}, true);
+      }
+    }
+  }
 }
