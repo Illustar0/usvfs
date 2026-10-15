@@ -8,10 +8,25 @@ namespace
 {
 
 template <typename Record>
+constexpr std::optional<ShortNameFields> shortNameFieldsOf()
+{
+  if constexpr (requires(Record record) { record.ShortName; }) {
+    return ShortNameFields{.lengthOffset = offsetof(Record, ShortNameLength),
+                           .offset       = offsetof(Record, ShortName)};
+  } else {
+    return std::nullopt;
+  }
+}
+
+template <typename Record>
 constexpr DirectoryRecordLayout layoutOf(FILE_INFORMATION_CLASS informationClass)
 {
-  return {informationClass, sizeof(Record), alignof(Record),
-          offsetof(Record, FileNameLength), offsetof(Record, FileName)};
+  return {.informationClass     = informationClass,
+          .minimumLength        = sizeof(Record),
+          .alignment            = alignof(Record),
+          .fileNameLengthOffset = offsetof(Record, FileNameLength),
+          .fileNameOffset       = offsetof(Record, FileName),
+          .shortName            = shortNameFieldsOf<Record>()};
 }
 
 // The minimum lengths and alignments are those BuildQueryDirectoryIrp in ntoskrnl

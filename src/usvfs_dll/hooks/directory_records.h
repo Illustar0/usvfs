@@ -7,6 +7,13 @@
 
 #include <ntdll_declarations.h>
 
+// The 8.3 name of a record: a CCHAR byte count and a WCHAR[12] array.
+struct ShortNameFields
+{
+  ULONG lengthOffset;
+  ULONG offset;
+};
+
 // The records one directory information class returns.
 struct DirectoryRecordLayout
 {
@@ -17,6 +24,8 @@ struct DirectoryRecordLayout
   ULONG alignment;
   ULONG fileNameLengthOffset;
   ULONG fileNameOffset;
+  // only the classes with "Both" in their name carry an 8.3 name
+  std::optional<ShortNameFields> shortName;
 };
 
 // Returns the layout of the records of a directory information class whose records

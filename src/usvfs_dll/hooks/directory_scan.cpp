@@ -1,11 +1,14 @@
 #include "directory_scan.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <shared_mutex>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -22,7 +25,6 @@
 #include "../hookcontext.h"
 
 #include "directory_records.h"
-#include "file_information_utils.h"
 #include "handle_tracker.h"
 #include "sharedids.h"
 
@@ -49,6 +51,37 @@ private:
   std::set<std::wstring> m_upperNames;
 };
 
+// Gives a record in the buffer another name. Keeps what the stock code did until
+// the virtual entries are written through DirectoryOutput: the new name is written
+// over the old one even when it is longer, and an 8.3 name, if the record has one,
+// is replaced by what GetShortPathNameW makes of the new name, relative to the
+// current directory, stored as a count of characters.
+void renameRecord(const DirectoryRecordLayout& layout, PVOID record,
+                  const std::wstring& name)
+{
+  auto* bytes = static_cast<std::byte*>(record);
+  ULONG fileNameLength;
+  std::memcpy(&fileNameLength, bytes + layout.fileNameLengthOffset,
+              sizeof(fileNameLength));
+  std::memset(bytes + layout.fileNameOffset, 0, fileNameLength);
+  fileNameLength = static_cast<ULONG>(name.length() * sizeof(WCHAR));
+  std::memcpy(bytes + layout.fileNameLengthOffset, &fileNameLength,
+              sizeof(fileNameLength));
+  std::memcpy(bytes + layout.fileNameOffset, name.c_str(), fileNameLength);
+
+  if (layout.shortName) {
+    CCHAR shortNameLength;
+    std::memcpy(&shortNameLength, bytes + layout.shortName->lengthOffset,
+                sizeof(shortNameLength));
+    if (shortNameLength > 0) {
+      shortNameLength = static_cast<CCHAR>(GetShortPathNameW(
+          name.c_str(), reinterpret_cast<LPWSTR>(bytes + layout.shortName->offset), 8));
+      std::memcpy(bytes + layout.shortName->lengthOffset, &shortNameLength,
+                  sizeof(shortNameLength));
+    }
+  }
+}
+
 NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
                          const std::wstring& fakeName,
                          FILE_INFORMATION_CLASS FileInformationClass, PVOID& buffer,
@@ -69,13 +102,18 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
     if ((res != STATUS_SUCCESS) || (status.Information <= 0)) {
       bufferSize = 0UL;
     } else {
+      // shouldVirtualize lets through only the classes that have a layout
+      const DirectoryRecordLayout layout =
+          findDirectoryRecordLayout(FileInformationClass).value();
       ULONG totalOffset = 0;
       PVOID lastSkipPos = nullptr;
 
       while (totalOffset < status.Information) {
-        ULONG offset;
-        std::wstring fileName;
-        GetFileInformationData(FileInformationClass, buffer, offset, fileName);
+        const DirectoryRecord record(layout,
+                                     std::span(static_cast<const std::byte*>(buffer),
+                                               status.Information - totalOffset));
+        ULONG offset          = record.nextEntryOffset();
+        std::wstring fileName = record.fileName();
         // in case this is a single-file search result and the specified
         // filename differs from the file name found, replace it in the
         // information structure
@@ -90,7 +128,7 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
           }
           // WARNING for the case where the fake name is longer this needs to
           // move back all further results and update the offset first
-          SetFileInformationFileName(FileInformationClass, buffer, fakeName);
+          renameRecord(layout, buffer, fakeName);
           fileName = fakeName;
         }
         bool add = true;
@@ -131,7 +169,9 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
       }
     }
     if (lastValidRecord != nullptr) {
-      SetFileInformationOffset(FileInformationClass, lastValidRecord, 0);
+      // NextEntryOffset, the first field of every directory record
+      const ULONG lastEntryOffset = 0;
+      std::memcpy(lastValidRecord, &lastEntryOffset, sizeof(lastEntryOffset));
     }
   }
   return res;
