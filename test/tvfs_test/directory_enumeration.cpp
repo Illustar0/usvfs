@@ -3,20 +3,29 @@
 #include "pch.h"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstring>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <latch>
 #include <mutex>
 #include <ostream>
+#include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include <hookcontext.h>
+#include <hooks/directory_records.h>
 #include <hooks/ntdll.h>
 #include <unicodestring.h>
 
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
+#include <test_helpers.h>
 
 #include "tvfs_test.h"
 
@@ -761,4 +770,203 @@ TEST_F(USVFSTest, NtQueryDirectoryFileRejectsMisalignedBuffersLikeNtdll)
       }
     }
   }
+}
+
+namespace
+{
+
+template <FILE_INFORMATION_CLASS InformationClass, typename Record>
+struct RecordType
+{
+  static constexpr FILE_INFORMATION_CLASS informationClass = InformationClass;
+  using Type                                               = Record;
+};
+
+using RecordTypes = ::testing::Types<
+    RecordType<FileDirectoryInformation, FILE_DIRECTORY_INFORMATION>,
+    RecordType<FileFullDirectoryInformation, FILE_FULL_DIR_INFORMATION>,
+    RecordType<FileBothDirectoryInformation, FILE_BOTH_DIR_INFORMATION>,
+    RecordType<FileNamesInformation, FILE_NAMES_INFORMATION>,
+    RecordType<FileIdBothDirectoryInformation, FILE_ID_BOTH_DIR_INFORMATION>,
+    RecordType<FileIdFullDirectoryInformation, FILE_ID_FULL_DIR_INFORMATION>,
+    RecordType<FileIdExtdDirectoryInformation, FILE_ID_EXTD_DIR_INFORMATION>,
+    RecordType<FileIdExtdBothDirectoryInformation, FILE_ID_EXTD_BOTH_DIR_INFORMATION>,
+    RecordType<FileId64ExtdDirectoryInformation, FILE_ID_64_EXTD_DIR_INFORMATION>,
+    RecordType<FileId64ExtdBothDirectoryInformation,
+               FILE_ID_64_EXTD_BOTH_DIR_INFORMATION>,
+    RecordType<FileIdAllExtdDirectoryInformation, FILE_ID_ALL_EXTD_DIR_INFORMATION>,
+    RecordType<FileIdAllExtdBothDirectoryInformation,
+               FILE_ID_ALL_EXTD_BOTH_DIR_INFORMATION>>;
+
+// A record built through the fields of its declared structure, so that it does not
+// depend on the offsets in the layout table it is read with.
+template <typename Record>
+struct SyntheticRecord
+{
+  alignas(Record) std::array<std::byte, 0x400> storage{};
+  size_t size = 0;
+
+  SyntheticRecord(std::wstring_view name, ULONG nextEntryOffset)
+  {
+    auto* fields            = reinterpret_cast<Record*>(storage.data());
+    fields->NextEntryOffset = nextEntryOffset;
+    fields->FileNameLength  = static_cast<ULONG>(name.size() * sizeof(WCHAR));
+    std::memcpy(storage.data() + offsetof(Record, FileName), name.data(),
+                fields->FileNameLength);
+    size = offsetof(Record, FileName) + fields->FileNameLength;
+  }
+
+  std::span<const std::byte> bytes() const { return std::span(storage).first(size); }
+};
+
+template <typename T>
+class DirectoryRecordTest : public ::testing::Test
+{
+protected:
+  using Record = typename T::Type;
+
+  static DirectoryRecordLayout layout()
+  {
+    return findDirectoryRecordLayout(T::informationClass).value();
+  }
+};
+
+// A directory on the volume the tests run from, which differs from the system one on
+// a ReFS Dev Drive. Its names take every length up to 64 characters, so that records
+// end at every offset modulo 8.
+std::filesystem::path generatedListingDirectory()
+{
+  const std::filesystem::path directory = test::path_of_test_temp(L"directory_records");
+  std::filesystem::create_directories(directory);
+  for (size_t length = 1; length <= 64; ++length) {
+    std::ofstream(directory / std::wstring(length, L'n'));
+  }
+  return directory;
+}
+
+// The directories whose native listings the records are checked against, one per
+// filesystem when the tests run from a volume other than NTFS.
+std::vector<std::filesystem::path> nativeListingDirectories()
+{
+  return {L"C:\\Windows", generatedListingDirectory()};
+}
+
+std::wstring fileSystemOf(const std::filesystem::path& path)
+{
+  std::wstring volume(MAX_PATH, L'\0');
+  std::wstring fileSystem(MAX_PATH, L'\0');
+  if (!::GetVolumePathNameW(path.c_str(), volume.data(), MAX_PATH) ||
+      !::GetVolumeInformationW(volume.c_str(), nullptr, 0, nullptr, nullptr, nullptr,
+                               fileSystem.data(), MAX_PATH)) {
+    return L"unknown";
+  }
+  return fileSystem.c_str();
+}
+
+std::string describeDirectory(const std::filesystem::path& path)
+{
+  return std::format("{} ({})", path.string(),
+                     std::filesystem::path(fileSystemOf(path)).string());
+}
+
+// Lists a directory through ntdll and reads the names with DirectoryRecord.
+std::vector<std::wstring> listWithDirectoryRecords(const std::filesystem::path& path,
+                                                   const DirectoryRecordLayout& layout)
+{
+  const HANDLE directory = ::CreateFileW(
+      path.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  EXPECT_NE(INVALID_HANDLE_VALUE, directory);
+
+  std::vector<std::wstring> names;
+  std::vector<std::byte> buffer(0x10000);
+  IO_STATUS_BLOCK statusBlock;
+  while (nativeQueryDirectoryFile()(directory, nullptr, nullptr, nullptr, &statusBlock,
+                                    buffer.data(), static_cast<ULONG>(buffer.size()),
+                                    layout.informationClass, FALSE, nullptr,
+                                    FALSE) == STATUS_SUCCESS) {
+    std::span<const std::byte> data(buffer.data(), statusBlock.Information);
+    for (;;) {
+      const DirectoryRecord record(layout, data);
+      EXPECT_FALSE(record.isTruncated());
+      names.push_back(record.fileName());
+      if (record.nextEntryOffset() == 0) {
+        break;
+      }
+      data = data.subspan(record.nextEntryOffset());
+    }
+  }
+  ::CloseHandle(directory);
+  std::ranges::sort(names);
+  return names;
+}
+
+std::vector<std::wstring> listWithFindFirstFile(const std::filesystem::path& path)
+{
+  std::vector<std::wstring> names;
+  WIN32_FIND_DATAW data;
+  const HANDLE search = ::FindFirstFileW((path / L"*").c_str(), &data);
+  EXPECT_NE(INVALID_HANDLE_VALUE, search);
+  do {
+    names.emplace_back(data.cFileName);
+  } while (::FindNextFileW(search, &data));
+  ::FindClose(search);
+  std::ranges::sort(names);
+  return names;
+}
+
+}  // namespace
+
+TYPED_TEST_SUITE(DirectoryRecordTest, RecordTypes);
+
+TYPED_TEST(DirectoryRecordTest, ReadsTheFieldsOfARecord)
+{
+  const SyntheticRecord<typename TestFixture::Record> synthetic(L"usvfs.txt", 0x100);
+  const DirectoryRecord record(TestFixture::layout(), synthetic.bytes());
+
+  EXPECT_EQ(0x100u, record.nextEntryOffset());
+  EXPECT_EQ(synthetic.size, record.size());
+  EXPECT_FALSE(record.isTruncated());
+  EXPECT_EQ(L"usvfs.txt", record.fileName());
+}
+
+TYPED_TEST(DirectoryRecordTest, ReadsACutRecordAsTruncated)
+{
+  const SyntheticRecord<typename TestFixture::Record> synthetic(L"usvfs.txt", 0);
+  const DirectoryRecord record(TestFixture::layout(),
+                               synthetic.bytes().first(synthetic.size - sizeof(WCHAR)));
+
+  EXPECT_EQ(synthetic.size, record.size());
+  EXPECT_TRUE(record.isTruncated());
+  EXPECT_EQ(L"usvfs.tx", record.fileName());
+}
+
+TYPED_TEST(DirectoryRecordTest, ReadsBytesShortOfTheFixedFieldsAsTruncated)
+{
+  const SyntheticRecord<typename TestFixture::Record> synthetic(L"usvfs.txt", 0x100);
+  const DirectoryRecord record(TestFixture::layout(), synthetic.bytes().first(2));
+
+  EXPECT_EQ(0u, record.nextEntryOffset());
+  EXPECT_TRUE(record.isTruncated());
+  EXPECT_EQ(L"", record.fileName());
+}
+
+// ntdll is the reference for the declared structures the layout table derives from
+TYPED_TEST(DirectoryRecordTest, ReadsTheNamesNtdllWrites)
+{
+  for (const std::filesystem::path& directory : nativeListingDirectories()) {
+    SCOPED_TRACE(describeDirectory(directory));
+    const std::vector<std::wstring> names =
+        listWithDirectoryRecords(directory, TestFixture::layout());
+
+    ASSERT_LT(2u, names.size());
+    EXPECT_EQ(listWithFindFirstFile(directory), names);
+  }
+}
+
+TEST(DirectoryRecordLayoutTest, KnowsOnlyClassesWhoseRecordsCarryAFileName)
+{
+  EXPECT_TRUE(findDirectoryRecordLayout(FileDirectoryInformation).has_value());
+  EXPECT_FALSE(findDirectoryRecordLayout(FileStandardInformation).has_value());
+  EXPECT_FALSE(findDirectoryRecordLayout(FileObjectIdInformation).has_value());
 }

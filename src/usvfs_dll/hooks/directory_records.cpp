@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 
 namespace
 {
@@ -9,7 +10,8 @@ namespace
 template <typename Record>
 constexpr DirectoryRecordLayout layoutOf(FILE_INFORMATION_CLASS informationClass)
 {
-  return {informationClass, sizeof(Record), alignof(Record)};
+  return {informationClass, sizeof(Record), alignof(Record),
+          offsetof(Record, FileNameLength), offsetof(Record, FileName)};
 }
 
 // The minimum lengths and alignments are those BuildQueryDirectoryIrp in ntoskrnl
@@ -42,4 +44,46 @@ findDirectoryRecordLayout(FILE_INFORMATION_CLASS informationClass)
     return std::nullopt;
   }
   return *layout;
+}
+
+DirectoryRecord::DirectoryRecord(const DirectoryRecordLayout& layout,
+                                 std::span<const std::byte> bytes)
+    : m_layout(layout), m_bytes(bytes)
+{}
+
+ULONG DirectoryRecord::nextEntryOffset() const
+{
+  // the first field of every directory record
+  return readField(0);
+}
+
+ULONG DirectoryRecord::size() const
+{
+  return m_layout.fileNameOffset + readField(m_layout.fileNameLengthOffset);
+}
+
+bool DirectoryRecord::isTruncated() const
+{
+  return size() > m_bytes.size();
+}
+
+std::wstring DirectoryRecord::fileName() const
+{
+  const size_t end = std::min<size_t>(size(), m_bytes.size());
+  if (end <= m_layout.fileNameOffset) {
+    return {};
+  }
+  std::wstring name((end - m_layout.fileNameOffset) / sizeof(WCHAR), L'\0');
+  std::memcpy(name.data(), m_bytes.data() + m_layout.fileNameOffset,
+              name.size() * sizeof(WCHAR));
+  return name;
+}
+
+ULONG DirectoryRecord::readField(ULONG offset) const
+{
+  ULONG value = 0;
+  if (offset + sizeof(value) <= m_bytes.size()) {
+    std::memcpy(&value, m_bytes.data() + offset, sizeof(value));
+  }
+  return value;
 }

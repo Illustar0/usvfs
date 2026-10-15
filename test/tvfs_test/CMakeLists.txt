@@ -10,3 +10,7 @@ usvfs_target_link_usvfs(tvfs_test)
 # tvfs_test uses a private USVFS header so we need to include it manually
 get_target_property(USVFS_SOURCE_DIR usvfs_dll SOURCE_DIR)
 target_include_directories(tvfs_test PRIVATE ${USVFS_SOURCE_DIR})
+
+# the directory records are not exported from the usvfs DLL, so the test builds
+# them itself
+target_sources(tvfs_test PRIVATE ${USVFS_SOURCE_DIR}/hooks/directory_records.cpp)
