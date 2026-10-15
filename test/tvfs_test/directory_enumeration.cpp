@@ -538,3 +538,107 @@ TEST_F(USVFSTest, NtQueryDirectoryFilePostsCompletionPackets)
   addVirtualEntries(ctx->redirectionTable());
   expectNativeCompletions(false, CompletionNotification::CompletionPort);
 }
+
+namespace
+{
+
+struct QueryOutcome
+{
+  NTSTATUS result;
+  IO_STATUS_BLOCK statusBlock;
+};
+
+// Queries a directory with a status block that shows whether the query wrote it.
+QueryOutcome queryWithMarkedStatusBlock(NtQueryDirectoryFile_type query,
+                                        HANDLE directory, PUNICODE_STRING fileName)
+{
+  QueryOutcome outcome;
+  outcome.statusBlock.Status      = UNWRITTEN_STATUS;
+  outcome.statusBlock.Information = UNWRITTEN_INFORMATION;
+  alignas(8) char buffer[1024];
+  outcome.result =
+      query(directory, nullptr, nullptr, nullptr, &outcome.statusBlock, buffer,
+            sizeof(buffer), FileDirectoryInformation, FALSE, fileName, FALSE);
+  return outcome;
+}
+
+// Lists a directory until it reports its end, then queries it once more, and
+// returns the outcomes of these two queries.
+std::vector<QueryOutcome> queryPastTheLastEntry(NtQueryDirectoryFile_type query,
+                                                HANDLE directory)
+{
+  std::vector<QueryOutcome> endOutcomes;
+  for (int call = 0; endOutcomes.size() < 2 && call < 10000; ++call) {
+    const QueryOutcome outcome = queryWithMarkedStatusBlock(query, directory, nullptr);
+    if (outcome.result != STATUS_SUCCESS) {
+      endOutcomes.push_back(outcome);
+    }
+  }
+  return endOutcomes;
+}
+
+void expectSameOutcome(const QueryOutcome& expected, const QueryOutcome& actual)
+{
+  EXPECT_EQ(expected.result, actual.result);
+  EXPECT_EQ(expected.statusBlock.Status, actual.statusBlock.Status);
+  EXPECT_EQ(expected.statusBlock.Information, actual.statusBlock.Information);
+}
+
+}  // namespace
+
+TEST_F(USVFSTest, NtQueryDirectoryFileLeavesStatusBlockWhenNothingMatches)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  addVirtualEntries(ctx->redirectionTable());
+  usvfs::UnicodeString pattern(L"usvfs_no_such_file_*");
+
+  // a query moves its handle through the directory, so ntdll and the hook each
+  // list through a handle of their own
+  HANDLE nativeHandle = openRootDirectory(true);
+  HANDLE hookedHandle = openRootDirectory(true);
+  ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+  const QueryOutcome expected = queryWithMarkedStatusBlock(
+      nativeQueryDirectoryFile(), nativeHandle, static_cast<PUNICODE_STRING>(pattern));
+  const QueryOutcome actual =
+      queryWithMarkedStatusBlock(&usvfs::hook_NtQueryDirectoryFile, hookedHandle,
+                                 static_cast<PUNICODE_STRING>(pattern));
+
+  ASSERT_EQ(STATUS_NO_SUCH_FILE, expected.result);
+  expectSameOutcome(expected, actual);
+
+  usvfs::hook_NtClose(nativeHandle);
+  usvfs::hook_NtClose(hookedHandle);
+}
+
+TEST_F(USVFSTest, NtQueryDirectoryFileReportsNoBytesPastTheLastEntry)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  addVirtualEntries(ctx->redirectionTable());
+
+  HANDLE nativeHandle = openRootDirectory(true);
+  HANDLE hookedHandle = openRootDirectory(true);
+  ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+  const std::vector<QueryOutcome> expected =
+      queryPastTheLastEntry(nativeQueryDirectoryFile(), nativeHandle);
+  const std::vector<QueryOutcome> actual =
+      queryPastTheLastEntry(&usvfs::hook_NtQueryDirectoryFile, hookedHandle);
+
+  ASSERT_EQ(2u, expected.size());
+  ASSERT_EQ(STATUS_NO_MORE_FILES, expected.front().result);
+  ASSERT_EQ(expected.size(), actual.size()) << "the listing does not end";
+  for (size_t query = 0; query < expected.size(); ++query) {
+    SCOPED_TRACE(query);
+    expectSameOutcome(expected[query], actual[query]);
+  }
+
+  usvfs::hook_NtClose(nativeHandle);
+  usvfs::hook_NtClose(hookedHandle);
+}

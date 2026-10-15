@@ -570,7 +570,13 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
       }
     }
   }
-  return dataReturned ? STATUS_SUCCESS : STATUS_NO_MORE_FILES;
+  if (!dataReturned) {
+    // dataRead still holds the capacity when no read ran or the last source did
+    // not open
+    dataRead = 0;
+    return STATUS_NO_MORE_FILES;
+  }
+  return STATUS_SUCCESS;
 }
 
 NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
@@ -582,9 +588,11 @@ NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
   const bool isFirstCall = std::exchange(m_isFirstCall, false);
 
   ULONG dataRead;
-  NTSTATUS res = fill(query, dataRead);
+  const NTSTATUS res = fill(query, dataRead);
+  // an empty first result is an error, and ntdll leaves the status block of a
+  // failed query alone
   if (res == STATUS_NO_MORE_FILES && isFirstCall) {
-    res = STATUS_NO_SUCH_FILE;
+    return STATUS_NO_SUCH_FILE;
   }
   query.statusBlock->Status      = res;
   query.statusBlock->Information = dataRead;
