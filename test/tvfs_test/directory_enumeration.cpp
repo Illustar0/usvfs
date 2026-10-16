@@ -1798,6 +1798,91 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsPastAVirtualPartialRecordLikeNtdll)
   }
 }
 
+namespace
+{
+
+std::vector<std::wstring> recordNames(const DirectoryRecordLayout& layout,
+                                      std::span<const std::byte> data)
+{
+  std::vector<std::wstring> names;
+  for (const size_t offset : recordOffsets(layout, data)) {
+    names.push_back(DirectoryRecord(layout, data.subspan(offset)).fileName());
+  }
+  return names;
+}
+
+}  // namespace
+
+// ntdll is the reference for how many virtual entries a query returns, as it lists
+// files of the virtual names: as many as the buffer holds, the first that does not fit
+// starting the next query. The pattern leaves out "." and "..", so the regular entries
+// end before the first query writes any.
+TEST_F(USVFSTest, NtQueryDirectoryFileListsSeveralVirtualEntriesPerQueryLikeNtdll)
+{
+  constexpr int ENTRY_COUNT           = 8;
+  constexpr std::wstring_view PATTERN = L"usvfs_entry_*";
+  const std::filesystem::path namesakeDirectory =
+      test::path_of_test_temp(L"virtual_entries_namesakes");
+  const std::filesystem::path virtualDirectory =
+      test::path_of_test_temp(L"virtual_entries");
+  std::filesystem::create_directories(namesakeDirectory);
+  std::filesystem::create_directories(virtualDirectory);
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  for (int entry = 0; entry < ENTRY_COUNT; ++entry) {
+    const std::wstring name = std::format(L"usvfs_entry_{}.txt", entry);
+    std::ofstream(namesakeDirectory / name);
+    ctx->redirectionTable().addFile((virtualDirectory / name).c_str(),
+                                    usvfs::RedirectionDataLocal(REAL_FILEA));
+  }
+
+  for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
+    const DirectoryRecordLayout layout =
+        findDirectoryRecordLayout(informationClass).value();
+    HANDLE wholeHandle = openHookedDirectory(namesakeDirectory);
+    ASSERT_NE(INVALID_HANDLE_VALUE, wholeHandle);
+    const ListedQuery whole = queryOnce(nativeQueryDirectoryFile(), wholeHandle,
+                                        {informationClass, 0x1000, false, PATTERN});
+    usvfs::hook_NtClose(wholeHandle);
+    const std::vector<size_t> offsets = recordOffsets(layout, whole.data);
+    ASSERT_EQ(static_cast<size_t>(ENTRY_COUNT), offsets.size());
+
+    // the first holds every entry; the second ends where the fourth record starts, so
+    // it holds three
+    for (const ULONG length : {0x1000ul, static_cast<ULONG>(offsets[3])}) {
+      for (const bool isSingleEntry : {false, true}) {
+        SCOPED_TRACE(std::format("class {}, length {}, {}",
+                                 static_cast<int>(informationClass), length,
+                                 isSingleEntry ? "single entry" : "full buffer"));
+        const ListingQuery listing{informationClass, length, isSingleEntry, PATTERN};
+        HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
+        HANDLE hookedHandle   = openHookedDirectory(virtualDirectory);
+        ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
+        ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+        const std::vector<ListedQuery> expected =
+            listQueries(nativeQueryDirectoryFile(), namesakeHandle, listing);
+        const std::vector<ListedQuery> actual =
+            listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+
+        ASSERT_EQ(expected.size(), actual.size());
+        for (size_t query = 0; query < expected.size(); ++query) {
+          SCOPED_TRACE(query);
+          expectSameOutcome(expected[query].outcome, actual[query].outcome);
+          EXPECT_EQ(recordOffsets(layout, expected[query].data),
+                    recordOffsets(layout, actual[query].data));
+          EXPECT_EQ(recordNames(layout, expected[query].data),
+                    recordNames(layout, actual[query].data));
+        }
+
+        usvfs::hook_NtClose(namesakeHandle);
+        usvfs::hook_NtClose(hookedHandle);
+      }
+    }
+  }
+}
+
 // ntdll is the reference for a directory read that fails, also where virtual entries
 // would follow: the error, on every query. The I/O manager refuses a handle without
 // FILE_LIST_DIRECTORY before the filesystem sees the query, so every filesystem fails

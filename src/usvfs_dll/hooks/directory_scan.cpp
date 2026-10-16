@@ -227,10 +227,11 @@ public:
       : m_matches(std::move(matches))
   {}
 
-  // Writes the next entry that reads and is not written yet. An entry that does not
-  // fit is left for the next call. Returns STATUS_SUCCESS once it wrote one or the
-  // output holds no more, STATUS_BUFFER_OVERFLOW once it wrote the partial record of
-  // one, and STATUS_NO_MORE_FILES when none is left.
+  // Writes the entries left to list, as many as the output takes; the first that does
+  // not fit stays for the next call. Skips an entry whose record cannot be read or
+  // whose name is written already. Returns STATUS_SUCCESS once it wrote some,
+  // STATUS_BUFFER_OVERFLOW once it wrote the partial record of one, and
+  // STATUS_NO_MORE_FILES when none is left.
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
 private:
@@ -250,9 +251,9 @@ private:
 
 NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& output)
 {
-  // Kept from the stock code: a query gets one entry at most, and an entry that does
-  // not read or is written already is dropped.
-  for (; m_nextMatch < m_matches.size(); ++m_nextMatch) {
+  // the skipped entries are dropped as the stock code dropped them; a single-entry
+  // query stops before reading an entry it would not take
+  for (; m_nextMatch < m_matches.size() && !output.isSatisfied(); ++m_nextMatch) {
     const VirtualMatch& match                   = m_matches[m_nextMatch];
     const std::optional<DirectoryRecord> record = read(match, query);
     if (!record) {
@@ -267,15 +268,14 @@ NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
                                ? output.append(*record)
                                : output.appendRenamed(*record, name);
     // like ntdll, an entry that does not fit stays for the next call to return, be it
-    // after its partial record or after the entries the output holds
+    // after its partial record or after the entries the output holds. That call reads
+    // it again: one extra read per call, so that no record is kept between calls.
     if (!isWritten) {
       return output.isOverflowed() ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     }
     m_names.insert(name);
-    ++m_nextMatch;
-    return STATUS_SUCCESS;
   }
-  return STATUS_NO_MORE_FILES;
+  return output.isEmpty() ? STATUS_NO_MORE_FILES : STATUS_SUCCESS;
 }
 
 std::optional<DirectoryRecord> VirtualEntryReader::read(const VirtualMatch& match,
