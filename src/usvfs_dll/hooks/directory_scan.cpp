@@ -271,10 +271,11 @@ std::optional<DirectoryRecord> NativeDirectoryReader::next()
   return record;
 }
 
-// A directory that virtual entries map files or directories of. Read whole the first
-// time an entry needs it, keeping the records of what the entries map, so that it is
-// read once rather than once per entry, and its handle closes before the query that
-// reads it returns.
+// A directory that virtual entries map files or directories of. Read the first time an
+// entry needs it, keeping the records of what the entries map, so that it is read
+// once rather than once per entry, and its handle closes before the query that reads
+// it returns. Read whole, or queried by name when it has one file mapped: a mapping
+// of one file out of a large directory, such as C:\Windows, would read it all.
 class SourceDirectory
 {
 public:
@@ -291,12 +292,13 @@ public:
                                       std::vector<std::byte>& buffer);
 
 private:
-  // Reads the directory whole and keeps the records of the file names.
+  // Reads the directory and keeps the records of the file names.
   void read(const DirectoryRecordLayout& layout, std::vector<std::byte>& buffer);
   // Queries the directory for a file name.
   std::optional<DirectoryRecord> query(const std::wstring& fileName,
                                        const DirectoryRecordLayout& layout,
                                        std::vector<std::byte>& buffer);
+  void keep(std::wstring fileName, const DirectoryRecord& record);
 
   // where a kept record lies in m_records
   struct RecordPlace
@@ -325,6 +327,10 @@ SourceDirectory::find(const std::wstring& fileName, const DirectoryRecordLayout&
     return DirectoryRecord(
         layout, std::span(m_records).subspan(place->second.offset, place->second.size));
   }
+  if (m_fileNames.size() == 1) {
+    // queried by name already
+    return std::nullopt;
+  }
   // The file is missing, or the mapping names it in another case or by its 8.3 name,
   // which a query by name leaves to the filesystem to match.
   return query(fileName, layout, buffer);
@@ -338,6 +344,13 @@ void SourceDirectory::read(const DirectoryRecordLayout& layout,
   m_recordClass = layout.informationClass;
   m_records.clear();
   m_recordPlaces.clear();
+  if (m_fileNames.size() == 1) {
+    const std::wstring& fileName = *m_fileNames.begin();
+    if (const std::optional<DirectoryRecord> record = query(fileName, layout, buffer)) {
+      keep(fileName, *record);
+    }
+    return;
+  }
   OwnedHandle directory = openScanDirectory(m_path);
   if (!directory.isValid()) {
     spdlog::get("hooks")->warn(
@@ -348,13 +361,9 @@ void SourceDirectory::read(const DirectoryRecordLayout& layout,
   NativeDirectoryReader reader(std::move(directory), layout, std::nullopt, buffer);
   while (const std::optional<DirectoryRecord> record = reader.next()) {
     std::wstring fileName = record->fileName();
-    if (!m_fileNames.contains(fileName)) {
-      continue;
+    if (m_fileNames.contains(fileName)) {
+      keep(std::move(fileName), *record);
     }
-    const std::span<const std::byte> bytes = record->bytes();
-    m_recordPlaces.try_emplace(std::move(fileName),
-                               RecordPlace{m_records.size(), bytes.size()});
-    m_records.insert(m_records.end(), bytes.begin(), bytes.end());
   }
   if (reader.endStatus() != STATUS_NO_MORE_FILES) {
     spdlog::get("hooks")->warn(
@@ -388,6 +397,14 @@ SourceDirectory::query(const std::wstring& fileName,
                                static_cast<uint32_t>(reader.endStatus()));
   }
   return record;
+}
+
+void SourceDirectory::keep(std::wstring fileName, const DirectoryRecord& record)
+{
+  const std::span<const std::byte> bytes = record.bytes();
+  m_recordPlaces.try_emplace(std::move(fileName),
+                             RecordPlace{m_records.size(), bytes.size()});
+  m_records.insert(m_records.end(), bytes.begin(), bytes.end());
 }
 
 // A virtual entry of the scanned directory.

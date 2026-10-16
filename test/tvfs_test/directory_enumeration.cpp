@@ -1884,12 +1884,15 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsSeveralVirtualEntriesPerQueryLikeNtdl
 }
 
 // ntdll is the reference for virtual entries that map files of several directories,
-// as it lists files of the virtual names: every entry whose file exists, also when
-// the mapping names it in another case, and none twice or out of order, also when a
-// query asks for another information class than the one before it.
+// some of them with one file mapped, as it lists files of the virtual names: every
+// entry whose file exists, also when the mapping names it in another case, and none
+// twice or out of order, also when a query asks for another information class than
+// the one before it.
 TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
 {
-  constexpr int ENTRY_COUNT           = 12;
+  constexpr int ENTRY_COUNT = 12;
+  // the entries whose file exists, with the two that map the one file of a directory
+  constexpr size_t LISTED_COUNT       = ENTRY_COUNT - 1 + 2;
   constexpr std::wstring_view PATTERN = L"usvfs_entry_*";
   const std::filesystem::path root    = test::path_of_test_temp(L"several_sources");
   std::filesystem::remove_all(root);
@@ -1924,6 +1927,22 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
     ctx->redirectionTable().addFile((virtualDirectory / name).c_str(),
                                     usvfs::RedirectionDataLocal(linkTarget.string()));
   }
+  // a directory with one file, which two entries map under the name in another case,
+  // and a directory whose one mapped file does not exist
+  const std::filesystem::path singleSource  = root / L"source_c";
+  const std::filesystem::path missingSource = root / L"source_d";
+  std::filesystem::create_directories(singleSource);
+  std::filesystem::create_directories(missingSource);
+  std::ofstream(singleSource / L"single.txt");
+  for (const std::wstring_view name : {L"usvfs_entry_12.txt", L"usvfs_entry_13.txt"}) {
+    std::ofstream(namesakeDirectory / name);
+    ctx->redirectionTable().addFile(
+        (virtualDirectory / name).c_str(),
+        usvfs::RedirectionDataLocal((singleSource / L"SINGLE.TXT").string()));
+  }
+  ctx->redirectionTable().addFile(
+      (virtualDirectory / L"usvfs_entry_14.txt").c_str(),
+      usvfs::RedirectionDataLocal((missingSource / L"missing.txt").string()));
 
   for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
     const DirectoryRecordLayout layout =
@@ -1934,7 +1953,7 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
                                         {informationClass, 0x1000, false, PATTERN});
     usvfs::hook_NtClose(wholeHandle);
     const std::vector<size_t> offsets = recordOffsets(layout, whole.data);
-    ASSERT_EQ(static_cast<size_t>(ENTRY_COUNT - 1), offsets.size());
+    ASSERT_EQ(LISTED_COUNT, offsets.size());
 
     // the first holds every entry; the second ends where the fourth record starts, so
     // it holds three, and so does it with the class changed on every query
@@ -1969,7 +1988,7 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
                   recordOffsets(queryLayout, actual.data));
         EXPECT_EQ(recordNames(queryLayout, expected.data),
                   recordNames(queryLayout, actual.data));
-        if (expected.outcome.result != STATUS_SUCCESS || query > ENTRY_COUNT) {
+        if (expected.outcome.result != STATUS_SUCCESS || query > LISTED_COUNT) {
           break;
         }
         if (isClassChanging) {
