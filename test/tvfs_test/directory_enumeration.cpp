@@ -2353,6 +2353,110 @@ TEST_F(USVFSTest, NtQueryDirectoryFileRestartsWithTheLatchedPatternLikeNtdll)
   }
 }
 
+// ntdll is the reference for the query flags besides restart and single entry. The I/O
+// manager drops SL_INDEX_SPECIFIED and the undefined bits before the filesystem sees
+// them, so a query with them lists what the namesake directory lists.
+// SL_RETURN_ON_DISK_ENTRIES_ONLY asks a filter that virtualizes the directory to leave
+// the query to the filesystem, and the hook does not emulate SL_NO_CURSOR_UPDATE, so a
+// query with either lists what ntdll lists of the physical directory.
+TEST_F(USVFSTest, NtQueryDirectoryFileExHandlesQueryFlagsLikeNtdll)
+{
+  // a guard against a listing that does not end
+  constexpr size_t MAXIMUM_QUERIES = 100;
+  const std::filesystem::path root = test::path_of_test_temp(L"query_flags");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path namesakeDirectory = root / L"namesakes";
+  const std::filesystem::path virtualDirectory  = root / L"virtual";
+  const std::filesystem::path sourceDirectory   = root / L"source";
+  for (const std::filesystem::path& directory :
+       {namesakeDirectory, virtualDirectory, sourceDirectory}) {
+    std::filesystem::create_directories(directory);
+  }
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  std::ofstream{namesakeDirectory / L"a_regular.txt"};
+  std::ofstream{virtualDirectory / L"a_regular.txt"};
+  std::ofstream{namesakeDirectory / L"a_virtual.txt"};
+  std::ofstream{sourceDirectory / L"a_virtual.txt"};
+  ctx->redirectionTable().addFile(
+      (virtualDirectory / L"a_virtual.txt").c_str(),
+      usvfs::RedirectionDataLocal((sourceDirectory / L"a_virtual.txt").string()));
+
+  const auto nativeQuery = reinterpret_cast<NtQueryDirectoryFileEx_type>(
+      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQueryDirectoryFileEx"));
+  const auto queryOnceEx = [](NtQueryDirectoryFileEx_type query, HANDLE directory,
+                              ULONG flags, std::wstring_view pattern) {
+    usvfs::UnicodeString fileName(pattern.data(), pattern.size());
+    alignas(8) std::array<std::byte, 0x1000> buffer;
+    ListedQuery listed;
+    listed.outcome.statusBlock.Status      = UNWRITTEN_STATUS;
+    listed.outcome.statusBlock.Information = UNWRITTEN_INFORMATION;
+    listed.outcome.result =
+        query(directory, nullptr, nullptr, nullptr, &listed.outcome.statusBlock,
+              buffer.data(), static_cast<ULONG>(buffer.size()),
+              FileDirectoryInformation, flags, static_cast<PUNICODE_STRING>(fileName));
+    if (listed.outcome.result == STATUS_SUCCESS) {
+      listed.data.assign(buffer.begin(),
+                         buffer.begin() + listed.outcome.statusBlock.Information);
+    }
+    return listed;
+  };
+  const DirectoryRecordLayout layout =
+      findDirectoryRecordLayout(FileDirectoryInformation).value();
+
+  // the flags as kernelbase passes them for FIND_FIRST_EX_ON_DISK_ENTRIES_ONLY, and
+  // alone; the pattern matches the virtual entry only, so that a query the hook
+  // virtualized would list it where ntdll lists nothing
+  for (const ULONG flags :
+       {ULONG{SL_RETURN_SINGLE_ENTRY | SL_RETURN_ON_DISK_ENTRIES_ONLY},
+        ULONG{SL_NO_CURSOR_UPDATE}}) {
+    SCOPED_TRACE(std::format("flags {:#x}", flags));
+    HANDLE nativeHandle = openHookedDirectory(virtualDirectory);
+    HANDLE hookedHandle = openHookedDirectory(virtualDirectory);
+    ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+    const ListedQuery expected =
+        queryOnceEx(nativeQuery, nativeHandle, flags, L"*_virtual.txt");
+    const ListedQuery actual = queryOnceEx(&usvfs::hook_NtQueryDirectoryFileEx,
+                                           hookedHandle, flags, L"*_virtual.txt");
+    expectSameOutcome(expected.outcome, actual.outcome);
+    expectSameRecords(layout, expected.data, actual.data);
+
+    usvfs::hook_NtClose(nativeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
+
+  for (const ULONG flags : {ULONG{SL_INDEX_SPECIFIED}, 0x20ul, 0x80000000ul}) {
+    SCOPED_TRACE(std::format("flags {:#x}", flags));
+    HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
+    HANDLE hookedHandle   = openHookedDirectory(virtualDirectory);
+    ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+    // the virtual entries follow the regular ones in an order of their own, so only
+    // which names a listing holds is compared
+    const auto listNames = [&](NtQueryDirectoryFileEx_type query, HANDLE directory) {
+      std::vector<std::wstring> names;
+      for (size_t count = 0; count < MAXIMUM_QUERIES; ++count) {
+        const ListedQuery listed = queryOnceEx(query, directory, flags, L"*");
+        if (listed.outcome.result != STATUS_SUCCESS) {
+          break;
+        }
+        std::ranges::move(recordNames(layout, listed.data), std::back_inserter(names));
+      }
+      std::ranges::sort(names);
+      return names;
+    };
+    EXPECT_EQ(listNames(nativeQuery, namesakeHandle),
+              listNames(&usvfs::hook_NtQueryDirectoryFileEx, hookedHandle));
+
+    usvfs::hook_NtClose(namesakeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
+}
+
 namespace
 {
 

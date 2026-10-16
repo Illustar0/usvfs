@@ -834,6 +834,15 @@ bool shouldVirtualize(const DirectoryQuery& query)
   if (query.event || query.apcRoutine || query.apcContext) {
     return false;
   }
+  // The I/O manager drops the flags outside the mask, SL_INDEX_SPECIFIED among them,
+  // before the filesystem sees them, so the virtual listing ignores them too.
+  // SL_RETURN_ON_DISK_ENTRIES_ONLY asks a filter that virtualizes the directory to
+  // leave the query to the filesystem. SL_NO_CURSOR_UPDATE, which only NTFS honors,
+  // is not emulated.
+  constexpr ULONG VIRTUALIZED_FLAGS = SL_RESTART_SCAN | SL_RETURN_SINGLE_ENTRY;
+  if ((query.flags & SL_QUERY_DIRECTORY_MASK & ~VIRTUALIZED_FLAGS) != 0) {
+    return false;
+  }
   const std::optional<DirectoryRecordLayout> layout =
       findDirectoryRecordLayout(query.informationClass);
   if (!layout) {
