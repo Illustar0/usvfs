@@ -21,6 +21,7 @@
 #include <stringutils.h>
 #include <unicodestring.h>
 
+#include "../hookcallcontext.h"
 #include "../hookcontext.h"
 
 #include "directory_records.h"
@@ -93,6 +94,31 @@ public:
 private:
   HANDLE m_handle = INVALID_HANDLE_VALUE;
 };
+
+// Opens a directory for synchronous enumeration, with the usvfs hooks suppressed.
+//
+// The legacy implementation opened mapping source directories with CreateFileW
+// without suppressing the hooks, so every internal directory open re-entered the
+// NtCreateFile and attribute hooks of usvfs and incurred substantial redundant path
+// rerouting and lock overhead.
+//
+// Suppressing the hooks means that a mapping source directory that only exists
+// virtually (a chained virtual-to-virtual mapping) is no longer redirected a second
+// time during directory enumeration. However, the file-open hooks only perform a
+// single-hop reroute anyway, so such second-hop virtual files could never actually be
+// opened (ERROR_PATH_NOT_FOUND); preserving that accidental enumeration behavior has
+// little practical value while significantly hurting performance for normal physical
+// source directories.
+//
+// The hooks still track the handle, as they see it closed.
+OwnedHandle openScanDirectory(const std::wstring& path)
+{
+  // the hooks pass a call straight to ntdll while any group of theirs is held
+  const usvfs::FunctionGroupLock unhooked(usvfs::MutExHookGroup::ALL_GROUPS);
+  return OwnedHandle(CreateFileW(path.c_str(), GENERIC_READ,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+}
 
 // Reads the regular entries of the scanned directory from ntdll and writes those that
 // no virtual entry shadows.
@@ -266,9 +292,7 @@ std::optional<DirectoryRecord> VirtualEntryReader::read(const VirtualMatch& matc
       !ush::startswith(directoryPath.c_str(), LR"(\\?\)")) {
     directoryPath = LR"(\\?\)" + directoryPath;
   }
-  const OwnedHandle directory(CreateFileW(
-      directoryPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+  const OwnedHandle directory = openScanDirectory(directoryPath);
   if (!directory.isValid()) {
     spdlog::get("hooks")->warn("failed to open the directory of {0} to list it: {1}",
                                fullPath.string(), ::GetLastError());
