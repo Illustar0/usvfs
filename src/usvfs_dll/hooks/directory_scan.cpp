@@ -101,8 +101,8 @@ public:
   {}
 
   // Writes the entries of the next reads, reading only while the output is empty.
-  // Returns STATUS_SUCCESS once it wrote some, and STATUS_NO_MORE_FILES when a read
-  // fails.
+  // Returns STATUS_SUCCESS once it wrote some, STATUS_BUFFER_OVERFLOW once it wrote
+  // the partial record of a read, and STATUS_NO_MORE_FILES when a read fails.
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
 private:
@@ -132,8 +132,16 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
     const NTSTATUS result = NtQueryDirectoryFile(
         source, nullptr, nullptr, nullptr, &status, m_staging.data(), query.length,
         query.informationClass, query.isSingleEntry(), query.fileName, FALSE);
-    // Kept from the stock code until partial records and errors from ntdll are
-    // passed on: any other result ends the regular entries.
+    // ntdll cuts a first record that does not fit short, and returns it again on
+    // every query until a buffer holds it, so the regular entries do not end here.
+    // Its name may be cut short too, which leaves no telling whether a virtual entry
+    // shadows it: it is passed on either way, and filtered once it comes whole.
+    if (result == STATUS_BUFFER_OVERFLOW) {
+      output.mirror(std::span(m_staging).first(status.Information));
+      return result;
+    }
+    // Kept from the stock code until errors from ntdll are passed on: any other
+    // result ends the regular entries.
     if (result != STATUS_SUCCESS) {
       return STATUS_NO_MORE_FILES;
     }
@@ -541,13 +549,14 @@ bool shouldVirtualize(const DirectoryQuery& query)
 
 // Writes the next entries of the scan: the regular ones first, so that "." and ".."
 // come with the first query of a wildcard search as callers expect, then the virtual
-// ones. Returns STATUS_SUCCESS if it wrote any, and STATUS_NO_MORE_FILES once both
-// are exhausted.
+// ones. Returns STATUS_SUCCESS if it wrote any, STATUS_BUFFER_OVERFLOW if it passed
+// on a partial record from ntdll, and STATUS_NO_MORE_FILES once both are exhausted.
 NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, DirectoryOutput& output)
 {
   if (m_regular) {
-    if (m_regular->fill(query, output) == STATUS_SUCCESS) {
-      return STATUS_SUCCESS;
+    const NTSTATUS status = m_regular->fill(query, output);
+    if (status != STATUS_NO_MORE_FILES) {
+      return status;
     }
     // the regular entries are done, and the reader's handle and staging area with them
     m_regular.reset();

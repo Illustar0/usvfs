@@ -94,6 +94,9 @@ public:
   bool append(const DirectoryRecord& record);
   // Writes a record under another name, on the same terms as append.
   bool appendRenamed(const DirectoryRecord& record, std::wstring_view name);
+  // Writes the data of a native read as it is, partial record included, into an
+  // empty output that it fits.
+  void mirror(std::span<const std::byte> native);
 
   // Turns the status a fill ended with into the result of the query, and writes the
   // status block unless the result is an error, which ntdll reports without it.

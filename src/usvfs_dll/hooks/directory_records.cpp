@@ -197,6 +197,13 @@ bool DirectoryOutput::appendRenamed(const DirectoryRecord& record,
   return true;
 }
 
+void DirectoryOutput::mirror(std::span<const std::byte> native)
+{
+  std::ranges::copy(native, m_buffer.begin());
+  m_lastRecordOffset = 0;
+  m_size             = native.size();
+}
+
 NTSTATUS DirectoryOutput::complete(NTSTATUS fillStatus,
                                    IO_STATUS_BLOCK& statusBlock) const
 {

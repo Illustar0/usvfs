@@ -1132,7 +1132,8 @@ namespace
 struct ListedQuery
 {
   QueryOutcome outcome;
-  // the bytes the status block reports, for a query that succeeded
+  // the bytes the status block reports, for a query that returned records, whole or
+  // cut short
   std::vector<std::byte> data;
 };
 
@@ -1158,7 +1159,8 @@ ListedQuery queryOnce(NtQueryDirectoryFile_type query, HANDLE directory,
       query(directory, nullptr, nullptr, nullptr, &listed.outcome.statusBlock,
             buffer.data(), listing.length, listing.informationClass,
             listing.isSingleEntry, static_cast<PUNICODE_STRING>(fileName), FALSE);
-  if (listed.outcome.result == STATUS_SUCCESS) {
+  if (listed.outcome.result == STATUS_SUCCESS ||
+      listed.outcome.result == STATUS_BUFFER_OVERFLOW) {
     listed.data.assign(buffer.begin(),
                        buffer.begin() + listed.outcome.statusBlock.Information);
   }
@@ -1513,5 +1515,66 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsAVirtualEntryLikeNtdllListsItsFile)
 
     usvfs::hook_NtClose(nativeHandle);
     usvfs::hook_NtClose(hookedHandle);
+  }
+}
+
+// ntdll is the reference for a first record that does not fit: it returns as much of
+// it as fits, with STATUS_BUFFER_OVERFLOW, again on every query until a buffer holds
+// it, and the listing goes on from there
+TEST_F(USVFSTest, NtQueryDirectoryFileListsPastAPartialRecordLikeNtdll)
+{
+  // queries enough to list either directory several times over
+  constexpr size_t MAXIMUM_QUERIES = 1000;
+  auto params                      = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+
+  for (const std::filesystem::path& directory : nativeListingDirectories()) {
+    for (const FILE_INFORMATION_CLASS informationClass :
+         DIRECTORY_INFORMATION_CLASSES) {
+      SCOPED_TRACE(std::format("{}, class {}", describeDirectory(directory),
+                               static_cast<int>(informationClass)));
+      const DirectoryRecordLayout layout =
+          findDirectoryRecordLayout(informationClass).value();
+      // a query moves its handle through the directory, so ntdll and the hook each
+      // list through a handle of their own
+      HANDLE nativeHandle = openHookedDirectory(directory);
+      HANDLE hookedHandle = openHookedDirectory(directory);
+      ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+      ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+      std::vector<ListedQuery> expected;
+      std::vector<ListedQuery> actual;
+      const auto queryBoth = [&](ULONG length) {
+        const ListingQuery listing{informationClass, length, false, L"*"};
+        expected.push_back(
+            queryOnce(nativeQueryDirectoryFile(), nativeHandle, listing));
+        actual.push_back(
+            queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing));
+        return expected.back().outcome.result;
+      };
+      // the smallest buffer ntdll accepts, which a longer name overflows
+      while (queryBoth(layout.minimumLength) == STATUS_SUCCESS &&
+             expected.size() < MAXIMUM_QUERIES) {
+      }
+      ASSERT_EQ(STATUS_BUFFER_OVERFLOW, expected.back().outcome.result);
+      queryBoth(layout.minimumLength);
+      while (queryBoth(0x1000) == STATUS_SUCCESS && expected.size() < MAXIMUM_QUERIES) {
+      }
+      ASSERT_EQ(STATUS_NO_MORE_FILES, expected.back().outcome.result);
+
+      for (size_t query = 0; query < expected.size(); ++query) {
+        SCOPED_TRACE(query);
+        expectSameOutcome(expected[query].outcome, actual[query].outcome);
+        if (expected[query].outcome.result == STATUS_BUFFER_OVERFLOW) {
+          EXPECT_EQ(expected[query].data, actual[query].data) << "the partial record";
+        } else {
+          expectSameRecords(layout, expected[query].data, actual[query].data);
+        }
+      }
+
+      usvfs::hook_NtClose(nativeHandle);
+      usvfs::hook_NtClose(hookedHandle);
+    }
   }
 }
