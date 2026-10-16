@@ -63,6 +63,11 @@ foreach(directory ${directories})
         continue()
     endif()
 
+    # a benchmark measures rather than checks, and takes its time
+    if(dirname STREQUAL "tvfs_directory_bench")
+        continue()
+    endif()
+
     add_test(NAME ${dirname}_x64
         COMMAND ${USVFS_TEST_BINDIR}/${dirname}_x64.exe
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}

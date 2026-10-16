@@ -18,7 +18,10 @@
   "features": {
     "testing": {
       "description": "Build USVFS tests.",
-      "dependencies": ["gtest"]
+      "dependencies": [
+        { "name": "benchmark", "version>=": "1.9.5" },
+        "gtest"
+      ]
     }
   }
 }
