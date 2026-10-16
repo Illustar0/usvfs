@@ -44,6 +44,11 @@ public:
     return m_upperNames.insert(ush::to_upper(name)).second;
   }
 
+  bool contains(const std::wstring& name) const
+  {
+    return m_upperNames.contains(ush::to_upper(name));
+  }
+
 private:
   std::set<std::wstring> m_upperNames;
 };
@@ -185,15 +190,17 @@ public:
       : m_matches(std::move(matches))
   {}
 
-  // Writes the next entry that reads, fits and is not written yet. Returns
-  // STATUS_SUCCESS once it wrote one, STATUS_BUFFER_OVERFLOW once it wrote the partial
-  // record of one, and STATUS_NO_MORE_FILES when none is left.
+  // Writes the next entry that reads and is not written yet. An entry that does not
+  // fit is left for the next call. Returns STATUS_SUCCESS once it wrote one or the
+  // output holds no more, STATUS_BUFFER_OVERFLOW once it wrote the partial record of
+  // one, and STATUS_NO_MORE_FILES when none is left.
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
 private:
-  // Reads the entry of a match and writes it. Returns whether it wrote it.
-  bool append(const VirtualMatch& match, const DirectoryQuery& query,
-              DirectoryOutput& output);
+  // Reads the record of what a match maps to from the directory it lies in. Returns
+  // nothing when the read fails.
+  std::optional<DirectoryRecord> read(const VirtualMatch& match,
+                                      const DirectoryQuery& query);
 
   std::vector<VirtualMatch> m_matches;
   // index of the next match to try; the ones before it are done
@@ -207,20 +214,35 @@ private:
 NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& output)
 {
   // Kept from the stock code: a query gets one entry at most, and an entry that does
-  // not read, does not fit or is written already is dropped.
-  while (m_nextMatch < m_matches.size()) {
-    if (append(m_matches[m_nextMatch++], query, output)) {
-      return STATUS_SUCCESS;
+  // not read or is written already is dropped.
+  for (; m_nextMatch < m_matches.size(); ++m_nextMatch) {
+    const VirtualMatch& match                   = m_matches[m_nextMatch];
+    const std::optional<DirectoryRecord> record = read(match, query);
+    if (!record) {
+      continue;
     }
-    if (output.isOverflowed()) {
-      return STATUS_BUFFER_OVERFLOW;
+    const std::wstring name =
+        match.virtualName.empty() ? record->fileName() : match.virtualName;
+    if (m_names.contains(name)) {
+      continue;
     }
+    const bool isWritten = match.virtualName.empty()
+                               ? output.append(*record)
+                               : output.appendRenamed(*record, name);
+    // like ntdll, an entry that does not fit stays for the next call to return, be it
+    // after its partial record or after the entries the output holds
+    if (!isWritten) {
+      return output.isOverflowed() ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+    }
+    m_names.insert(name);
+    ++m_nextMatch;
+    return STATUS_SUCCESS;
   }
   return STATUS_NO_MORE_FILES;
 }
 
-bool VirtualEntryReader::append(const VirtualMatch& match, const DirectoryQuery& query,
-                                DirectoryOutput& output)
+std::optional<DirectoryRecord> VirtualEntryReader::read(const VirtualMatch& match,
+                                                        const DirectoryQuery& query)
 {
   // the path of a directory mapped with all its content ends with a separator, which
   // leaves "." as its file name
@@ -239,7 +261,7 @@ bool VirtualEntryReader::append(const VirtualMatch& match, const DirectoryQuery&
   if (!directory.isValid()) {
     spdlog::get("hooks")->warn("failed to open the directory of {0} to list it: {1}",
                                fullPath.string(), ::GetLastError());
-    return false;
+    return std::nullopt;
   }
 
   // shouldVirtualize lets through only the classes that have a layout
@@ -257,16 +279,11 @@ bool VirtualEntryReader::append(const VirtualMatch& match, const DirectoryQuery&
   if (result != STATUS_SUCCESS) {
     spdlog::get("hooks")->warn("error reported listing files in {0}: {1:x}",
                                fullPath.string(), static_cast<uint32_t>(result));
-    return false;
+    return std::nullopt;
   }
 
   // the pattern is the name of the file, so the read starts with its record
-  const DirectoryRecord record(layout, std::span(m_staging).first(status.Information));
-  if (match.virtualName.empty()) {
-    return m_names.insert(record.fileName()) && output.append(record);
-  }
-  return m_names.insert(match.virtualName) &&
-         output.appendRenamed(record, match.virtualName);
+  return DirectoryRecord(layout, std::span(m_staging).first(status.Information));
 }
 
 // The state of one scan: the queries on a handle from its first query or restart on.
