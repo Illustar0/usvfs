@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cwchar>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -444,7 +445,9 @@ private:
     std::wstring virtualName;
   };
 
-  std::vector<SourceDirectory> m_sources;
+  // a deque, as a vector that grows copies them: the move constructors of the MSVC
+  // unordered containers allocate, so they are not noexcept
+  std::deque<SourceDirectory> m_sources;
   // in the order of the matches, which is the order they are listed in
   std::vector<Entry> m_entries;
   // index of the next entry to try; the ones before it are done
