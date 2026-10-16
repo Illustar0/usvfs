@@ -15,7 +15,6 @@
 
 #include "directory_scan.h"
 #include "handle_tracker.h"
-#include "sharedids.h"
 
 namespace ulog = usvfs::log;
 namespace ush  = usvfs::shared;
@@ -554,17 +553,6 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
   HOOK_START_GROUP(MutExHookGroup::OPEN_FILE)
   // Why is the usual if (!callContext.active()... check missing?
 
-  bool storePath = false;
-  if (((OpenOptions & FILE_DIRECTORY_FILE) != 0UL) &&
-      ((OpenOptions & FILE_OPEN_FOR_BACKUP_INTENT) != 0UL)) {
-    // this may be an attempt to open a directory handle for iterating.
-    // If so we need to treat it a little bit differently
-    /*    usvfs::FunctionGroupLock lock(usvfs::MutExHookGroup::FILE_ATTRIBUTES);
-        FILE_BASIC_INFORMATION dummy;
-        storePath = FAILED(NtQueryAttributesFile(ObjectAttributes, &dummy));*/
-    storePath = true;
-  }
-
   UnicodeString fullName = CreateUnicodeString(ObjectAttributes);
 
   if (isDeviceFile(static_cast<LPCWSTR>(fullName))) {
@@ -598,12 +586,6 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     res = ::NtOpenFile(FileHandle, DesiredAccess, adjustedAttributes.get(),
                        IoStatusBlock, ShareAccess, OpenOptions);
     POST_REALCALL
-    if (SUCCEEDED(res) && storePath) {
-      // store the original search path for use during iteration
-      READ_CONTEXT()->customData<SearchHandleMap>(SearchHandles)[*FileHandle] =
-          static_cast<LPCWSTR>(fullName);
-#pragma message("need to clean up this handle in CloseHandle call")
-    }
 
     if (redir.redirected) {
       LOG_CALL()
@@ -753,17 +735,8 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     POST_REALCALL
     rerouter.updateResult(callContext, res == STATUS_SUCCESS);
 
-    if (res == STATUS_SUCCESS) {
-      if (rerouter.newReroute())
-        rerouter.insertMapping(WRITE_CONTEXT());
-
-      if (rerouter.isDir() && rerouter.wasRerouted() &&
-          ((FileAttributes & FILE_OPEN_FOR_BACKUP_INTENT) ==
-           FILE_OPEN_FOR_BACKUP_INTENT)) {
-        // store the original search path for use during iteration
-        WRITE_CONTEXT()->customData<SearchHandleMap>(SearchHandles)[*FileHandle] =
-            inPathW;
-      }
+    if (res == STATUS_SUCCESS && rerouter.newReroute()) {
+      rerouter.insertMapping(WRITE_CONTEXT());
     }
 
     if (rerouter.wasRerouted() || rerouter.changedError() ||
@@ -829,17 +802,6 @@ NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
 
   if ((::GetFileType(Handle) == FILE_TYPE_DISK)) {
     log = eraseDirectoryScan(Handle);
-
-    HookContext::Ptr context = WRITE_CONTEXT();
-    {
-      SearchHandleMap& searchHandles =
-          context->customData<SearchHandleMap>(SearchHandles);
-      auto iter = searchHandles.find(Handle);
-      if (iter != searchHandles.end()) {
-        searchHandles.erase(iter);
-        log = true;
-      }
-    }
   }
 
   if (GetFileType(Handle) == FILE_TYPE_DISK)
