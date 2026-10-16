@@ -681,21 +681,17 @@ private:
 // running while the DLL unloads do not touch a destroyed registry.
 DirectoryScans& directoryScans = *new DirectoryScans;
 
-// The children of a directory in the redirection tree that may be listed, copied out
+// The children of a directory in the redirection tree that map something, copied out
 // of the tree as it holds them, in UTF-8.
 struct TreeDirectorySnapshot
 {
   struct Child
   {
     std::string name;
-    // empty for a directory that only the tree holds
     std::string linkTarget;
   };
 
   std::vector<Child> children;
-  // the path of the directory in the tree, which a child without a link target lies
-  // under; taken only if there is such a child
-  std::optional<bfs::path> path;
 };
 
 // Copies the children of a directory out of the redirection tree, or returns nothing if
@@ -727,15 +723,14 @@ std::optional<TreeDirectorySnapshot> snapshotTreeDirectory(const UnicodeString& 
   TreeDirectorySnapshot snapshot;
   snapshot.children.reserve(node->numNodes());
   for (auto child = node->filesBegin(); child != node->filesEnd(); ++child) {
-    const auto& subNode        = child->second;
-    const auto& linkTarget     = subNode->data().linkTarget;
-    const bool isOnlyInTheTree = linkTarget.length() == 0;
-    if ((isOnlyInTheTree && !subNode->isDirectory()) ||
-        subNode->hasFlag(usvfs::shared::FLAG_DUMMY)) {
+    const auto& subNode    = child->second;
+    const auto& linkTarget = subNode->data().linkTarget;
+    // A child without a link target maps nothing, so whatever of it is on disk is
+    // listed with the regular entries. The mapping functions give every directory
+    // they add a link target, and the parents they add are dummies, so such a child
+    // is only made through the tree itself.
+    if (linkTarget.length() == 0 || subNode->hasFlag(usvfs::shared::FLAG_DUMMY)) {
       continue;
-    }
-    if (isOnlyInTheTree && !snapshot.path) {
-      snapshot.path = node->path();
     }
     snapshot.children.push_back(
         {subNode->name(), std::string(linkTarget.c_str(), linkTarget.length())});
@@ -776,13 +771,9 @@ gatherVirtualEntries(const TreeDirectorySnapshot& snapshot,
       }
     }
 
-    if (!child.linkTarget.empty()) {
-      matches.push_back(
-          {ush::string_cast<std::wstring>(child.linkTarget, ush::CodePage::UTF8),
-           std::move(vName)});
-    } else {
-      matches.push_back({(*snapshot.path / vName).wstring(), std::move(vName)});
-    }
+    matches.push_back(
+        {ush::string_cast<std::wstring>(child.linkTarget, ush::CodePage::UTF8),
+         std::move(vName)});
   }
   return matches;
 }

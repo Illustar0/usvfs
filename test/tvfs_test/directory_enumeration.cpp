@@ -2533,6 +2533,50 @@ TEST_F(USVFSTest,
   }
 }
 
+// ntdll is the reference for a directory whose tree node has children without a link
+// target: they map nothing, so the directory lists as it lists on disk, a child that
+// exists there with the other entries and one that does not not at all.
+TEST_F(USVFSTest, NtQueryDirectoryFileListsUnlinkedTreeDirectoriesLikeNtdll)
+{
+  const std::filesystem::path directory = test::path_of_test_temp(L"unlinked_tree");
+  std::filesystem::remove_all(directory);
+  std::filesystem::create_directories(directory / L"usvfs_on_disk");
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  for (const std::wstring_view name : {L"usvfs_on_disk", L"usvfs_tree_only"}) {
+    ctx->redirectionTable().addDirectory((directory / name).c_str(),
+                                         usvfs::RedirectionDataLocal(""));
+  }
+  // a query moves its handle through the directory, so ntdll and the hook each list
+  // through a handle of their own
+  HANDLE nativeHandle = openHookedDirectory(directory);
+  HANDLE hookedHandle = openHookedDirectory(directory);
+  ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+  const ListingQuery listing{FileDirectoryInformation, 0x1000, false, L"*"};
+  const std::vector<ListedQuery> expected =
+      listQueries(nativeQueryDirectoryFile(), nativeHandle, listing);
+  const std::vector<ListedQuery> actual =
+      listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+
+  const DirectoryRecordLayout layout =
+      findDirectoryRecordLayout(FileDirectoryInformation).value();
+  ASSERT_EQ(STATUS_SUCCESS, expected.front().outcome.result);
+  ASSERT_EQ(3u, recordOffsets(layout, expected.front().data).size())
+      << "\".\", \"..\" and the directory on disk";
+  ASSERT_EQ(expected.size(), actual.size());
+  for (size_t query = 0; query < expected.size(); ++query) {
+    SCOPED_TRACE(query);
+    expectSameOutcome(expected[query].outcome, actual[query].outcome);
+    expectSameRecords(layout, expected[query].data, actual[query].data);
+  }
+
+  usvfs::hook_NtClose(nativeHandle);
+  usvfs::hook_NtClose(hookedHandle);
+}
+
 namespace
 {
 
