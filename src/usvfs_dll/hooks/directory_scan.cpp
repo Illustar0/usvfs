@@ -370,6 +370,11 @@ public:
   // after the lock is released. Returns an empty pointer if the handle has none.
   std::shared_ptr<DirectoryScan> erase(HANDLE handle)
   {
+    // looked up under the shared lock first, as every handle opened and closed comes
+    // here and few have a scan
+    if (!find(handle)) {
+      return nullptr;
+    }
     std::unique_lock lock(m_mutex);
     auto entry = m_scans.extract(handle);
     return entry ? std::move(entry.mapped()) : nullptr;

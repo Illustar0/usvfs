@@ -28,5 +28,8 @@ NTSTATUS queryNative(const DirectoryQuery& query);
 // the status block.
 NTSTATUS queryDirectory(const DirectoryQuery& query);
 
-// Releases the scan of a closed handle. Returns whether it had one.
+// Releases the scan of a closed handle, or of a handle value just opened again, as a
+// handle closed where the hooks do not see it leaves its scan behind:
+// DuplicateHandle with DUPLICATE_CLOSE_SOURCE into another process closes it in the
+// kernel. Returns whether the handle had a scan.
 bool eraseDirectoryScan(HANDLE handle);

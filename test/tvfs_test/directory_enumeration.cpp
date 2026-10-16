@@ -2036,3 +2036,55 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsCaseVariantsLikeNtdll)
   usvfs::hook_NtClose(nativeHandle);
   usvfs::hook_NtClose(hookedHandle);
 }
+
+// ntdll is the reference for a handle that takes the value of one the hooks did not
+// see closed, as DuplicateHandle with DUPLICATE_CLOSE_SOURCE into another process
+// closes it in the kernel: the new handle lists its own directory from the start,
+// whatever the closed one had listed. Into the same process, the duplicate takes the
+// value itself, with the same file object, so its scan stays right.
+TEST_F(USVFSTest, NtQueryDirectoryFileListsAReissuedHandleLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const std::vector<std::filesystem::path> directories = nativeListingDirectories();
+  const ListingQuery listing{FileDirectoryInformation, 0x1000, false, L"*"};
+
+  HANDLE closedHandle = openHookedDirectory(directories[0]);
+  ASSERT_NE(INVALID_HANDLE_VALUE, closedHandle);
+  listQueries(&usvfs::hook_NtQueryDirectoryFile, closedHandle, listing);
+  // the hooks are not installed in the test process, so this close passes them by
+  ASSERT_TRUE(::CloseHandle(closedHandle));
+  // The handle table hands the value out again, though not necessarily next: opening
+  // through the hooks takes other handles too.
+  std::vector<HANDLE> otherHandles;
+  HANDLE reissuedHandle = openHookedDirectory(directories[1]);
+  while (reissuedHandle != closedHandle && otherHandles.size() < 1000) {
+    otherHandles.push_back(reissuedHandle);
+    reissuedHandle = openHookedDirectory(directories[1]);
+  }
+  ASSERT_EQ(closedHandle, reissuedHandle) << "the value is not reissued";
+  HANDLE nativeHandle = openHookedDirectory(directories[1]);
+  ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+
+  const std::vector<ListedQuery> expected =
+      listQueries(nativeQueryDirectoryFile(), nativeHandle, listing);
+  const std::vector<ListedQuery> actual =
+      listQueries(&usvfs::hook_NtQueryDirectoryFile, reissuedHandle, listing);
+
+  const DirectoryRecordLayout layout =
+      findDirectoryRecordLayout(FileDirectoryInformation).value();
+  ASSERT_LE(2u, expected.size());
+  ASSERT_EQ(expected.size(), actual.size());
+  for (size_t query = 0; query < expected.size(); ++query) {
+    SCOPED_TRACE(query);
+    expectSameOutcome(expected[query].outcome, actual[query].outcome);
+    expectSameRecords(layout, expected[query].data, actual[query].data);
+  }
+
+  for (const HANDLE handle : otherHandles) {
+    usvfs::hook_NtClose(handle);
+  }
+  usvfs::hook_NtClose(reissuedHandle);
+  usvfs::hook_NtClose(nativeHandle);
+}

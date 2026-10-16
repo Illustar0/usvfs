@@ -631,6 +631,9 @@ NTSTATUS WINAPI usvfs::hook_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAc
 {
   NTSTATUS res = ntdll_mess_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
                                        IoStatusBlock, ShareAccess, OpenOptions);
+  if (res >= 0 && FileHandle) {
+    eraseDirectoryScan(*FileHandle);
+  }
   if (res >= 0 && ObjectAttributes && FileHandle &&
       GetFileType(*FileHandle) == FILE_TYPE_DISK)
     ntdllHandleTracker.insert(*FileHandle, CreateUnicodeString(ObjectAttributes));
@@ -799,6 +802,9 @@ NTSTATUS WINAPI usvfs::hook_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK Desired
                                          IoStatusBlock, AllocationSize, FileAttributes,
                                          ShareAccess, CreateDisposition, CreateOptions,
                                          EaBuffer, EaLength);
+  if (res >= 0 && FileHandle) {
+    eraseDirectoryScan(*FileHandle);
+  }
   if (res >= 0 && ObjectAttributes && FileHandle &&
       GetFileType(*FileHandle) == FILE_TYPE_DISK)
     ntdllHandleTracker.insert(*FileHandle, CreateUnicodeString(ObjectAttributes));
