@@ -100,9 +100,12 @@ class RegularEntryReader
 {
 public:
   // Reads source, or the handle of the query if source is invalid. The shadowed
-  // names are those of the virtual entries, which take precedence.
-  RegularEntryReader(OwnedHandle source, CaseInsensitiveNameSet shadowedNames)
-      : m_source(std::move(source)), m_names(std::move(shadowedNames))
+  // names are those of the virtual entries, which take precedence. A reader for a
+  // restarted scan restarts the native scan with its first read.
+  RegularEntryReader(OwnedHandle source, CaseInsensitiveNameSet shadowedNames,
+                     bool isRestart)
+      : m_source(std::move(source)), m_names(std::move(shadowedNames)),
+        m_isRestartPending(isRestart)
   {}
 
   // Writes the entries of the next reads, reading only while the output is empty.
@@ -115,6 +118,7 @@ private:
   OwnedHandle m_source;
   // the shadowed names and those of the entries written, so that none is written twice
   CaseInsensitiveNameSet m_names;
+  bool m_isRestartPending;
   // where a read goes before its entries are filtered; vector storage is aligned for
   // every record, as operator new aligns to 8 bytes or more
   std::vector<std::byte> m_staging;
@@ -131,13 +135,16 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
   m_staging.resize(query.length);
 
   while (output.isEmpty()) {
-    // the handle completes synchronously and the caller's notifications belong to
-    // the caller's query, so this read asks for none; like the stock code, it never
-    // restarts the native scan
+    // The handle completes synchronously and the caller's notifications belong to
+    // the caller's query, so this read asks for none. A restart goes on to the native
+    // scan of the caller's handle, which would go on from where it was otherwise;
+    // ntdll then lists with the pattern of the restart, or the one it latched when
+    // the restart brings none. A reopened source starts at its first entry anyway.
     IO_STATUS_BLOCK status;
     const NTSTATUS result = NtQueryDirectoryFile(
         source, nullptr, nullptr, nullptr, &status, m_staging.data(), query.length,
-        query.informationClass, query.isSingleEntry(), query.fileName, FALSE);
+        query.informationClass, query.isSingleEntry(), query.fileName,
+        std::exchange(m_isRestartPending, false));
     // ntdll cuts a first record that does not fit short, and returns it again on
     // every query until a buffer holds it, so the regular entries do not end here.
     // Its name may be cut short too, which leaves no telling whether a virtual entry
@@ -508,7 +515,8 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query)
   for (const VirtualMatch& match : virtualMatches) {
     shadowedNames.insert(match.virtualName);
   }
-  m_regular.emplace(std::move(regularSource), std::move(shadowedNames));
+  m_regular.emplace(std::move(regularSource), std::move(shadowedNames),
+                    query.isRestart());
   m_virtual = VirtualEntryReader(std::move(virtualMatches));
 }
 

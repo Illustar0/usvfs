@@ -11,6 +11,7 @@
 #include <fstream>
 #include <latch>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <span>
 #include <string>
@@ -1143,22 +1144,27 @@ struct ListingQuery
   FILE_INFORMATION_CLASS informationClass;
   ULONG length;
   bool isSingleEntry;
-  std::wstring_view pattern;
+  // nothing for a query without FileName
+  std::optional<std::wstring_view> pattern;
+  bool isRestart = false;
 };
 
 // Queries a directory with a status block that shows whether the query wrote it.
 ListedQuery queryOnce(NtQueryDirectoryFile_type query, HANDLE directory,
                       const ListingQuery& listing)
 {
-  usvfs::UnicodeString fileName(listing.pattern.data(), listing.pattern.size());
+  std::optional<usvfs::UnicodeString> fileName;
+  if (listing.pattern) {
+    fileName.emplace(listing.pattern->data(), listing.pattern->size());
+  }
   std::vector<std::byte> buffer(listing.length);
   ListedQuery listed;
   listed.outcome.statusBlock.Status      = UNWRITTEN_STATUS;
   listed.outcome.statusBlock.Information = UNWRITTEN_INFORMATION;
-  listed.outcome.result =
-      query(directory, nullptr, nullptr, nullptr, &listed.outcome.statusBlock,
-            buffer.data(), listing.length, listing.informationClass,
-            listing.isSingleEntry, static_cast<PUNICODE_STRING>(fileName), FALSE);
+  listed.outcome.result                  = query(
+      directory, nullptr, nullptr, nullptr, &listed.outcome.statusBlock, buffer.data(),
+      listing.length, listing.informationClass, listing.isSingleEntry,
+      fileName ? static_cast<PUNICODE_STRING>(*fileName) : nullptr, listing.isRestart);
   if (listed.outcome.result == STATUS_SUCCESS ||
       listed.outcome.result == STATUS_BUFFER_OVERFLOW) {
     listed.data.assign(buffer.begin(),
@@ -1833,5 +1839,67 @@ TEST_F(USVFSTest, NtQueryDirectoryFilePassesAFailedRegularReadOnLikeNtdll)
 
     usvfs::hook_NtClose(nativeHandle);
     usvfs::hook_NtClose(hookedHandle);
+  }
+}
+
+// ntdll is the reference for a restart in the middle of a listing: what the scan
+// lists from there with the pattern the restart brings, or without one
+TEST_F(USVFSTest, NtQueryDirectoryFileRestartsTheRegularEntriesLikeNtdll)
+{
+  // queries enough to list either directory several times over
+  constexpr size_t MAXIMUM_QUERIES = 1000;
+  struct Restart
+  {
+    std::wstring_view firstPattern;
+    std::optional<std::wstring_view> restartPattern;
+  };
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+
+  for (const std::filesystem::path& directory : nativeListingDirectories()) {
+    for (const Restart& restart :
+         {Restart{L"*", L"*"}, Restart{L"*", L"n*"}, Restart{L"n*", std::nullopt}}) {
+      SCOPED_TRACE(std::format(
+          "{}, {} then {}", describeDirectory(directory),
+          std::filesystem::path(restart.firstPattern).string(),
+          std::filesystem::path(restart.restartPattern.value_or(L"<null>")).string()));
+      const DirectoryRecordLayout layout =
+          findDirectoryRecordLayout(FileDirectoryInformation).value();
+      // a query moves its handle through the directory, so ntdll and the hook each
+      // list through a handle of their own
+      HANDLE nativeHandle = openHookedDirectory(directory);
+      HANDLE hookedHandle = openHookedDirectory(directory);
+      ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+      ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+      std::vector<ListedQuery> expected;
+      std::vector<ListedQuery> actual;
+      const auto queryBoth = [&](const ListingQuery& listing) {
+        expected.push_back(
+            queryOnce(nativeQueryDirectoryFile(), nativeHandle, listing));
+        actual.push_back(
+            queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing));
+        return expected.back().outcome.result;
+      };
+      // small enough for the listing to go on after it
+      ASSERT_EQ(STATUS_SUCCESS, queryBoth({FileDirectoryInformation, 0x800, false,
+                                           restart.firstPattern}));
+      NTSTATUS result = queryBoth(
+          {FileDirectoryInformation, 0x800, false, restart.restartPattern, true});
+      while (result == STATUS_SUCCESS && expected.size() < MAXIMUM_QUERIES) {
+        result = queryBoth({FileDirectoryInformation, 0x800, false, L"*"});
+      }
+      ASSERT_EQ(STATUS_NO_MORE_FILES, result);
+
+      for (size_t query = 0; query < expected.size(); ++query) {
+        SCOPED_TRACE(query);
+        expectSameOutcome(expected[query].outcome, actual[query].outcome);
+        expectSameRecords(layout, expected[query].data, actual[query].data);
+      }
+
+      usvfs::hook_NtClose(nativeHandle);
+      usvfs::hook_NtClose(hookedHandle);
+    }
   }
 }
