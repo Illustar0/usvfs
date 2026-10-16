@@ -104,7 +104,7 @@ public:
   // restarted scan restarts the native scan with its first read.
   RegularEntryReader(OwnedHandle source, CaseInsensitiveNameSet shadowedNames,
                      bool isRestart)
-      : m_source(std::move(source)), m_names(std::move(shadowedNames)),
+      : m_source(std::move(source)), m_shadowedNames(std::move(shadowedNames)),
         m_isRestartPending(isRestart)
   {}
 
@@ -116,8 +116,9 @@ public:
 
 private:
   OwnedHandle m_source;
-  // the shadowed names and those of the entries written, so that none is written twice
-  CaseInsensitiveNameSet m_names;
+  // Only these are left out: ntdll lists every entry once, and names that differ in
+  // case only are different entries in a case-sensitive directory.
+  CaseInsensitiveNameSet m_shadowedNames;
   bool m_isRestartPending;
   // where a read goes before its entries are filtered; vector storage is aligned for
   // every record, as operator new aligns to 8 bytes or more
@@ -164,7 +165,7 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
     std::span<const std::byte> data(m_staging.data(), status.Information);
     while (!data.empty()) {
       const DirectoryRecord record(layout, data);
-      if (m_names.insert(record.fileName())) {
+      if (!m_shadowedNames.contains(record.fileName())) {
         // fits, since the records before it in the output are those before it in
         // the read, or fewer
         output.append(record);

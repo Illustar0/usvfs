@@ -19,6 +19,8 @@
 #include <thread>
 #include <vector>
 
+#include <aclapi.h>
+
 #include <hookcontext.h>
 #include <hooks/directory_records.h>
 #include <hooks/ntdll.h>
@@ -1944,4 +1946,93 @@ TEST_F(USVFSTest, NtQueryDirectoryFileEndsAnEmptyRestartLikeNtdll)
     usvfs::hook_NtClose(nativeHandle);
     usvfs::hook_NtClose(hookedHandle);
   }
+}
+
+namespace
+{
+
+// A directory whose names are case-sensitive, with two files whose names differ in
+// case only. The flag can be set on an empty directory only, and takes
+// FILE_DELETE_CHILD, which a volume may give users only with full control, so the
+// current user is granted it first.
+std::filesystem::path caseSensitiveDirectory()
+{
+  const std::filesystem::path directory = test::path_of_test_temp(L"case_sensitive");
+  std::filesystem::remove_all(directory);
+  std::filesystem::create_directories(directory);
+
+  EXPLICIT_ACCESS_W access{};
+  access.grfAccessPermissions = FILE_DELETE_CHILD;
+  access.grfAccessMode        = GRANT_ACCESS;
+  access.grfInheritance       = NO_INHERITANCE;
+  BuildTrusteeWithNameW(&access.Trustee, const_cast<LPWSTR>(L"CURRENT_USER"));
+  PACL dacl                       = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  EXPECT_EQ(ERROR_SUCCESS,
+            ::GetNamedSecurityInfoW(directory.c_str(), SE_FILE_OBJECT,
+                                    DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl,
+                                    nullptr, &descriptor));
+  PACL grantedDacl = nullptr;
+  EXPECT_EQ(ERROR_SUCCESS, ::SetEntriesInAclW(1, &access, dacl, &grantedDacl));
+  EXPECT_EQ(ERROR_SUCCESS,
+            ::SetNamedSecurityInfoW(const_cast<LPWSTR>(directory.c_str()),
+                                    SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                                    nullptr, grantedDacl, nullptr));
+  ::LocalFree(grantedDacl);
+  ::LocalFree(descriptor);
+
+  const HANDLE handle =
+      ::CreateFileW(directory.c_str(), FILE_WRITE_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  EXPECT_NE(INVALID_HANDLE_VALUE, handle);
+  FILE_CASE_SENSITIVE_INFO caseSensitivity{FILE_CS_FLAG_CASE_SENSITIVE_DIR};
+  EXPECT_TRUE(::SetFileInformationByHandle(handle, FileCaseSensitiveInfo,
+                                           &caseSensitivity, sizeof(caseSensitivity)))
+      << ::GetLastError();
+  ::CloseHandle(handle);
+
+  std::ofstream(directory / L"usvfs_case.txt");
+  std::ofstream(directory / L"USVFS_CASE.txt");
+  return directory;
+}
+
+}  // namespace
+
+// ntdll is the reference for a case-sensitive directory: names that differ in case
+// only are different entries, and listed as such
+TEST_F(USVFSTest, NtQueryDirectoryFileListsCaseVariantsLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const std::filesystem::path directory = caseSensitiveDirectory();
+  SCOPED_TRACE(describeDirectory(directory));
+  // a query moves its handle through the directory, so ntdll and the hook each list
+  // through a handle of their own
+  HANDLE nativeHandle = openHookedDirectory(directory);
+  HANDLE hookedHandle = openHookedDirectory(directory);
+  ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+  const ListingQuery listing{FileDirectoryInformation, 0x1000, false, L"*"};
+  const std::vector<ListedQuery> expected =
+      listQueries(nativeQueryDirectoryFile(), nativeHandle, listing);
+  const std::vector<ListedQuery> actual =
+      listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+
+  const DirectoryRecordLayout layout =
+      findDirectoryRecordLayout(FileDirectoryInformation).value();
+  ASSERT_EQ(STATUS_SUCCESS, expected.front().outcome.result);
+  ASSERT_EQ(4u, recordOffsets(layout, expected.front().data).size())
+      << "\".\", \"..\" and both files";
+  ASSERT_EQ(expected.size(), actual.size());
+  for (size_t query = 0; query < expected.size(); ++query) {
+    SCOPED_TRACE(query);
+    expectSameOutcome(expected[query].outcome, actual[query].outcome);
+    expectSameRecords(layout, expected[query].data, actual[query].data);
+  }
+
+  usvfs::hook_NtClose(nativeHandle);
+  usvfs::hook_NtClose(hookedHandle);
 }
