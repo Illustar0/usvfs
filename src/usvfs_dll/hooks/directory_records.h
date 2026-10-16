@@ -4,6 +4,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 
 #include <ntdll_declarations.h>
 
@@ -53,6 +54,8 @@ public:
   // place: WOW64 accepts the buffer of a legacy query at any address, so the name
   // need not be aligned for WCHAR.
   std::wstring fileName() const;
+  // the bytes of the record without the padding, or as many of them as there are
+  std::span<const std::byte> bytes() const;
 
 private:
   // reads 0 for a field past the bytes
@@ -60,4 +63,51 @@ private:
 
   DirectoryRecordLayout m_layout;
   std::span<const std::byte> m_bytes;
+};
+
+// The buffer of a directory query, filled with records the way ntdll fills it:
+// each record starts a multiple of 8 bytes from the start of the buffer, the
+// NextEntryOffset of the one before links to it, and the size reported ends with the
+// last record, without padding after it.
+class DirectoryOutput
+{
+public:
+  // How the query the output answers asks for its entries.
+  struct Options
+  {
+    bool isSingleEntry;
+    // an empty result is STATUS_NO_SUCH_FILE on the first call only
+    bool isFirstCall;
+  };
+
+  DirectoryOutput(std::span<std::byte> buffer, const DirectoryRecordLayout& layout,
+                  Options options);
+
+  bool isEmpty() const;
+  // whether the query wants no further record: it asked for a single one and has it
+  bool isSatisfied() const;
+  // the bytes written, up to the end of the last record
+  ULONG size() const;
+
+  // Writes a record as it is. Returns false, and writes nothing, when the record does
+  // not fit, is truncated, or the query is satisfied.
+  bool append(const DirectoryRecord& record);
+  // Writes a record under another name, on the same terms as append.
+  bool appendRenamed(const DirectoryRecord& record, std::wstring_view name);
+
+  // Turns the status a fill ended with into the result of the query, and writes the
+  // status block unless the result is an error, which ntdll reports without it.
+  NTSTATUS complete(NTSTATUS fillStatus, IO_STATUS_BLOCK& statusBlock) const;
+
+private:
+  // Makes room for a record after the last one and links the last one to it.
+  // Returns nothing when the record does not fit or the query is satisfied.
+  std::optional<std::span<std::byte>> place(size_t recordSize);
+
+  std::span<std::byte> m_buffer;
+  DirectoryRecordLayout m_layout;
+  Options m_options;
+  // where the last record starts; nothing while the output is empty
+  std::optional<size_t> m_lastRecordOffset;
+  size_t m_size = 0;
 };

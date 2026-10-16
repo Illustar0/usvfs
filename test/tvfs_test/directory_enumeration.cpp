@@ -808,14 +808,14 @@ struct SyntheticRecord
 
   SyntheticRecord(std::wstring_view name, ULONG nextEntryOffset)
   {
-    auto* fields            = reinterpret_cast<Record*>(storage.data());
-    fields->NextEntryOffset = nextEntryOffset;
-    fields->FileNameLength  = static_cast<ULONG>(name.size() * sizeof(WCHAR));
+    fields().NextEntryOffset = nextEntryOffset;
+    fields().FileNameLength  = static_cast<ULONG>(name.size() * sizeof(WCHAR));
     std::memcpy(storage.data() + offsetof(Record, FileName), name.data(),
-                fields->FileNameLength);
-    size = offsetof(Record, FileName) + fields->FileNameLength;
+                fields().FileNameLength);
+    size = offsetof(Record, FileName) + fields().FileNameLength;
   }
 
+  Record& fields() { return *reinterpret_cast<Record*>(storage.data()); }
   std::span<const std::byte> bytes() const { return std::span(storage).first(size); }
 };
 
@@ -969,4 +969,309 @@ TEST(DirectoryRecordLayoutTest, KnowsOnlyClassesWhoseRecordsCarryAFileName)
   EXPECT_TRUE(findDirectoryRecordLayout(FileDirectoryInformation).has_value());
   EXPECT_FALSE(findDirectoryRecordLayout(FileStandardInformation).has_value());
   EXPECT_FALSE(findDirectoryRecordLayout(FileObjectIdInformation).has_value());
+}
+
+namespace
+{
+
+// Returns the data each query of a native listing returned into a buffer of the
+// given length.
+std::vector<std::vector<std::byte>>
+listNativeQueries(const std::filesystem::path& path,
+                  FILE_INFORMATION_CLASS informationClass, ULONG length)
+{
+  const HANDLE directory = ::CreateFileW(
+      path.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  EXPECT_NE(INVALID_HANDLE_VALUE, directory);
+
+  std::vector<std::vector<std::byte>> queries;
+  std::vector<std::byte> buffer(length);
+  IO_STATUS_BLOCK statusBlock;
+  while (nativeQueryDirectoryFile()(directory, nullptr, nullptr, nullptr, &statusBlock,
+                                    buffer.data(), length, informationClass, FALSE,
+                                    nullptr, FALSE) == STATUS_SUCCESS) {
+    queries.emplace_back(buffer.begin(), buffer.begin() + statusBlock.Information);
+  }
+  ::CloseHandle(directory);
+  return queries;
+}
+
+// Returns where the records in the data of a query start.
+std::vector<size_t> recordOffsets(const DirectoryRecordLayout& layout,
+                                  std::span<const std::byte> data)
+{
+  std::vector<size_t> offsets{0};
+  for (;;) {
+    const ULONG next =
+        DirectoryRecord(layout, data.subspan(offsets.back())).nextEntryOffset();
+    if (next == 0) {
+      return offsets;
+    }
+    offsets.push_back(offsets.back() + next);
+  }
+}
+
+}  // namespace
+
+// ntdll is the reference for where records go and for the size reported
+TYPED_TEST(DirectoryRecordTest, LaysOutRecordsLikeNtdll)
+{
+  // small enough for the listing to take several queries
+  constexpr ULONG LENGTH             = 0x800;
+  const DirectoryRecordLayout layout = TestFixture::layout();
+  for (const std::filesystem::path& directory : nativeListingDirectories()) {
+    SCOPED_TRACE(describeDirectory(directory));
+    const std::vector<std::vector<std::byte>> queries =
+        listNativeQueries(directory, layout.informationClass, LENGTH);
+    ASSERT_LE(2u, queries.size());
+
+    for (size_t query = 0; query < queries.size(); ++query) {
+      SCOPED_TRACE(query);
+      const std::span<const std::byte> expected(queries[query]);
+      const std::vector<size_t> offsets = recordOffsets(layout, expected);
+      std::vector<std::byte> buffer(LENGTH);
+      DirectoryOutput output(buffer, layout,
+                             {.isSingleEntry = false, .isFirstCall = false});
+      for (const size_t offset : offsets) {
+        ASSERT_TRUE(output.append(DirectoryRecord(layout, expected.subspan(offset))));
+      }
+
+      // the records with their links, and the size; the padding between them is
+      // whatever the buffer held
+      EXPECT_EQ(expected.size(), output.size());
+      for (const size_t offset : offsets) {
+        const size_t size = DirectoryRecord(layout, expected.subspan(offset)).size();
+        EXPECT_TRUE(std::ranges::equal(expected.subspan(offset, size),
+                                       std::span(buffer).subspan(offset, size)))
+            << "record at " << offset;
+      }
+    }
+  }
+}
+
+// The rule NtfsQueryDirectory and RefsQueryDirectory apply to a record after the
+// first: it fits when it ends, without the padding after it, within the buffer.
+// Native listings are no reference for it: where a query ends depends on the
+// filesystem, on the filters above it, and on how NTFS makes up "." and "..".
+TYPED_TEST(DirectoryRecordTest, FitsARecordThatEndsWithTheBuffer)
+{
+  using Record = typename TestFixture::Record;
+  const SyntheticRecord<Record> first(L"usvfs.txt", 0);
+  const SyntheticRecord<Record> second(L"usvfs_second.txt", 0);
+  const size_t end = (first.size + 7) / 8 * 8 + second.size;
+
+  for (const size_t length : {end, end - 1}) {
+    SCOPED_TRACE(length);
+    std::vector<std::byte> buffer(length);
+    DirectoryOutput output(buffer, TestFixture::layout(),
+                           {.isSingleEntry = false, .isFirstCall = false});
+    ASSERT_TRUE(output.append(DirectoryRecord(TestFixture::layout(), first.bytes())));
+
+    EXPECT_EQ(length == end,
+              output.append(DirectoryRecord(TestFixture::layout(), second.bytes())));
+    EXPECT_EQ(length == end ? end : first.size, output.size());
+  }
+}
+
+TYPED_TEST(DirectoryRecordTest, WritesOneRecordForASingleEntryQuery)
+{
+  const SyntheticRecord<typename TestFixture::Record> synthetic(L"usvfs.txt", 0);
+  const DirectoryRecord record(TestFixture::layout(), synthetic.bytes());
+  std::vector<std::byte> buffer(0x400);
+  DirectoryOutput output(buffer, TestFixture::layout(),
+                         {.isSingleEntry = true, .isFirstCall = false});
+
+  EXPECT_FALSE(output.isSatisfied());
+  ASSERT_TRUE(output.append(record));
+  EXPECT_TRUE(output.isSatisfied());
+  EXPECT_FALSE(output.append(record));
+  EXPECT_EQ(synthetic.size, output.size());
+}
+
+TYPED_TEST(DirectoryRecordTest, WritesARecordUnderAnotherName)
+{
+  SyntheticRecord<typename TestFixture::Record> synthetic(L"usvfs.txt", 0x100);
+  synthetic.fields().FileIndex = 0x12345678;
+  std::vector<std::byte> buffer(0x400);
+  DirectoryOutput output(buffer, TestFixture::layout(),
+                         {.isSingleEntry = false, .isFirstCall = false});
+
+  ASSERT_TRUE(
+      output.appendRenamed(DirectoryRecord(TestFixture::layout(), synthetic.bytes()),
+                           L"usvfs_a_longer_name.txt"));
+
+  const DirectoryRecord renamed(TestFixture::layout(),
+                                std::span(buffer).first(output.size()));
+  EXPECT_EQ(L"usvfs_a_longer_name.txt", renamed.fileName());
+  EXPECT_EQ(0u, renamed.nextEntryOffset());
+  EXPECT_EQ(output.size(), renamed.size());
+  EXPECT_EQ(
+      0x12345678u,
+      reinterpret_cast<const typename TestFixture::Record*>(buffer.data())->FileIndex);
+}
+
+TYPED_TEST(DirectoryRecordTest, RefusesATruncatedRecord)
+{
+  const SyntheticRecord<typename TestFixture::Record> synthetic(L"usvfs.txt", 0);
+  const DirectoryRecord record(TestFixture::layout(),
+                               synthetic.bytes().first(synthetic.size - sizeof(WCHAR)));
+  std::vector<std::byte> buffer(0x400);
+  DirectoryOutput output(buffer, TestFixture::layout(),
+                         {.isSingleEntry = false, .isFirstCall = false});
+
+  EXPECT_FALSE(output.append(record));
+  EXPECT_FALSE(output.appendRenamed(record, L"usvfs.txt"));
+  EXPECT_TRUE(output.isEmpty());
+}
+
+namespace
+{
+
+struct NativeQuery
+{
+  QueryOutcome outcome;
+  // the bytes the status block reports, for a query that succeeded
+  std::vector<std::byte> data;
+};
+
+// Lists a directory through ntdll with status blocks that show whether a query wrote
+// them, and returns every query up to the first that fails.
+std::vector<NativeQuery> listNativeOutcomes(const std::filesystem::path& path,
+                                            std::wstring_view pattern, ULONG length)
+{
+  const HANDLE directory = ::CreateFileW(
+      path.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  EXPECT_NE(INVALID_HANDLE_VALUE, directory);
+  usvfs::UnicodeString fileName(pattern.data(), pattern.size());
+
+  std::vector<NativeQuery> queries;
+  std::vector<std::byte> buffer(length);
+  do {
+    NativeQuery& query                    = queries.emplace_back();
+    query.outcome.statusBlock.Status      = UNWRITTEN_STATUS;
+    query.outcome.statusBlock.Information = UNWRITTEN_INFORMATION;
+    query.outcome.result                  = nativeQueryDirectoryFile()(
+        directory, nullptr, nullptr, nullptr, &query.outcome.statusBlock, buffer.data(),
+        length, FileDirectoryInformation, FALSE, static_cast<PUNICODE_STRING>(fileName),
+        FALSE);
+    if (query.outcome.result == STATUS_SUCCESS) {
+      query.data.assign(buffer.begin(),
+                        buffer.begin() + query.outcome.statusBlock.Information);
+    }
+  } while (queries.back().outcome.result == STATUS_SUCCESS);
+  ::CloseHandle(directory);
+  return queries;
+}
+
+// Writes the records of a native query to a DirectoryOutput that ends with them, and
+// completes it with the status a fill of the output ended with.
+QueryOutcome replay(const NativeQuery& native, bool isFirstCall, NTSTATUS fillStatus)
+{
+  const DirectoryRecordLayout layout =
+      findDirectoryRecordLayout(FileDirectoryInformation).value();
+  std::vector<std::byte> buffer(native.data.size());
+  DirectoryOutput output(buffer, layout,
+                         {.isSingleEntry = false, .isFirstCall = isFirstCall});
+  if (!native.data.empty()) {
+    for (const size_t offset : recordOffsets(layout, native.data)) {
+      EXPECT_TRUE(output.append(
+          DirectoryRecord(layout, std::span(native.data).subspan(offset))));
+    }
+  }
+
+  QueryOutcome outcome;
+  outcome.statusBlock.Status      = UNWRITTEN_STATUS;
+  outcome.statusBlock.Information = UNWRITTEN_INFORMATION;
+  outcome.result                  = output.complete(fillStatus, outcome.statusBlock);
+  return outcome;
+}
+
+// Whether the filesystem pends the first query for a pattern instead of completing it
+// at once, which only an asynchronous handle shows.
+bool isFirstQueryPended(const std::filesystem::path& path, std::wstring_view pattern)
+{
+  const HANDLE directory = ::CreateFileW(
+      path.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+  EXPECT_NE(INVALID_HANDLE_VALUE, directory);
+  const HANDLE event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  usvfs::UnicodeString fileName(pattern.data(), pattern.size());
+
+  IO_STATUS_BLOCK statusBlock;
+  alignas(8) std::array<std::byte, 0x800> buffer;
+  const NTSTATUS status = nativeQueryDirectoryFile()(
+      directory, event, nullptr, nullptr, &statusBlock, buffer.data(),
+      static_cast<ULONG>(buffer.size()), FileDirectoryInformation, FALSE,
+      static_cast<PUNICODE_STRING>(fileName), FALSE);
+  if (status == STATUS_PENDING) {
+    // the query writes the buffer and status block until it completes
+    ::WaitForSingleObject(event, INFINITE);
+  }
+  ::CloseHandle(event);
+  ::CloseHandle(directory);
+  return status == STATUS_PENDING;
+}
+
+}  // namespace
+
+// ntdll is the reference for how the queries of a listing complete: a query reports
+// its records whether its fill ran out of room or of records, and the end of the
+// listing comes with the query after the last records.
+TEST(DirectoryOutputTest, CompletesTheQueriesOfAListingLikeNtdll)
+{
+  for (const std::filesystem::path& directory : nativeListingDirectories()) {
+    SCOPED_TRACE(describeDirectory(directory));
+    const std::vector<NativeQuery> queries = listNativeOutcomes(directory, L"*", 0x800);
+    ASSERT_LE(3u, queries.size());
+    ASSERT_EQ(STATUS_NO_MORE_FILES, queries.back().outcome.result);
+
+    for (size_t query = 0; query + 1 < queries.size(); ++query) {
+      SCOPED_TRACE(query);
+      for (const NTSTATUS fillStatus : {STATUS_SUCCESS, STATUS_NO_MORE_FILES}) {
+        SCOPED_TRACE(fillStatus);
+        expectSameOutcome(queries[query].outcome,
+                          replay(queries[query], query == 0, fillStatus));
+      }
+    }
+    expectSameOutcome(queries.back().outcome,
+                      replay(queries.back(), false, STATUS_NO_MORE_FILES));
+  }
+}
+
+// ntdll is the reference for a query that fails at once, as the queries of the hook
+// do. The I/O manager writes the status block of a failed query only when the
+// filesystem pended it (IopCompleteRequest checks Irp->PendingReturned), which ReFS
+// does here and NTFS does not, so a pended query is a reference for the result only.
+TEST(DirectoryOutputTest, FailsAQueryThatMatchesNothingLikeNtdll)
+{
+  constexpr std::wstring_view PATTERN = L"usvfs_no_such_file_*";
+  for (const std::filesystem::path& directory : nativeListingDirectories()) {
+    SCOPED_TRACE(describeDirectory(directory));
+    const std::vector<NativeQuery> queries =
+        listNativeOutcomes(directory, PATTERN, 0x800);
+    ASSERT_EQ(1u, queries.size());
+    const QueryOutcome actual = replay(queries.front(), true, STATUS_NO_MORE_FILES);
+
+    if (isFirstQueryPended(directory, PATTERN)) {
+      EXPECT_EQ(queries.front().outcome.result, actual.result);
+      continue;
+    }
+    expectSameOutcome(queries.front().outcome, actual);
+  }
+}
+
+TEST(DirectoryOutputTest, PassesAnErrorOnLikeNtdll)
+{
+  for (const std::filesystem::path& directory : nativeListingDirectories()) {
+    SCOPED_TRACE(describeDirectory(directory));
+    // shorter than any record, which ntdll rejects before the filesystem sees it
+    const std::vector<NativeQuery> queries = listNativeOutcomes(directory, L"*", 1);
+    ASSERT_EQ(1u, queries.size());
+    ASSERT_EQ(STATUS_INFO_LENGTH_MISMATCH, queries.front().outcome.result);
+
+    expectSameOutcome(queries.front().outcome,
+                      replay(queries.front(), true, queries.front().outcome.result));
+  }
 }

@@ -94,6 +94,11 @@ std::wstring DirectoryRecord::fileName() const
   return name;
 }
 
+std::span<const std::byte> DirectoryRecord::bytes() const
+{
+  return m_bytes.first(std::min<size_t>(size(), m_bytes.size()));
+}
+
 ULONG DirectoryRecord::readField(ULONG offset) const
 {
   ULONG value = 0;
@@ -101,4 +106,130 @@ ULONG DirectoryRecord::readField(ULONG offset) const
     std::memcpy(&value, m_bytes.data() + offset, sizeof(value));
   }
   return value;
+}
+
+namespace
+{
+
+// ntdll starts every record a multiple of 8 bytes from the start of the buffer, for
+// all twelve classes alike, whatever the alignment of their records
+constexpr size_t RECORD_SPACING = 8;
+
+void writeField(std::span<std::byte> record, ULONG offset, ULONG value)
+{
+  std::memcpy(record.data() + offset, &value, sizeof(value));
+}
+
+bool isError(NTSTATUS status)
+{
+  return (static_cast<ULONG>(status) >> 30) == 3;
+}
+
+}  // namespace
+
+DirectoryOutput::DirectoryOutput(std::span<std::byte> buffer,
+                                 const DirectoryRecordLayout& layout, Options options)
+    : m_buffer(buffer), m_layout(layout), m_options(options)
+{}
+
+bool DirectoryOutput::isEmpty() const
+{
+  return !m_lastRecordOffset;
+}
+
+bool DirectoryOutput::isSatisfied() const
+{
+  return m_options.isSingleEntry && !isEmpty();
+}
+
+ULONG DirectoryOutput::size() const
+{
+  return static_cast<ULONG>(m_size);
+}
+
+bool DirectoryOutput::append(const DirectoryRecord& record)
+{
+  if (record.isTruncated()) {
+    return false;
+  }
+  const std::optional<std::span<std::byte>> target = place(record.size());
+  if (!target) {
+    return false;
+  }
+  std::ranges::copy(record.bytes(), target->begin());
+  writeField(*target, 0, 0);
+  return true;
+}
+
+bool DirectoryOutput::appendRenamed(const DirectoryRecord& record,
+                                    std::wstring_view name)
+{
+  if (record.isTruncated()) {
+    return false;
+  }
+  const ULONG fileNameLength = static_cast<ULONG>(name.size() * sizeof(WCHAR));
+  const std::optional<std::span<std::byte>> target =
+      place(m_layout.fileNameOffset + fileNameLength);
+  if (!target) {
+    return false;
+  }
+  std::ranges::copy(record.bytes().first(m_layout.fileNameOffset), target->begin());
+  writeField(*target, 0, 0);
+  writeField(*target, m_layout.fileNameLengthOffset, fileNameLength);
+  std::memcpy(target->data() + m_layout.fileNameOffset, name.data(), fileNameLength);
+
+  // Kept from the stock code until virtual entries go without 8.3 names (D1): an
+  // 8.3 name is replaced by what GetShortPathNameW makes of the new name, relative
+  // to the current directory, stored as a count of characters.
+  if (m_layout.shortName) {
+    CCHAR shortNameLength;
+    std::memcpy(&shortNameLength, target->data() + m_layout.shortName->lengthOffset,
+                sizeof(shortNameLength));
+    if (shortNameLength > 0) {
+      const std::wstring terminatedName(name);
+      shortNameLength = static_cast<CCHAR>(GetShortPathNameW(
+          terminatedName.c_str(),
+          reinterpret_cast<LPWSTR>(target->data() + m_layout.shortName->offset), 8));
+      std::memcpy(target->data() + m_layout.shortName->lengthOffset, &shortNameLength,
+                  sizeof(shortNameLength));
+    }
+  }
+  return true;
+}
+
+NTSTATUS DirectoryOutput::complete(NTSTATUS fillStatus,
+                                   IO_STATUS_BLOCK& statusBlock) const
+{
+  NTSTATUS status = fillStatus;
+  if (fillStatus == STATUS_NO_MORE_FILES) {
+    // records written by this query are reported first, the end by the next one;
+    // ending without any record is an error on the first query only
+    status = !isEmpty()              ? STATUS_SUCCESS
+             : m_options.isFirstCall ? STATUS_NO_SUCH_FILE
+                                     : STATUS_NO_MORE_FILES;
+  }
+  if (!isError(status)) {
+    statusBlock.Status      = status;
+    statusBlock.Information = m_size;
+  }
+  return status;
+}
+
+std::optional<std::span<std::byte>> DirectoryOutput::place(size_t recordSize)
+{
+  if (isSatisfied()) {
+    return std::nullopt;
+  }
+  const size_t offset =
+      isEmpty() ? 0 : (m_size + RECORD_SPACING - 1) / RECORD_SPACING * RECORD_SPACING;
+  if (offset + recordSize > m_buffer.size()) {
+    return std::nullopt;
+  }
+  if (m_lastRecordOffset) {
+    writeField(m_buffer.subspan(*m_lastRecordOffset), 0,
+               static_cast<ULONG>(offset - *m_lastRecordOffset));
+  }
+  m_lastRecordOffset = offset;
+  m_size             = offset + recordSize;
+  return m_buffer.subspan(offset, recordSize);
 }
