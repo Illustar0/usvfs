@@ -567,8 +567,9 @@ private:
   std::vector<Entry> m_entries;
   // index of the next entry to try; the ones before it are done
   size_t m_nextEntry = 0;
-  // the names of the entries written, so that none is written twice
-  CaseInsensitiveNameSet m_names;
+  // the names of the entries written, so that none is written twice; none while the
+  // redirection tree keeps them apart already (see the constructor)
+  std::optional<CaseInsensitiveNameSet> m_names;
   // where the source directories read, aligned as the regular reader's staging area.
   // A read holds a record whole, whatever the length of its name: the entry goes out
   // under its virtual name, whose length alone decides whether it fits the query.
@@ -599,6 +600,21 @@ VirtualEntryReader::VirtualEntryReader(const std::vector<VirtualMatch>& matches)
     m_sources[sourceIndex->second].addFileName(fileName);
     m_entries.push_back({sourceIndex->second, std::move(fileName), match.virtualName});
   }
+
+  // The tree compares the names of its nodes folding the ASCII letters, as
+  // RtlUpcaseUnicodeChar folds them, so no two virtual names that are all ASCII name
+  // one file. It folds no other letter, so names that differ only in the case of one
+  // (U+00C4 and U+00E4, say) are nodes of their own; and an entry without a virtual
+  // name goes out under the name of its file, which the tree does not hold.
+  const bool areAllAscii = std::ranges::all_of(m_entries, [](const Entry& entry) {
+    return !entry.virtualName.empty() &&
+           std::ranges::all_of(entry.virtualName, [](WCHAR c) {
+             return c < 0x80;
+           });
+  });
+  if (!areAllAscii) {
+    m_names.emplace();
+  }
 }
 
 NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& output)
@@ -618,7 +634,7 @@ NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
     // the records of a source directory lie in a buffer of its own, aligned for WCHAR
     const std::wstring_view name =
         entry.virtualName.empty() ? record->fileNameView() : entry.virtualName;
-    if (m_names.contains(name)) {
+    if (m_names && m_names->contains(name)) {
       continue;
     }
     const bool isWritten = entry.virtualName.empty()
@@ -629,7 +645,9 @@ NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
     if (!isWritten) {
       return output.isOverflowed() ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     }
-    m_names.insert(name);
+    if (m_names) {
+      m_names->insert(name);
+    }
   }
   return output.isEmpty() ? STATUS_NO_MORE_FILES : STATUS_SUCCESS;
 }
