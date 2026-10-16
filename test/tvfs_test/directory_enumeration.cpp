@@ -208,10 +208,14 @@ TEST_F(USVFSTest, NtQueryDirectoryFileRestartClosesReopenedHandle)
   std::unique_ptr<usvfs::HookContext> ctx(
       usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
 
-  // backup intent makes the scan reopen the directory into a handle of its own
-  HANDLE hdl = hooked_NtOpenFile(
-      L"C:\\", FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-      FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT);
+  // a mapped entry makes the scan open the directory into a handle of its own
+  const std::filesystem::path directory = test::path_of_test_temp(L"restart_reopened");
+  std::filesystem::create_directories(directory);
+  ctx->redirectionTable().addFile((directory / L"usvfs_virtual.txt").c_str(),
+                                  usvfs::RedirectionDataLocal(REAL_FILEA));
+  HANDLE hdl = hooked_NtOpenFile(directory.c_str(), FILE_GENERIC_READ,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
   ASSERT_NE(INVALID_HANDLE_VALUE, hdl);
 
   IO_STATUS_BLOCK status;
@@ -2233,7 +2237,8 @@ TEST_F(USVFSTest, NtQueryDirectoryFileEndsAnEmptyRestartLikeNtdll)
 // ntdll is the reference for the pattern a restart lists with, as NTFS and ReFS latch
 // it: that of the first query, or every name without one, until a restart brings one
 // that is not empty; a query that does not restart ignores its pattern. The virtual
-// entries follow it as the regular ones do, also with a directory the scan reopens.
+// entries follow it as the regular ones do, which the scan reads through a handle of
+// its own.
 TEST_F(USVFSTest, NtQueryDirectoryFileRestartsWithTheLatchedPatternLikeNtdll)
 {
   // a guard against a listing that does not end
@@ -2322,34 +2327,26 @@ TEST_F(USVFSTest, NtQueryDirectoryFileRestartsWithTheLatchedPatternLikeNtdll)
   ASSERT_EQ((std::vector<std::wstring>{L"a_regular.txt", L"a_virtual.txt"}),
             reference.back().names);
 
-  // backup intent makes the scan reopen the directory into a handle of its own
-  const std::pair<std::string_view, ULONG> handleKinds[] = {
-      {"queried handle", 0}, {"reopened directory", FILE_OPEN_FOR_BACKUP_INTENT}};
-  for (const auto& [handleDescription, backupIntent] : handleKinds) {
-    for (const Sequence& sequence : sequences) {
-      SCOPED_TRACE(std::format("{}, {}", handleDescription, sequence.description));
-      HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
-      HANDLE hookedHandle   = hooked_NtOpenFile(
-          virtualDirectory.c_str(), FILE_GENERIC_READ,
-          FILE_SHARE_READ | FILE_SHARE_WRITE,
-          FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | backupIntent);
-      ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
-      ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+  for (const Sequence& sequence : sequences) {
+    SCOPED_TRACE(sequence.description);
+    HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
+    HANDLE hookedHandle   = openHookedDirectory(virtualDirectory);
+    ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
 
-      const std::vector<Listing> expected =
-          list(nativeQueryDirectoryFile(), namesakeHandle, sequence);
-      const std::vector<Listing> actual =
-          list(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, sequence);
-      for (size_t index = 0; index < sequence.patterns.size(); ++index) {
-        SCOPED_TRACE(std::format("listing {}", index));
-        EXPECT_EQ(expected[index].firstResult, actual[index].firstResult);
-        EXPECT_EQ(expected[index].names, actual[index].names);
-        EXPECT_EQ(expected[index].endResult, actual[index].endResult);
-      }
-
-      usvfs::hook_NtClose(namesakeHandle);
-      usvfs::hook_NtClose(hookedHandle);
+    const std::vector<Listing> expected =
+        list(nativeQueryDirectoryFile(), namesakeHandle, sequence);
+    const std::vector<Listing> actual =
+        list(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, sequence);
+    for (size_t index = 0; index < sequence.patterns.size(); ++index) {
+      SCOPED_TRACE(std::format("listing {}", index));
+      EXPECT_EQ(expected[index].firstResult, actual[index].firstResult);
+      EXPECT_EQ(expected[index].names, actual[index].names);
+      EXPECT_EQ(expected[index].endResult, actual[index].endResult);
     }
+
+    usvfs::hook_NtClose(namesakeHandle);
+    usvfs::hook_NtClose(hookedHandle);
   }
 }
 
@@ -2453,6 +2450,78 @@ TEST_F(USVFSTest, NtQueryDirectoryFileExHandlesQueryFlagsLikeNtdll)
               listNames(&usvfs::hook_NtQueryDirectoryFileEx, hookedHandle));
 
     usvfs::hook_NtClose(namesakeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
+}
+
+// ntdll is the reference for a directory that a mapping source is linked onto, as it
+// lists files of the virtual names: the files on disk at the virtual path and the
+// virtual entries, whichever handle the caller opened. The open hook reroutes the
+// handle to the mapping source unless it was opened with backup intent, so the scan
+// reads the physical directory through a handle of its own.
+TEST_F(USVFSTest,
+       NtQueryDirectoryFileListsThePhysicalDirectoryAtTheVirtualPathLikeNtdll)
+{
+  // a guard against a listing that does not end
+  constexpr size_t MAXIMUM_QUERIES = 100;
+  const std::filesystem::path root = test::path_of_test_temp(L"physical_at_virtual");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path namesakeDirectory = root / L"namesakes";
+  const std::filesystem::path virtualDirectory  = root / L"virtual";
+  const std::filesystem::path sourceDirectory   = root / L"source";
+  for (const std::filesystem::path& directory :
+       {namesakeDirectory, virtualDirectory, sourceDirectory}) {
+    std::filesystem::create_directories(directory);
+  }
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  std::ofstream{namesakeDirectory / L"a_regular.txt"};
+  std::ofstream{virtualDirectory / L"a_regular.txt"};
+  ctx->redirectionTable().addDirectory(
+      virtualDirectory.c_str(), usvfs::RedirectionDataLocal(sourceDirectory.string()));
+  for (const std::wstring_view name : {L"a_virtual.txt", L"shadowed.txt"}) {
+    std::ofstream{namesakeDirectory / name};
+    std::ofstream{sourceDirectory / name};
+    ctx->redirectionTable().addFile(
+        (virtualDirectory / name).c_str(),
+        usvfs::RedirectionDataLocal((sourceDirectory / name).string()));
+  }
+  // shadowed by the virtual entry of the same name, so listed once
+  std::ofstream{virtualDirectory / L"shadowed.txt"};
+
+  const auto listNames = [](NtQueryDirectoryFile_type query, HANDLE directory) {
+    const DirectoryRecordLayout layout =
+        findDirectoryRecordLayout(FileDirectoryInformation).value();
+    std::vector<std::wstring> names;
+    for (size_t count = 0; count < MAXIMUM_QUERIES; ++count) {
+      const ListedQuery listed =
+          queryOnce(query, directory, {FileDirectoryInformation, 0x1000, false, L"*"});
+      if (listed.outcome.result != STATUS_SUCCESS) {
+        break;
+      }
+      std::ranges::move(recordNames(layout, listed.data), std::back_inserter(names));
+    }
+    // the virtual entries follow the regular ones in an order of their own
+    std::ranges::sort(names);
+    return names;
+  };
+
+  HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
+  ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
+  const std::vector<std::wstring> expected =
+      listNames(nativeQueryDirectoryFile(), namesakeHandle);
+  usvfs::hook_NtClose(namesakeHandle);
+
+  const std::pair<std::string_view, ULONG> handleKinds[] = {
+      {"rerouted handle", 0}, {"backup intent", FILE_OPEN_FOR_BACKUP_INTENT}};
+  for (const auto& [handleDescription, backupIntent] : handleKinds) {
+    SCOPED_TRACE(handleDescription);
+    HANDLE hookedHandle = hooked_NtOpenFile(
+        virtualDirectory.c_str(), FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | backupIntent);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+    EXPECT_EQ(expected, listNames(&usvfs::hook_NtQueryDirectoryFile, hookedHandle));
     usvfs::hook_NtClose(hookedHandle);
   }
 }

@@ -27,7 +27,6 @@
 
 #include "directory_records.h"
 #include "handle_tracker.h"
-#include "sharedids.h"
 
 namespace ulog = usvfs::log;
 namespace ush  = usvfs::shared;
@@ -673,13 +672,12 @@ private:
 DirectoryScans& directoryScans = *new DirectoryScans;
 
 // Returns the virtual entries of a directory that match a pattern, all of them
-// without one.
-std::vector<VirtualMatch>
+// without one, or nothing if the directory is not in the redirection tree.
+std::optional<std::vector<VirtualMatch>>
 gatherVirtualEntries(const UnicodeString& dirName,
                      const usvfs::RedirectionTreeContainer& redir,
                      const std::optional<std::wstring>& pattern)
 {
-  std::vector<VirtualMatch> matches;
   LPCWSTR dirNameW = static_cast<LPCWSTR>(dirName);
   // fix directory name. I'd love to know why microsoft sometimes uses "\??\" vs
   // "\\?\"
@@ -689,8 +687,9 @@ gatherVirtualEntries(const UnicodeString& dirName,
   }
   auto node = redir->findNode(boost::filesystem::path(dirNameW));
   if (node.get() == nullptr) {
-    return matches;
+    return std::nullopt;
   }
+  std::vector<VirtualMatch> matches;
 
   // RtlIsNameInExpression wants the pattern upcased, as it ignores case; it reads the
   // DOS wildcards as the filesystem does.
@@ -735,17 +734,28 @@ gatherVirtualEntries(const UnicodeString& dirName,
   return matches;
 }
 
-// Opens the directory the regular entries are read from: the physical directory at
-// the search path a hook stored for the handle. Returns an invalid handle if there is
-// none or opening it fails, in which case the caller's handle is read instead. A
-// search path missing on disk is where the hooks reroute any open of it, the caller's
-// one included.
-OwnedHandle openRegularSource(const std::optional<std::wstring>& storedSearchPath)
+// Returns whether a handle was granted the access that listing a directory takes,
+// which the I/O manager checks before the filesystem sees a query.
+bool canListDirectory(HANDLE handle)
 {
-  if (!storedSearchPath) {
+  PUBLIC_OBJECT_BASIC_INFORMATION information{};
+  return NtQueryObject(handle, ObjectBasicInformation, &information,
+                       sizeof(information), nullptr) >= 0 &&
+         (information.GrantedAccess & FILE_LIST_DIRECTORY) != 0;
+}
+
+// Opens the directory the regular entries of a directory in the redirection tree are
+// read from: the physical directory at its virtual path, since the open hook may have
+// rerouted the caller's handle to a mapping source. Returns an invalid handle if it
+// does not exist on disk, where the hooks reroute any open of it, or if the caller's
+// handle may not list it, which only a read of that handle reports like ntdll does;
+// the caller's handle is read then.
+OwnedHandle openRegularSource(HANDLE callerHandle, const UnicodeString& virtualPath)
+{
+  if (!canListDirectory(callerHandle)) {
     return OwnedHandle();
   }
-  return openScanDirectory(*storedSearchPath);
+  return openScanDirectory(static_cast<LPCWSTR>(virtualPath));
 }
 
 // Returns whether every I/O on the handle completes before returning. Only then may
@@ -791,45 +801,40 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* r
     return;
   }
 
-  // The stored search path also names the virtual directory, so it is looked up
-  // under the same context lock as the virtual entries.
-  std::optional<std::wstring> storedSearchPath;
-  UnicodeString searchPath;
-  std::vector<VirtualMatch> virtualMatches;
+  // the path the caller opened, before the open hook rerouted it
+  const UnicodeString virtualPath = ntdllHandleTracker.lookup(query.handle);
+  std::optional<std::vector<VirtualMatch>> virtualMatches;
   {
     HookContext::Ptr context = WRITE_CONTEXT();
-
-    const SearchHandleMap& searchMap =
-        context->customData<SearchHandleMap>(SearchHandles);
-    if (const auto iter = searchMap.find(query.handle); iter != searchMap.end()) {
-      storedSearchPath = iter->second;
-    }
-    searchPath = storedSearchPath ? UnicodeString(storedSearchPath->c_str())
-                                  : ntdllHandleTracker.lookup(query.handle);
     virtualMatches =
-        gatherVirtualEntries(searchPath, context->redirectionTable(), m_pattern);
+        gatherVirtualEntries(virtualPath, context->redirectionTable(), m_pattern);
   }
-  // opened after the context lock is released, as it does I/O
-  OwnedHandle regularSource = openRegularSource(storedSearchPath);
+  // Opened after the context lock is released, as it does I/O. The open hook
+  // reroutes only a directory in the tree, so the caller's handle of any other is the
+  // physical directory already.
+  OwnedHandle regularSource =
+      virtualMatches ? openRegularSource(query.handle, virtualPath) : OwnedHandle();
+  const std::vector<VirtualMatch> matches =
+      std::move(virtualMatches).value_or(std::vector<VirtualMatch>());
 
   // logged once per scan, under the hook's name so that both entry points stay
   // distinguishable
   ulog::CallLogger(query.isEx ? "hook_NtQueryDirectoryFileEx"
                               : "hook_NtQueryDirectoryFile")
-      .addParam("path", searchPath)
+      .addParam("path", virtualPath)
       .addParam("pattern", m_pattern.value_or(L"<every entry>"))
-      .addParam("regularSource", regularSource.isValid()
-                                     ? *storedSearchPath
-                                     : std::wstring(L"<queried handle>"))
-      .addParam("numVirtualFiles", virtualMatches.size());
+      .addParam("regularSource",
+                std::wstring(regularSource.isValid() ? L"<physical directory>"
+                                                     : L"<queried handle>"))
+      .addParam("numVirtualFiles", matches.size());
 
   CaseInsensitiveNameSet shadowedNames;
-  for (const VirtualMatch& match : virtualMatches) {
+  for (const VirtualMatch& match : matches) {
     shadowedNames.insert(match.virtualName);
   }
   m_regular.emplace(std::move(regularSource), m_pattern, std::move(shadowedNames),
                     query.isRestart());
-  m_virtual = VirtualEntryReader(virtualMatches);
+  m_virtual = VirtualEntryReader(matches);
 }
 
 NTSTATUS queryNative(const DirectoryQuery& query)
