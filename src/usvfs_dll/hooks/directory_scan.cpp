@@ -598,9 +598,9 @@ public:
 private:
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
-  // whether the queries go straight to ntdll; fixed at construction, so read
-  // without the lock
-  const bool m_isPassthrough;
+  // whether the queries go straight to ntdll; set only by the constructor, before the
+  // scan is shared, so read without the lock
+  bool m_isPassthrough;
   // the pattern the scan lists with, std::nullopt for every entry (see latchPattern);
   // fixed at construction, so the restart replacing the scan reads it unlocked
   const std::optional<std::wstring> m_pattern;
@@ -798,8 +798,9 @@ latchPattern(const DirectoryQuery& query,
   return std::wstring(query.fileName->Buffer, query.fileName->Length / sizeof(WCHAR));
 }
 
-// An asynchronous handle gets a scan that only forwards its queries, so that the
-// handle is checked once rather than on every query.
+// A scan that the virtual listing cannot or need not serve only forwards its queries,
+// so that this is decided once rather than on every query: that of an asynchronous
+// handle, and that of a directory the redirection tree does not hold.
 DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* replaced)
     : m_isPassthrough(!isSynchronousHandle(query.handle)),
       m_pattern(latchPattern(query, replaced ? replaced->m_pattern : std::nullopt)),
@@ -819,13 +820,15 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* r
     virtualMatches =
         gatherVirtualEntries(virtualPath, context->redirectionTable(), m_pattern);
   }
-  // Opened after the context lock is released, as it does I/O. The open hook
-  // reroutes only a directory in the tree, so the caller's handle of any other is the
-  // physical directory already.
-  OwnedHandle regularSource =
-      virtualMatches ? openRegularSource(query.handle, virtualPath) : OwnedHandle();
-  const std::vector<VirtualMatch> matches =
-      std::move(virtualMatches).value_or(std::vector<VirtualMatch>());
+  // The open hook reroutes only a directory in the tree, so the caller's handle of any
+  // other is the physical directory, which has no virtual entries to add.
+  if (!virtualMatches) {
+    m_isPassthrough = true;
+    return;
+  }
+  // opened after the context lock is released, as it does I/O
+  OwnedHandle regularSource = openRegularSource(query.handle, virtualPath);
+  const std::vector<VirtualMatch> matches = std::move(*virtualMatches);
 
   // logged once per scan, under the hook's name so that both entry points stay
   // distinguishable
