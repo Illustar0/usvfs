@@ -681,12 +681,28 @@ private:
 // running while the DLL unloads do not touch a destroyed registry.
 DirectoryScans& directoryScans = *new DirectoryScans;
 
-// Returns the virtual entries of a directory that match a pattern, all of them
-// without one, or nothing if the directory is not in the redirection tree.
-std::optional<std::vector<VirtualMatch>>
-gatherVirtualEntries(const UnicodeString& dirName,
-                     const usvfs::RedirectionTreeContainer& redir,
-                     const std::optional<std::wstring>& pattern)
+// The children of a directory in the redirection tree that may be listed, copied out
+// of the tree as it holds them, in UTF-8.
+struct TreeDirectorySnapshot
+{
+  struct Child
+  {
+    std::string name;
+    // empty for a directory that only the tree holds
+    std::string linkTarget;
+  };
+
+  std::vector<Child> children;
+  // the path of the directory in the tree, which a child without a link target lies
+  // under; taken only if there is such a child
+  std::optional<bfs::path> path;
+};
+
+// Copies the children of a directory out of the redirection tree, or returns nothing if
+// the tree does not hold it. Only copies while holding the hook context, which
+// excludes every other hook of the process; converting and matching the names is left
+// to gatherVirtualEntries.
+std::optional<TreeDirectorySnapshot> snapshotTreeDirectory(const UnicodeString& dirName)
 {
   LPCWSTR dirNameW = static_cast<LPCWSTR>(dirName);
   // fix directory name. I'd love to know why microsoft sometimes uses "\??\" vs
@@ -695,10 +711,44 @@ gatherVirtualEntries(const UnicodeString& dirName,
       (wcsncmp(dirNameW, LR"(\??\)", 4) == 0)) {
     dirNameW += 4;
   }
-  auto node = redir->findNode(boost::filesystem::path(dirNameW));
+  const bfs::path treePath(dirNameW);
+
+  // Read access, though for now it takes the same exclusive lock as write access
+  // (see HookContext::readAccess), so that only the shared side is taken once the two
+  // are split. The split has to keep TreeContainer::get() const in mind, which
+  // reassigns the container when another process moved the tree to a new block:
+  // readers sharing the lock must not do that concurrently.
+  using usvfs::HookContext;
+  const HookContext::ConstPtr context = READ_CONTEXT();
+  const auto node                     = context->redirectionTable()->findNode(treePath);
   if (node.get() == nullptr) {
     return std::nullopt;
   }
+  TreeDirectorySnapshot snapshot;
+  snapshot.children.reserve(node->numNodes());
+  for (auto child = node->filesBegin(); child != node->filesEnd(); ++child) {
+    const auto& subNode        = child->second;
+    const auto& linkTarget     = subNode->data().linkTarget;
+    const bool isOnlyInTheTree = linkTarget.length() == 0;
+    if ((isOnlyInTheTree && !subNode->isDirectory()) ||
+        subNode->hasFlag(usvfs::shared::FLAG_DUMMY)) {
+      continue;
+    }
+    if (isOnlyInTheTree && !snapshot.path) {
+      snapshot.path = node->path();
+    }
+    snapshot.children.push_back(
+        {subNode->name(), std::string(linkTarget.c_str(), linkTarget.length())});
+  }
+  return snapshot;
+}
+
+// Returns the virtual entries of a directory that match a pattern, all of them
+// without one.
+std::vector<VirtualMatch>
+gatherVirtualEntries(const TreeDirectorySnapshot& snapshot,
+                     const std::optional<std::wstring>& pattern)
+{
   std::vector<VirtualMatch> matches;
 
   // RtlIsNameInExpression wants the pattern upcased, as it ignores case; it reads the
@@ -714,14 +764,9 @@ gatherVirtualEntries(const UnicodeString& dirName,
     RtlUpcaseUnicodeString(&expression, &source, FALSE);
   }
 
-  for (auto child = node->filesBegin(); child != node->filesEnd(); ++child) {
-    const auto& subNode = child->second;
-    if (((subNode->data().linkTarget.length() == 0) && !subNode->isDirectory()) ||
-        subNode->hasFlag(usvfs::shared::FLAG_DUMMY)) {
-      continue;
-    }
+  for (const TreeDirectorySnapshot::Child& child : snapshot.children) {
     std::wstring vName =
-        ush::string_cast<std::wstring>(subNode->name(), ush::CodePage::UTF8);
+        ush::string_cast<std::wstring>(child.name, ush::CodePage::UTF8);
     if (upcasedPattern) {
       UNICODE_STRING name{static_cast<USHORT>(vName.size() * sizeof(WCHAR)),
                           static_cast<USHORT>(vName.size() * sizeof(WCHAR)),
@@ -731,14 +776,12 @@ gatherVirtualEntries(const UnicodeString& dirName,
       }
     }
 
-    if (subNode->data().linkTarget.length() > 0) {
-      matches.push_back({ush::string_cast<std::wstring>(
-                             subNode->data().linkTarget.c_str(), ush::CodePage::UTF8),
-                         std::move(vName)});
-    } else {
+    if (!child.linkTarget.empty()) {
       matches.push_back(
-          {ush::string_cast<std::wstring>(subNode->path().c_str(), ush::CodePage::UTF8),
+          {ush::string_cast<std::wstring>(child.linkTarget, ush::CodePage::UTF8),
            std::move(vName)});
+    } else {
+      matches.push_back({(*snapshot.path / vName).wstring(), std::move(vName)});
     }
   }
   return matches;
@@ -806,29 +849,22 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* r
       m_pattern(latchPattern(query, replaced ? replaced->m_pattern : std::nullopt)),
       m_isFirstCall(replaced == nullptr)
 {
-  using namespace usvfs;
-
   if (m_isPassthrough) {
     return;
   }
 
   // the path the caller opened, before the open hook rerouted it
   const UnicodeString virtualPath = ntdllHandleTracker.lookup(query.handle);
-  std::optional<std::vector<VirtualMatch>> virtualMatches;
-  {
-    HookContext::Ptr context = WRITE_CONTEXT();
-    virtualMatches =
-        gatherVirtualEntries(virtualPath, context->redirectionTable(), m_pattern);
-  }
+  const std::optional<TreeDirectorySnapshot> snapshot =
+      snapshotTreeDirectory(virtualPath);
   // The open hook reroutes only a directory in the tree, so the caller's handle of any
   // other is the physical directory, which has no virtual entries to add.
-  if (!virtualMatches) {
+  if (!snapshot) {
     m_isPassthrough = true;
     return;
   }
-  // opened after the context lock is released, as it does I/O
   OwnedHandle regularSource = openRegularSource(query.handle, virtualPath);
-  const std::vector<VirtualMatch> matches = std::move(*virtualMatches);
+  const std::vector<VirtualMatch> matches = gatherVirtualEntries(*snapshot, m_pattern);
 
   // logged once per scan, under the hook's name so that both entry points stay
   // distinguishable
