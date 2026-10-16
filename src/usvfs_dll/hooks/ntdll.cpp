@@ -629,6 +629,10 @@ NTSTATUS WINAPI usvfs::hook_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAc
                                        PIO_STATUS_BLOCK IoStatusBlock,
                                        ULONG ShareAccess, ULONG OpenOptions)
 {
+  if (isInternalDirectoryIo()) {
+    return ::NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
+                        ShareAccess, OpenOptions);
+  }
   NTSTATUS res = ntdll_mess_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
                                        IoStatusBlock, ShareAccess, OpenOptions);
   if (res >= 0 && FileHandle) {
@@ -813,6 +817,9 @@ NTSTATUS WINAPI usvfs::hook_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK Desired
 
 NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
 {
+  if (isInternalDirectoryIo()) {
+    return ::NtClose(Handle);
+  }
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
 
   NTSTATUS res = STATUS_NO_SUCH_FILE;

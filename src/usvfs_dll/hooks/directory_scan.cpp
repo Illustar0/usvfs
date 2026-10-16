@@ -23,7 +23,6 @@
 #include <stringutils.h>
 #include <unicodestring.h>
 
-#include "../hookcallcontext.h"
 #include "../hookcontext.h"
 
 #include "directory_records.h"
@@ -56,6 +55,33 @@ private:
   std::set<std::wstring> m_upperNames;
 };
 
+// Marks the calling thread as doing I/O of the scan itself while it lives: the
+// NtOpenFile and NtClose hooks then pass the calls straight to ntdll, so that the
+// handles of the scan are neither rerouted nor tracked, and their opening and closing
+// takes no lock of the hook context. A count rather than a flag, so that a scope
+// nested in another one does not end it.
+class InternalIoScope
+{
+public:
+  InternalIoScope() { ++s_depth; }
+  ~InternalIoScope() { --s_depth; }
+
+  InternalIoScope(const InternalIoScope&)            = delete;
+  InternalIoScope& operator=(const InternalIoScope&) = delete;
+
+  static bool isActive() { return s_depth > 0; }
+
+private:
+  static thread_local int s_depth;
+};
+
+thread_local int InternalIoScope::s_depth = 0;
+
+bool isInternalDirectoryIo()
+{
+  return InternalIoScope::isActive();
+}
+
 // A handle the scan opened itself. Move-only; closes the handle when destroyed, so
 // that a scan replaced by a restart or dropped by NtClose does not leak it.
 class OwnedHandle
@@ -85,10 +111,13 @@ public:
   // Closes the handle, if there is one.
   void reset()
   {
-    if (isValid() && !::CloseHandle(m_handle)) {
-      spdlog::get("hooks")->warn("failed to close handle {0:x}: {1}",
-                                 reinterpret_cast<std::uintptr_t>(m_handle),
-                                 ::GetLastError());
+    if (isValid()) {
+      const InternalIoScope internal;
+      if (!::CloseHandle(m_handle)) {
+        spdlog::get("hooks")->warn("failed to close handle {0:x}: {1}",
+                                   reinterpret_cast<std::uintptr_t>(m_handle),
+                                   ::GetLastError());
+      }
     }
     m_handle = INVALID_HANDLE_VALUE;
   }
@@ -97,7 +126,9 @@ private:
   HANDLE m_handle = INVALID_HANDLE_VALUE;
 };
 
-// Opens a directory for synchronous enumeration, with the usvfs hooks suppressed.
+// Opens a directory, named by a DOS path or one in the \??\ form, for synchronous
+// enumeration by the scan itself, with the usvfs hooks suppressed. Returns an invalid
+// handle if it cannot be opened.
 //
 // The legacy implementation opened mapping source directories with CreateFileW
 // without suppressing the hooks, so every internal directory open re-entered the
@@ -111,15 +142,30 @@ private:
 // opened (ERROR_PATH_NOT_FOUND); preserving that accidental enumeration behavior has
 // little practical value while significantly hurting performance for normal physical
 // source directories.
-//
-// The hooks still track the handle, as they see it closed.
 OwnedHandle openScanDirectory(const std::wstring& path)
 {
-  // the hooks pass a call straight to ntdll while any group of theirs is held
-  const usvfs::FunctionGroupLock unhooked(usvfs::MutExHookGroup::ALL_GROUPS);
-  return OwnedHandle(CreateFileW(path.c_str(), GENERIC_READ,
-                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+  // keeps a path in the \??\ form as it is
+  UNICODE_STRING ntPath{};
+  if (RtlDosPathNameToRelativeNtPathName_U_WithStatus(path.c_str(), &ntPath, nullptr,
+                                                      nullptr) < 0) {
+    return OwnedHandle();
+  }
+  // case-insensitive, as CreateFileW opens, since the tree may spell a directory in
+  // another case than the disk does
+  OBJECT_ATTRIBUTES attributes{sizeof(OBJECT_ATTRIBUTES), nullptr, &ntPath,
+                               OBJ_CASE_INSENSITIVE,      nullptr, nullptr};
+  IO_STATUS_BLOCK status;
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  NTSTATUS result;
+  {
+    const InternalIoScope internal;
+    result = NtOpenFile(&handle, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attributes,
+                        &status, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT |
+                            FILE_OPEN_FOR_BACKUP_INTENT);
+  }
+  HeapFree(GetProcessHeap(), 0, ntPath.Buffer);
+  return OwnedHandle(result >= 0 ? handle : INVALID_HANDLE_VALUE);
 }
 
 // Reads the regular entries of the scanned directory from ntdll and writes those that
@@ -689,17 +735,17 @@ gatherVirtualEntries(const UnicodeString& dirName,
   return matches;
 }
 
-// Opens the directory the regular entries are read from: the search path a hook
-// stored for the handle. Returns an invalid handle if there is none or opening it
-// fails, in which case the caller's handle is read instead.
+// Opens the directory the regular entries are read from: the physical directory at
+// the search path a hook stored for the handle. Returns an invalid handle if there is
+// none or opening it fails, in which case the caller's handle is read instead. A
+// search path missing on disk is where the hooks reroute any open of it, the caller's
+// one included.
 OwnedHandle openRegularSource(const std::optional<std::wstring>& storedSearchPath)
 {
   if (!storedSearchPath) {
     return OwnedHandle();
   }
-  return OwnedHandle(CreateFileW(storedSearchPath->c_str(), GENERIC_READ,
-                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+  return openScanDirectory(*storedSearchPath);
 }
 
 // Returns whether every I/O on the handle completes before returning. Only then may
@@ -763,7 +809,7 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* r
     virtualMatches =
         gatherVirtualEntries(searchPath, context->redirectionTable(), m_pattern);
   }
-  // opened without the context lock, since CreateFileW reenters the hooks
+  // opened after the context lock is released, as it does I/O
   OwnedHandle regularSource = openRegularSource(storedSearchPath);
 
   // logged once per scan, under the hook's name so that both entry points stay
