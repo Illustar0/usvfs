@@ -186,7 +186,8 @@ public:
   {}
 
   // Writes the next entry that reads, fits and is not written yet. Returns
-  // STATUS_SUCCESS once it wrote one, and STATUS_NO_MORE_FILES when none is left.
+  // STATUS_SUCCESS once it wrote one, STATUS_BUFFER_OVERFLOW once it wrote the partial
+  // record of one, and STATUS_NO_MORE_FILES when none is left.
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
 private:
@@ -210,6 +211,9 @@ NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
   while (m_nextMatch < m_matches.size()) {
     if (append(m_matches[m_nextMatch++], query, output)) {
       return STATUS_SUCCESS;
+    }
+    if (output.isOverflowed()) {
+      return STATUS_BUFFER_OVERFLOW;
     }
   }
   return STATUS_NO_MORE_FILES;

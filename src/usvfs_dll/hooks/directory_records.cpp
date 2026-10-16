@@ -142,6 +142,11 @@ bool DirectoryOutput::isSatisfied() const
   return m_options.isSingleEntry && !isEmpty();
 }
 
+bool DirectoryOutput::isOverflowed() const
+{
+  return m_isOverflowed;
+}
+
 ULONG DirectoryOutput::size() const
 {
   return static_cast<ULONG>(m_size);
@@ -156,9 +161,9 @@ bool DirectoryOutput::append(const DirectoryRecord& record)
   if (!target) {
     return false;
   }
-  std::ranges::copy(record.bytes(), target->begin());
+  std::ranges::copy(record.bytes().first(target->size()), target->begin());
   writeField(*target, 0, 0);
-  return true;
+  return !m_isOverflowed;
 }
 
 bool DirectoryOutput::appendRenamed(const DirectoryRecord& record,
@@ -176,7 +181,9 @@ bool DirectoryOutput::appendRenamed(const DirectoryRecord& record,
   std::ranges::copy(record.bytes().first(m_layout.fileNameOffset), target->begin());
   writeField(*target, 0, 0);
   writeField(*target, m_layout.fileNameLengthOffset, fileNameLength);
-  std::memcpy(target->data() + m_layout.fileNameOffset, name.data(), fileNameLength);
+  std::memcpy(
+      target->data() + m_layout.fileNameOffset, name.data(),
+      std::min<size_t>(fileNameLength, target->size() - m_layout.fileNameOffset));
 
   // Kept from the stock code until virtual entries go without 8.3 names (D1): an
   // 8.3 name is replaced by what GetShortPathNameW makes of the new name, relative
@@ -194,7 +201,7 @@ bool DirectoryOutput::appendRenamed(const DirectoryRecord& record,
                   sizeof(shortNameLength));
     }
   }
-  return true;
+  return !m_isOverflowed;
 }
 
 void DirectoryOutput::mirror(std::span<const std::byte> native)
@@ -202,6 +209,7 @@ void DirectoryOutput::mirror(std::span<const std::byte> native)
   std::ranges::copy(native, m_buffer.begin());
   m_lastRecordOffset = 0;
   m_size             = native.size();
+  m_isOverflowed     = true;
 }
 
 NTSTATUS DirectoryOutput::complete(NTSTATUS fillStatus,
@@ -226,6 +234,16 @@ std::optional<std::span<std::byte>> DirectoryOutput::place(size_t recordSize)
 {
   if (isSatisfied()) {
     return std::nullopt;
+  }
+  // NtfsQueryDirectory and RefsQueryDirectory cut a first record that does not fit
+  // short at the end of the buffer, and leave its entry for the next query to return
+  // again. The buffer holds the fields before FileName at least, as ntdll rejects one
+  // shorter than the minimum length.
+  if (isEmpty() && recordSize > m_buffer.size()) {
+    m_lastRecordOffset = 0;
+    m_size             = m_buffer.size();
+    m_isOverflowed     = true;
+    return m_buffer;
   }
   const size_t offset =
       isEmpty() ? 0 : (m_size + RECORD_SPACING - 1) / RECORD_SPACING * RECORD_SPACING;

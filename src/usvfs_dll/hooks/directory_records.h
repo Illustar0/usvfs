@@ -86,16 +86,21 @@ public:
   bool isEmpty() const;
   // whether the query wants no further record: it asked for a single one and has it
   bool isSatisfied() const;
+  // Whether the output holds only the partial record of an entry that does not fit
+  // it, which the query reports with STATUS_BUFFER_OVERFLOW.
+  bool isOverflowed() const;
   // the bytes written, up to the end of the last record
   ULONG size() const;
 
   // Writes a record as it is. Returns false, and writes nothing, when the record does
-  // not fit, is truncated, or the query is satisfied.
+  // not fit, is truncated, or the query is satisfied. A record that does not fit an
+  // empty output is the exception: like ntdll, it writes as much of it as fits, with
+  // the full FileNameLength, and still returns false.
   bool append(const DirectoryRecord& record);
   // Writes a record under another name, on the same terms as append.
   bool appendRenamed(const DirectoryRecord& record, std::wstring_view name);
-  // Writes the data of a native read as it is, partial record included, into an
-  // empty output that it fits.
+  // Writes the data of a native read that ended with STATUS_BUFFER_OVERFLOW, its
+  // partial record, as it is into an empty output that it fits.
   void mirror(std::span<const std::byte> native);
 
   // Turns the status a fill ended with into the result of the query, and writes the
@@ -103,8 +108,10 @@ public:
   NTSTATUS complete(NTSTATUS fillStatus, IO_STATUS_BLOCK& statusBlock) const;
 
 private:
-  // Makes room for a record after the last one and links the last one to it.
-  // Returns nothing when the record does not fit or the query is satisfied.
+  // Makes room for a record after the last one and links the last one to it. A record
+  // that does not fit an empty output gets the whole buffer, which the caller fills
+  // with as much of the record as fits. Returns nothing when the record does not fit
+  // or the query is satisfied.
   std::optional<std::span<std::byte>> place(size_t recordSize);
 
   std::span<std::byte> m_buffer;
@@ -112,5 +119,6 @@ private:
   Options m_options;
   // where the last record starts; nothing while the output is empty
   std::optional<size_t> m_lastRecordOffset;
-  size_t m_size = 0;
+  size_t m_size       = 0;
+  bool m_isOverflowed = false;
 };
