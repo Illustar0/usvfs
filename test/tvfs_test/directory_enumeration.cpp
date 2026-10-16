@@ -1390,3 +1390,60 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsRegularEntriesLikeNtdll)
     }
   }
 }
+
+// ntdll is the reference for where the data of a query ends: with its last record,
+// without the padding after it, also when the hook leaves out the shadowed records
+// after it. Every entry but "." and ".." is shadowed here, so the first query holds
+// the two, as ntdll returns them into a buffer that holds no more.
+TEST_F(USVFSTest, NtQueryDirectoryFileEndsWithTheLastRegularEntryLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const std::vector<std::filesystem::path> directories = nativeListingDirectories();
+  for (const std::filesystem::path& directory : directories) {
+    for (const std::wstring& name : listWithFindFirstFile(directory)) {
+      if (name != L"." && name != L"..") {
+        ctx->redirectionTable().addFile((directory / name).c_str(),
+                                        usvfs::RedirectionDataLocal(REAL_FILEA));
+      }
+    }
+  }
+
+  for (const std::filesystem::path& directory : directories) {
+    for (const FILE_INFORMATION_CLASS informationClass :
+         DIRECTORY_INFORMATION_CLASSES) {
+      SCOPED_TRACE(std::format("{}, class {}", describeDirectory(directory),
+                               static_cast<int>(informationClass)));
+      const ListingQuery listing{informationClass, 0x800, false, L"*"};
+      HANDLE nativeHandle = openHookedDirectory(directory);
+      HANDLE hookedHandle = openHookedDirectory(directory);
+      ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+      ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+      const ListedQuery native =
+          queryOnce(nativeQueryDirectoryFile(), nativeHandle, listing);
+      const ListedQuery hooked =
+          queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+
+      const DirectoryRecordLayout layout =
+          findDirectoryRecordLayout(informationClass).value();
+      const std::vector<size_t> offsets = recordOffsets(layout, native.data);
+      ASSERT_LE(3u, offsets.size()) << "no shadowed record follows \"..\"";
+      const size_t end =
+          offsets[1] +
+          DirectoryRecord(layout, std::span(native.data).subspan(offsets[1])).size();
+      QueryOutcome expected            = native.outcome;
+      expected.statusBlock.Information = end;
+      expectSameOutcome(expected, hooked.outcome);
+      ASSERT_EQ((std::vector<size_t>{0, offsets[1]}),
+                recordOffsets(layout, hooked.data));
+      for (const size_t offset : {offsets[0], offsets[1]}) {
+        expectSameRecordAt(layout, native.data, hooked.data, offset);
+      }
+
+      usvfs::hook_NtClose(nativeHandle);
+      usvfs::hook_NtClose(hookedHandle);
+    }
+  }
+}

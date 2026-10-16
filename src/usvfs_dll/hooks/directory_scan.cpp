@@ -218,6 +218,72 @@ private:
   HANDLE m_handle = INVALID_HANDLE_VALUE;
 };
 
+// Reads the regular entries of the scanned directory from ntdll and writes those that
+// no virtual entry shadows.
+class RegularEntryReader
+{
+public:
+  // Reads source, or the handle of the query if source is invalid. The shadowed
+  // names are those of the virtual entries, which take precedence.
+  RegularEntryReader(OwnedHandle source, CaseInsensitiveNameSet shadowedNames)
+      : m_source(std::move(source)), m_names(std::move(shadowedNames))
+  {}
+
+  // Writes the entries of the next reads, reading only while the output is empty.
+  // Returns STATUS_SUCCESS once it wrote some, and STATUS_NO_MORE_FILES when a read
+  // fails.
+  NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
+
+private:
+  OwnedHandle m_source;
+  // the shadowed names and those of the entries written, so that none is written twice
+  CaseInsensitiveNameSet m_names;
+  // where a read goes before its entries are filtered; vector storage is aligned for
+  // every record, as operator new aligns to 8 bytes or more
+  std::vector<std::byte> m_staging;
+};
+
+NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& output)
+{
+  // shouldVirtualize lets through only the classes that have a layout
+  const DirectoryRecordLayout layout =
+      findDirectoryRecordLayout(query.informationClass).value();
+  const HANDLE source = m_source.isValid() ? m_source.get() : query.handle;
+  // as large as the buffer of the query, so that a read returns what a read into that
+  // buffer would, and every record it returns fits there too
+  m_staging.resize(query.length);
+
+  while (output.isEmpty()) {
+    // the handle completes synchronously and the caller's notifications belong to
+    // the caller's query, so this read asks for none; like the stock code, it never
+    // restarts the native scan
+    IO_STATUS_BLOCK status;
+    const NTSTATUS result = NtQueryDirectoryFile(
+        source, nullptr, nullptr, nullptr, &status, m_staging.data(), query.length,
+        query.informationClass, query.isSingleEntry(), query.fileName, FALSE);
+    // Kept from the stock code until partial records and errors from ntdll are
+    // passed on: any other result ends the regular entries.
+    if (result != STATUS_SUCCESS) {
+      return STATUS_NO_MORE_FILES;
+    }
+
+    std::span<const std::byte> data(m_staging.data(), status.Information);
+    while (!data.empty()) {
+      const DirectoryRecord record(layout, data);
+      if (m_names.insert(record.fileName())) {
+        // fits, since the records before it in the output are those before it in
+        // the read, or fewer
+        output.append(record);
+      }
+      if (record.nextEntryOffset() == 0) {
+        break;
+      }
+      data = data.subspan(record.nextEntryOffset());
+    }
+  }
+  return STATUS_SUCCESS;
+}
+
 // A virtual entry of the scanned directory.
 struct VirtualMatch
 {
@@ -244,7 +310,7 @@ public:
   NTSTATUS query(const DirectoryQuery& query);
 
 private:
-  NTSTATUS fill(const DirectoryQuery& query, ULONG& dataRead);
+  NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output, ULONG& dataRead);
   bool addVirtualSearchResult(PVOID& FileInformation,
                               FILE_INFORMATION_CLASS FileInformationClass,
                               const std::wstring& realPath,
@@ -259,12 +325,15 @@ private:
   // directory queries made while holding it go straight to ntdll, so it is never
   // taken twice by one thread.
   std::mutex m_mutex;
+  // has a value while the scan lists the regular entries, before the virtual ones
+  std::optional<RegularEntryReader> m_regular;
+  // the names of the virtual entries written, so that none is written twice
   CaseInsensitiveNameSet m_foundFiles;
+  // the directory the next virtual entry is read from
   OwnedHandle m_currentSearchHandle;
   std::vector<VirtualMatch> m_virtualMatches;
   // index of the next match to return; the ones before it are done
   size_t m_nextVirtualMatch{0};
-  bool m_regularComplete{false};
   // an empty result is STATUS_NO_SUCH_FILE on the first call only
   bool m_isFirstCall{true};
 };
@@ -432,11 +501,12 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query)
     m_virtualMatches =
         gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName);
   }
+  CaseInsensitiveNameSet shadowedNames;
   for (const VirtualMatch& match : m_virtualMatches) {
-    m_foundFiles.insert(match.virtualName);
+    shadowedNames.insert(match.virtualName);
   }
   // opened without the context lock, since CreateFileW reenters the hooks
-  m_currentSearchHandle = openRegularSource(storedSearchPath);
+  m_regular.emplace(openRegularSource(storedSearchPath), std::move(shadowedNames));
 }
 
 /**
@@ -566,62 +636,49 @@ bool shouldVirtualize(const DirectoryQuery& query)
 // if we don't add the regular files first, "." and ".." wouldn't be in the
 //   first search result of wildcard searches which may confuse the caller
 //
-// Writes the next entries into the buffer of the query and their size into
-// dataRead. Returns STATUS_SUCCESS if it wrote any, and STATUS_NO_MORE_FILES once
-// both the regular and the virtual entries are exhausted.
-NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, ULONG& dataRead)
+// Writes the next entries, the regular ones into the output and the virtual ones
+// still straight into the buffer of the query, and their size into dataRead.
+// Returns STATUS_SUCCESS if it wrote any, and STATUS_NO_MORE_FILES once both the
+// regular and the virtual entries are exhausted.
+NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, DirectoryOutput& output,
+                             ULONG& dataRead)
 {
-  dataRead                     = query.length;
-  PVOID FileInformationCurrent = query.buffer;
-
-  // add regular search results, skipping those files we have in a virtual
-  // location
-  bool moreRegular  = !m_regularComplete;
-  bool dataReturned = false;
-  while (moreRegular && !dataReturned) {
-    dataRead = query.length;
-
-    const HANDLE handle =
-        m_currentSearchHandle.isValid() ? m_currentSearchHandle.get() : query.handle;
-    NTSTATUS subRes = addNtSearchData(handle, query.fileName, L"",
-                                      query.informationClass, FileInformationCurrent,
-                                      dataRead, m_foundFiles, query.isSingleEntry());
-    moreRegular     = subRes == STATUS_SUCCESS;
-    if (moreRegular) {
-      dataReturned = dataRead != 0;
-    } else {
-      m_regularComplete = true;
-      m_foundFiles.clear();
-      m_currentSearchHandle.reset();
+  if (m_regular) {
+    if (m_regular->fill(query, output) == STATUS_SUCCESS) {
+      dataRead = output.size();
+      return STATUS_SUCCESS;
     }
+    // the regular entries are done, and the reader's handle and staging area with them
+    m_regular.reset();
   }
-  if (!moreRegular) {
-    // add virtual results
-    while (!dataReturned && m_nextVirtualMatch < m_virtualMatches.size()) {
-      const VirtualMatch& match = m_virtualMatches[m_nextVirtualMatch];
-      if (match.realPath.size() != 0) {
-        dataRead = query.length;
-        if (addVirtualSearchResult(FileInformationCurrent, query.informationClass,
-                                   match.realPath, match.virtualName,
-                                   query.isSingleEntry(), dataRead)) {
-          // a positive result here means the call returned data and there may
-          // be further objects to be retrieved by repeating the call
-          dataReturned = true;
-        } else {
-          // proceed to next search handle
 
-          // TODO: doesn't append search results from more than one redirection
-          // per call. This is bad for performance but otherwise we'd need to
-          // re-write the offsets between information objects
-          ++m_nextVirtualMatch;
-          m_currentSearchHandle.reset();
-        }
+  // add virtual results, into the buffer the regular entries left empty
+  PVOID FileInformationCurrent = query.buffer;
+  bool dataReturned            = false;
+  while (!dataReturned && m_nextVirtualMatch < m_virtualMatches.size()) {
+    const VirtualMatch& match = m_virtualMatches[m_nextVirtualMatch];
+    if (match.realPath.size() != 0) {
+      dataRead = query.length;
+      if (addVirtualSearchResult(FileInformationCurrent, query.informationClass,
+                                 match.realPath, match.virtualName,
+                                 query.isSingleEntry(), dataRead)) {
+        // a positive result here means the call returned data and there may
+        // be further objects to be retrieved by repeating the call
+        dataReturned = true;
+      } else {
+        // proceed to next search handle
+
+        // TODO: doesn't append search results from more than one redirection
+        // per call. This is bad for performance but otherwise we'd need to
+        // re-write the offsets between information objects
+        ++m_nextVirtualMatch;
+        m_currentSearchHandle.reset();
       }
     }
   }
   if (!dataReturned) {
-    // dataRead still holds the capacity when no read ran or the last source did
-    // not open
+    // the read of a virtual entry whose source did not open leaves the capacity in
+    // dataRead
     dataRead = 0;
     return STATUS_NO_MORE_FILES;
   }
@@ -636,8 +693,13 @@ NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
   std::lock_guard lock(m_mutex);
   const bool isFirstCall = std::exchange(m_isFirstCall, false);
 
+  // shouldVirtualize lets through only the classes that have a layout
+  DirectoryOutput output(
+      std::span(static_cast<std::byte*>(query.buffer), query.length),
+      findDirectoryRecordLayout(query.informationClass).value(),
+      {.isSingleEntry = query.isSingleEntry(), .isFirstCall = isFirstCall});
   ULONG dataRead;
-  const NTSTATUS res = fill(query, dataRead);
+  const NTSTATUS res = fill(query, output, dataRead);
   // an empty first result is an error, and ntdll leaves the status block of a
   // failed query alone
   if (res == STATUS_NO_MORE_FILES && isFirstCall) {
