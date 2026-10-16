@@ -1128,46 +1128,72 @@ TYPED_TEST(DirectoryRecordTest, RefusesATruncatedRecord)
 namespace
 {
 
-struct NativeQuery
+struct ListedQuery
 {
   QueryOutcome outcome;
   // the bytes the status block reports, for a query that succeeded
   std::vector<std::byte> data;
 };
 
-// Lists a directory through ntdll with status blocks that show whether a query wrote
-// them, and returns every query up to the first that fails.
-std::vector<NativeQuery> listNativeOutcomes(const std::filesystem::path& path,
+// The queries of a listing, which differ only in where they find the handle.
+struct ListingQuery
+{
+  FILE_INFORMATION_CLASS informationClass;
+  ULONG length;
+  bool isSingleEntry;
+  std::wstring_view pattern;
+};
+
+// Queries a directory with a status block that shows whether the query wrote it.
+ListedQuery queryOnce(NtQueryDirectoryFile_type query, HANDLE directory,
+                      const ListingQuery& listing)
+{
+  usvfs::UnicodeString fileName(listing.pattern.data(), listing.pattern.size());
+  std::vector<std::byte> buffer(listing.length);
+  ListedQuery listed;
+  listed.outcome.statusBlock.Status      = UNWRITTEN_STATUS;
+  listed.outcome.statusBlock.Information = UNWRITTEN_INFORMATION;
+  listed.outcome.result =
+      query(directory, nullptr, nullptr, nullptr, &listed.outcome.statusBlock,
+            buffer.data(), listing.length, listing.informationClass,
+            listing.isSingleEntry, static_cast<PUNICODE_STRING>(fileName), FALSE);
+  if (listed.outcome.result == STATUS_SUCCESS) {
+    listed.data.assign(buffer.begin(),
+                       buffer.begin() + listed.outcome.statusBlock.Information);
+  }
+  return listed;
+}
+
+// Lists a directory as queryOnce queries it, and returns every query up to the first
+// that fails.
+std::vector<ListedQuery> listQueries(NtQueryDirectoryFile_type query, HANDLE directory,
+                                     const ListingQuery& listing)
+{
+  std::vector<ListedQuery> queries;
+  do {
+    queries.push_back(queryOnce(query, directory, listing));
+  } while (queries.back().outcome.result == STATUS_SUCCESS);
+  return queries;
+}
+
+// Lists a directory through ntdll, as listQueries does.
+std::vector<ListedQuery> listNativeOutcomes(const std::filesystem::path& path,
                                             std::wstring_view pattern, ULONG length)
 {
   const HANDLE directory = ::CreateFileW(
       path.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   EXPECT_NE(INVALID_HANDLE_VALUE, directory);
-  usvfs::UnicodeString fileName(pattern.data(), pattern.size());
-
-  std::vector<NativeQuery> queries;
-  std::vector<std::byte> buffer(length);
-  do {
-    NativeQuery& query                    = queries.emplace_back();
-    query.outcome.statusBlock.Status      = UNWRITTEN_STATUS;
-    query.outcome.statusBlock.Information = UNWRITTEN_INFORMATION;
-    query.outcome.result                  = nativeQueryDirectoryFile()(
-        directory, nullptr, nullptr, nullptr, &query.outcome.statusBlock, buffer.data(),
-        length, FileDirectoryInformation, FALSE, static_cast<PUNICODE_STRING>(fileName),
-        FALSE);
-    if (query.outcome.result == STATUS_SUCCESS) {
-      query.data.assign(buffer.begin(),
-                        buffer.begin() + query.outcome.statusBlock.Information);
-    }
-  } while (queries.back().outcome.result == STATUS_SUCCESS);
+  std::vector<ListedQuery> queries =
+      listQueries(nativeQueryDirectoryFile(), directory,
+                  {FileDirectoryInformation, length, false, pattern});
   ::CloseHandle(directory);
   return queries;
 }
 
 // Writes the records of a native query to a DirectoryOutput that ends with them, and
 // completes it with the status a fill of the output ended with.
-QueryOutcome replay(const NativeQuery& native, bool isFirstCall, NTSTATUS fillStatus)
+QueryOutcome replay(const ListedQuery& native, bool isFirstCall, NTSTATUS fillStatus)
 {
   const DirectoryRecordLayout layout =
       findDirectoryRecordLayout(FileDirectoryInformation).value();
@@ -1223,7 +1249,7 @@ TEST(DirectoryOutputTest, CompletesTheQueriesOfAListingLikeNtdll)
 {
   for (const std::filesystem::path& directory : nativeListingDirectories()) {
     SCOPED_TRACE(describeDirectory(directory));
-    const std::vector<NativeQuery> queries = listNativeOutcomes(directory, L"*", 0x800);
+    const std::vector<ListedQuery> queries = listNativeOutcomes(directory, L"*", 0x800);
     ASSERT_LE(3u, queries.size());
     ASSERT_EQ(STATUS_NO_MORE_FILES, queries.back().outcome.result);
 
@@ -1249,7 +1275,7 @@ TEST(DirectoryOutputTest, FailsAQueryThatMatchesNothingLikeNtdll)
   constexpr std::wstring_view PATTERN = L"usvfs_no_such_file_*";
   for (const std::filesystem::path& directory : nativeListingDirectories()) {
     SCOPED_TRACE(describeDirectory(directory));
-    const std::vector<NativeQuery> queries =
+    const std::vector<ListedQuery> queries =
         listNativeOutcomes(directory, PATTERN, 0x800);
     ASSERT_EQ(1u, queries.size());
     const QueryOutcome actual = replay(queries.front(), true, STATUS_NO_MORE_FILES);
@@ -1267,11 +1293,100 @@ TEST(DirectoryOutputTest, PassesAnErrorOnLikeNtdll)
   for (const std::filesystem::path& directory : nativeListingDirectories()) {
     SCOPED_TRACE(describeDirectory(directory));
     // shorter than any record, which ntdll rejects before the filesystem sees it
-    const std::vector<NativeQuery> queries = listNativeOutcomes(directory, L"*", 1);
+    const std::vector<ListedQuery> queries = listNativeOutcomes(directory, L"*", 1);
     ASSERT_EQ(1u, queries.size());
     ASSERT_EQ(STATUS_INFO_LENGTH_MISMATCH, queries.front().outcome.result);
 
     expectSameOutcome(queries.front().outcome,
                       replay(queries.front(), true, queries.front().outcome.result));
+  }
+}
+
+namespace
+{
+
+// Expects the same record at an offset, but for the link to the next one.
+void expectSameRecordAt(const DirectoryRecordLayout& layout,
+                        std::span<const std::byte> expected,
+                        std::span<const std::byte> actual, size_t offset)
+{
+  // past NextEntryOffset, the first field of every record
+  constexpr size_t FIELDS_OFFSET = sizeof(ULONG);
+  const size_t size = DirectoryRecord(layout, expected.subspan(offset)).size();
+  ASSERT_LE(offset + size, actual.size()) << "record at " << offset;
+  EXPECT_TRUE(
+      std::ranges::equal(expected.subspan(offset + FIELDS_OFFSET, size - FIELDS_OFFSET),
+                         actual.subspan(offset + FIELDS_OFFSET, size - FIELDS_OFFSET)))
+      << "record at " << offset;
+}
+
+// Expects the same records at the same offsets; the padding between them is whatever
+// the buffers held.
+void expectSameRecords(const DirectoryRecordLayout& layout,
+                       std::span<const std::byte> expected,
+                       std::span<const std::byte> actual)
+{
+  ASSERT_EQ(expected.empty(), actual.empty());
+  if (expected.empty()) {
+    return;
+  }
+  const std::vector<size_t> offsets = recordOffsets(layout, expected);
+  ASSERT_EQ(offsets, recordOffsets(layout, actual));
+  for (const size_t offset : offsets) {
+    expectSameRecordAt(layout, expected, actual, offset);
+  }
+}
+
+HANDLE openHookedDirectory(const std::filesystem::path& path)
+{
+  return hooked_NtOpenFile(path.c_str(), FILE_GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+}
+
+}  // namespace
+
+// ntdll is the reference for the regular entries of a directory without virtual
+// entries: the hook reads them from ntdll and has none to leave out or add
+TEST_F(USVFSTest, NtQueryDirectoryFileListsRegularEntriesLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+
+  for (const std::filesystem::path& directory : nativeListingDirectories()) {
+    for (const FILE_INFORMATION_CLASS informationClass :
+         DIRECTORY_INFORMATION_CLASSES) {
+      for (const bool isSingleEntry : {false, true}) {
+        SCOPED_TRACE(std::format("{}, class {}, {}", describeDirectory(directory),
+                                 static_cast<int>(informationClass),
+                                 isSingleEntry ? "single entry" : "full buffer"));
+        const ListingQuery listing{informationClass, 0x800, isSingleEntry, L"*"};
+        // a query moves its handle through the directory, so ntdll and the hook each
+        // list through a handle of their own
+        HANDLE nativeHandle = openHookedDirectory(directory);
+        HANDLE hookedHandle = openHookedDirectory(directory);
+        ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+        ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+        const std::vector<ListedQuery> expected =
+            listQueries(nativeQueryDirectoryFile(), nativeHandle, listing);
+        const std::vector<ListedQuery> actual =
+            listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+
+        ASSERT_LE(2u, expected.size());
+        ASSERT_EQ(expected.size(), actual.size());
+        const DirectoryRecordLayout layout =
+            findDirectoryRecordLayout(informationClass).value();
+        for (size_t query = 0; query < expected.size(); ++query) {
+          SCOPED_TRACE(query);
+          expectSameOutcome(expected[query].outcome, actual[query].outcome);
+          expectSameRecords(layout, expected[query].data, actual[query].data);
+        }
+
+        usvfs::hook_NtClose(nativeHandle);
+        usvfs::hook_NtClose(hookedHandle);
+      }
+    }
   }
 }
