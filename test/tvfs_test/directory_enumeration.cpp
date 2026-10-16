@@ -1554,6 +1554,55 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsAVirtualEntryLikeNtdllListsItsFile)
   }
 }
 
+// ntdll is the reference for a virtual entry whose file has a longer name: the record
+// ntdll lists for the file, under the virtual name, in a buffer that holds it under
+// that name only
+TEST_F(USVFSTest, NtQueryDirectoryFileListsAVirtualEntryThatFitsWhereItsFileWouldNot)
+{
+  constexpr std::wstring_view VIRTUAL_NAME = L"usvfs_v.txt";
+  constexpr std::wstring_view FILE_NAME =
+      L"usvfs_a_name_longer_than_the_virtual_one.txt";
+  const std::filesystem::path directory = test::path_of_test_temp(L"virtual_file");
+  std::filesystem::create_directories(directory);
+  std::ofstream(directory / FILE_NAME);
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  ctx->redirectionTable().addFile(
+      (L"C:\\" + std::wstring(VIRTUAL_NAME)).c_str(),
+      usvfs::RedirectionDataLocal((directory / FILE_NAME).string()));
+
+  for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
+    SCOPED_TRACE(std::format("class {}", static_cast<int>(informationClass)));
+    const DirectoryRecordLayout layout =
+        findDirectoryRecordLayout(informationClass).value();
+    const ULONG length =
+        layout.fileNameOffset + static_cast<ULONG>(VIRTUAL_NAME.size() * sizeof(WCHAR));
+    HANDLE nativeHandle = openHookedDirectory(directory);
+    HANDLE hookedHandle = openHookedDirectory(L"C:\\");
+    ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+    const ListedQuery native = queryOnce(nativeQueryDirectoryFile(), nativeHandle,
+                                         {informationClass, 0x1000, false, FILE_NAME});
+    const ListedQuery hooked =
+        queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle,
+                  {informationClass, length, false, VIRTUAL_NAME});
+
+    ASSERT_EQ(STATUS_SUCCESS, native.outcome.result);
+    QueryOutcome expected            = native.outcome;
+    expected.statusBlock.Information = length;
+    expectSameOutcome(expected, hooked.outcome);
+    const DirectoryRecord record(layout, hooked.data);
+    EXPECT_EQ(0u, record.nextEntryOffset());
+    EXPECT_EQ(VIRTUAL_NAME, record.fileName());
+    expectSameFixedFields(layout, native.data, hooked.data);
+
+    usvfs::hook_NtClose(nativeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
+}
+
 // ntdll is the reference for a first record that does not fit: it returns as much of
 // it as fits, with STATUS_BUFFER_OVERFLOW, again on every query until a buffer holds
 // it, and the listing goes on from there
@@ -1631,46 +1680,49 @@ TEST_F(USVFSTest, NtQueryDirectoryFileCutsAVirtualEntryThatDoesNotFitLikeNtdll)
                                   usvfs::RedirectionDataLocal(REAL_FILEA));
 
   for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
-    SCOPED_TRACE(std::format("class {}", static_cast<int>(informationClass)));
     const DirectoryRecordLayout layout =
         findDirectoryRecordLayout(informationClass).value();
-    // holds the record of the file the entry maps to, and not the one under the
-    // virtual name
-    const ULONG length    = layout.fileNameOffset +
-                            static_cast<ULONG>(sizeof(L"notepad.exe") - sizeof(WCHAR));
-    HANDLE fileHandle     = openHookedDirectory(L"C:\\Windows");
-    HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
-    HANDLE hookedHandle   = openHookedDirectory(L"C:\\");
+    HANDLE fileHandle = openHookedDirectory(L"C:\\Windows");
     ASSERT_NE(INVALID_HANDLE_VALUE, fileHandle);
-    ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
-    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
-
     const ListedQuery file =
         queryOnce(nativeQueryDirectoryFile(), fileHandle,
-                  {informationClass, length, false, L"notepad.exe"});
-    const ListedQuery namesake =
-        queryOnce(nativeQueryDirectoryFile(), namesakeHandle,
-                  {informationClass, length, false, VIRTUAL_NAME});
-    const ListedQuery hooked =
-        queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle,
-                  {informationClass, length, false, VIRTUAL_NAME});
-
+                  {informationClass, 0x1000, false, L"notepad.exe"});
     ASSERT_EQ(STATUS_SUCCESS, file.outcome.result);
-    ASSERT_EQ(STATUS_BUFFER_OVERFLOW, namesake.outcome.result);
-    expectSameOutcome(namesake.outcome, hooked.outcome);
-    ASSERT_EQ(namesake.data.size(), hooked.data.size());
-    const DirectoryRecord record(layout, hooked.data);
-    EXPECT_EQ(0u, record.nextEntryOffset());
-    EXPECT_EQ(DirectoryRecord(layout, namesake.data).size(), record.size());
-    EXPECT_TRUE(
-        std::ranges::equal(std::span(namesake.data).subspan(layout.fileNameOffset),
-                           std::span(hooked.data).subspan(layout.fileNameOffset)))
-        << "the name, as much of it as fits";
-    expectSameFixedFields(layout, file.data, hooked.data);
-
     usvfs::hook_NtClose(fileHandle);
-    usvfs::hook_NtClose(namesakeHandle);
-    usvfs::hook_NtClose(hookedHandle);
+
+    // the first holds neither the record of the file the entry maps to nor the one
+    // under the virtual name, the second holds the record of the file only
+    for (const ULONG length :
+         {layout.minimumLength, static_cast<ULONG>(file.data.size())}) {
+      SCOPED_TRACE(std::format("class {}, length {}",
+                               static_cast<int>(informationClass), length));
+      HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
+      HANDLE hookedHandle   = openHookedDirectory(L"C:\\");
+      ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
+      ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+      const ListedQuery namesake =
+          queryOnce(nativeQueryDirectoryFile(), namesakeHandle,
+                    {informationClass, length, false, VIRTUAL_NAME});
+      const ListedQuery hooked =
+          queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle,
+                    {informationClass, length, false, VIRTUAL_NAME});
+
+      ASSERT_EQ(STATUS_BUFFER_OVERFLOW, namesake.outcome.result);
+      expectSameOutcome(namesake.outcome, hooked.outcome);
+      ASSERT_EQ(namesake.data.size(), hooked.data.size());
+      const DirectoryRecord record(layout, hooked.data);
+      EXPECT_EQ(0u, record.nextEntryOffset());
+      EXPECT_EQ(DirectoryRecord(layout, namesake.data).size(), record.size());
+      EXPECT_TRUE(
+          std::ranges::equal(std::span(namesake.data).subspan(layout.fileNameOffset),
+                             std::span(hooked.data).subspan(layout.fileNameOffset)))
+          << "the name, as much of it as fits";
+      expectSameFixedFields(layout, file.data, hooked.data);
+
+      usvfs::hook_NtClose(namesakeHandle);
+      usvfs::hook_NtClose(hookedHandle);
+    }
   }
 }
 

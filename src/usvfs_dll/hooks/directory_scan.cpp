@@ -270,11 +270,14 @@ std::optional<DirectoryRecord> VirtualEntryReader::read(const VirtualMatch& matc
   const std::wstring fileName =
       ush::string_cast<std::wstring>(fullPath.filename().string(), ush::CodePage::UTF8);
   UnicodeString pattern(fileName.c_str());
-  m_staging.resize(query.length);
+  // holds a record with the longest name there is, as the record goes out under the
+  // virtual name, whose length alone decides whether it fits the buffer of the query
+  m_staging.resize(layout.fileNameOffset + UNICODE_STRING_MAX_BYTES);
   IO_STATUS_BLOCK status;
   const NTSTATUS result = NtQueryDirectoryFile(
       directory.get(), nullptr, nullptr, nullptr, &status, m_staging.data(),
-      query.length, query.informationClass, query.isSingleEntry(),
+      static_cast<ULONG>(m_staging.size()), query.informationClass,
+      query.isSingleEntry(),
       fileName != L"." ? static_cast<PUNICODE_STRING>(pattern) : nullptr, FALSE);
   if (result != STATUS_SUCCESS) {
     spdlog::get("hooks")->warn("error reported listing files in {0}: {1:x}",
