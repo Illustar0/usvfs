@@ -480,8 +480,7 @@ VirtualEntryReader::VirtualEntryReader(const std::vector<VirtualMatch>& matches)
     if (isNew) {
       m_sources.emplace_back(sourcePath);
     }
-    std::wstring fileName = ush::string_cast<std::wstring>(fullPath.filename().string(),
-                                                           ush::CodePage::UTF8);
+    std::wstring fileName = fullPath.filename().wstring();
     m_sources[sourceIndex->second].addFileName(fileName);
     m_entries.push_back({sourceIndex->second, std::move(fileName), match.virtualName});
   }
