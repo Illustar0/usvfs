@@ -43,6 +43,13 @@ public:
   {
     if (!isValidHandle(handle))
       return;
+    // looked up under the shared lock first, as every handle closed comes here and few
+    // are tracked
+    {
+      std::shared_lock<std::shared_mutex> lock(m_mutex);
+      if (!m_map.contains(handle))
+        return;
+    }
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     m_map.erase(handle);
   }

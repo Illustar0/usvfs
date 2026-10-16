@@ -798,14 +798,10 @@ NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
   NTSTATUS res = STATUS_NO_SUCH_FILE;
 
   HOOK_START_GROUP(MutExHookGroup::ALL_GROUPS)
-  bool log = false;
-
-  if ((::GetFileType(Handle) == FILE_TYPE_DISK)) {
-    log = eraseDirectoryScan(Handle);
-  }
-
-  if (GetFileType(Handle) == FILE_TYPE_DISK)
-    ntdllHandleTracker.erase(Handle);
+  // Not guarded by the file type: GetFileType takes a system call on every close, and
+  // both are cheap no-ops for the handles they do not hold, which are nearly all.
+  const bool log = eraseDirectoryScan(Handle);
+  ntdllHandleTracker.erase(Handle);
 
   PRE_REALCALL
   res = ::NtClose(Handle);
