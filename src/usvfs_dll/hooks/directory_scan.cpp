@@ -2,7 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <cwchar>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -16,7 +16,6 @@
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 
-#include <addrtools.h>
 #include <loghelpers.h>
 #include <stringcast.h>
 #include <stringutils.h>
@@ -45,137 +44,9 @@ public:
     return m_upperNames.insert(ush::to_upper(name)).second;
   }
 
-  void clear() { m_upperNames.clear(); }
-
 private:
   std::set<std::wstring> m_upperNames;
 };
-
-// Gives a record in the buffer another name. Keeps what the stock code did until
-// the virtual entries are written through DirectoryOutput: the new name is written
-// over the old one even when it is longer, and an 8.3 name, if the record has one,
-// is replaced by what GetShortPathNameW makes of the new name, relative to the
-// current directory, stored as a count of characters.
-void renameRecord(const DirectoryRecordLayout& layout, PVOID record,
-                  const std::wstring& name)
-{
-  auto* bytes = static_cast<std::byte*>(record);
-  ULONG fileNameLength;
-  std::memcpy(&fileNameLength, bytes + layout.fileNameLengthOffset,
-              sizeof(fileNameLength));
-  std::memset(bytes + layout.fileNameOffset, 0, fileNameLength);
-  fileNameLength = static_cast<ULONG>(name.length() * sizeof(WCHAR));
-  std::memcpy(bytes + layout.fileNameLengthOffset, &fileNameLength,
-              sizeof(fileNameLength));
-  std::memcpy(bytes + layout.fileNameOffset, name.c_str(), fileNameLength);
-
-  if (layout.shortName) {
-    CCHAR shortNameLength;
-    std::memcpy(&shortNameLength, bytes + layout.shortName->lengthOffset,
-                sizeof(shortNameLength));
-    if (shortNameLength > 0) {
-      shortNameLength = static_cast<CCHAR>(GetShortPathNameW(
-          name.c_str(), reinterpret_cast<LPWSTR>(bytes + layout.shortName->offset), 8));
-      std::memcpy(bytes + layout.shortName->lengthOffset, &shortNameLength,
-                  sizeof(shortNameLength));
-    }
-  }
-}
-
-NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
-                         const std::wstring& fakeName,
-                         FILE_INFORMATION_CLASS FileInformationClass, PVOID& buffer,
-                         ULONG& bufferSize, CaseInsensitiveNameSet& foundFiles,
-                         BOOLEAN returnSingleEntry)
-{
-  NTSTATUS res = STATUS_NO_SUCH_FILE;
-  if (hdl != INVALID_HANDLE_VALUE) {
-    PVOID lastValidRecord = nullptr;
-    PVOID bufferInit      = buffer;
-    // the handle completes synchronously and the caller's notifications belong to
-    // the caller's query, so this read asks for none
-    IO_STATUS_BLOCK status;
-    res = NtQueryDirectoryFile(hdl, nullptr, nullptr, nullptr, &status, buffer,
-                               bufferSize, FileInformationClass, returnSingleEntry,
-                               FileName, FALSE);
-
-    if ((res != STATUS_SUCCESS) || (status.Information <= 0)) {
-      bufferSize = 0UL;
-    } else {
-      // shouldVirtualize lets through only the classes that have a layout
-      const DirectoryRecordLayout layout =
-          findDirectoryRecordLayout(FileInformationClass).value();
-      ULONG totalOffset = 0;
-      PVOID lastSkipPos = nullptr;
-
-      while (totalOffset < status.Information) {
-        const DirectoryRecord record(layout,
-                                     std::span(static_cast<const std::byte*>(buffer),
-                                               status.Information - totalOffset));
-        ULONG offset          = record.nextEntryOffset();
-        std::wstring fileName = record.fileName();
-        // in case this is a single-file search result and the specified
-        // filename differs from the file name found, replace it in the
-        // information structure
-        if ((totalOffset == 0) && (offset == 0) && (fakeName.length() > 0)) {
-          // if the fake name is larger than what is in the buffer and there is
-          // not enough room, that's a buffer overflow
-          if ((fakeName.length() > fileName.length()) &&
-              ((fakeName.length() - fileName.length()) >
-               (bufferSize - status.Information))) {
-            res = STATUS_BUFFER_OVERFLOW;
-            break;
-          }
-          // WARNING for the case where the fake name is longer this needs to
-          // move back all further results and update the offset first
-          renameRecord(layout, buffer, fakeName);
-          fileName = fakeName;
-        }
-        bool add = true;
-        if (fileName.length() > 0) {
-          // add only if we didn't find this file before
-          add = foundFiles.insert(fileName);
-        }
-        if (!add) {
-          if (lastSkipPos == nullptr) {
-            lastSkipPos = buffer;
-          }
-        } else {
-          if (lastSkipPos != nullptr) {
-            memmove(lastSkipPos, buffer, status.Information - totalOffset);
-            ULONG delta = static_cast<ULONG>(ush::AddrDiff(buffer, lastSkipPos));
-            totalOffset -= delta;
-
-            buffer      = lastSkipPos;
-            lastSkipPos = nullptr;
-          }
-          lastValidRecord = buffer;
-        }
-
-        if (offset == 0) {
-          offset = static_cast<ULONG>(status.Information) - totalOffset;
-        }
-        buffer = ush::AddrAdd(buffer, offset);
-        totalOffset += offset;
-      }
-
-      if (lastSkipPos != nullptr) {
-        buffer     = lastSkipPos;
-        bufferSize = static_cast<ULONG>(ush::AddrDiff(buffer, bufferInit));
-        // null out the unused rest if there is some
-        memset(lastSkipPos, 0, status.Information - bufferSize);
-      } else {
-        bufferSize = static_cast<ULONG>(ush::AddrDiff(buffer, bufferInit));
-      }
-    }
-    if (lastValidRecord != nullptr) {
-      // NextEntryOffset, the first field of every directory record
-      const ULONG lastEntryOffset = 0;
-      std::memcpy(lastValidRecord, &lastEntryOffset, sizeof(lastEntryOffset));
-    }
-  }
-  return res;
-}
 
 // A handle the scan opened itself. Move-only; closes the handle when destroyed, so
 // that a scan replaced by a restart or dropped by NtClose does not leak it.
@@ -296,6 +167,99 @@ struct VirtualMatch
   std::wstring virtualName;
 };
 
+// Reads each virtual entry from the directory its file or directory lies in, and
+// writes it under its virtual name.
+class VirtualEntryReader
+{
+public:
+  VirtualEntryReader() = default;
+  explicit VirtualEntryReader(std::vector<VirtualMatch> matches)
+      : m_matches(std::move(matches))
+  {}
+
+  // Writes the next entry that reads, fits and is not written yet. Returns
+  // STATUS_SUCCESS once it wrote one, and STATUS_NO_MORE_FILES when none is left.
+  NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
+
+  // the entries not tried yet
+  size_t remainingCount() const { return m_matches.size() - m_nextMatch; }
+
+private:
+  // Reads the entry of a match and writes it. Returns whether it wrote it.
+  bool append(const VirtualMatch& match, const DirectoryQuery& query,
+              DirectoryOutput& output);
+
+  std::vector<VirtualMatch> m_matches;
+  // index of the next match to try; the ones before it are done
+  size_t m_nextMatch = 0;
+  // the names of the entries written, so that none is written twice
+  CaseInsensitiveNameSet m_names;
+  // where a read goes before its entry is written, aligned as the regular reader's
+  std::vector<std::byte> m_staging;
+};
+
+NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& output)
+{
+  // Kept from the stock code: a query gets one entry at most, and an entry that does
+  // not read, does not fit or is written already is dropped.
+  while (m_nextMatch < m_matches.size()) {
+    if (append(m_matches[m_nextMatch++], query, output)) {
+      return STATUS_SUCCESS;
+    }
+  }
+  return STATUS_NO_MORE_FILES;
+}
+
+bool VirtualEntryReader::append(const VirtualMatch& match, const DirectoryQuery& query,
+                                DirectoryOutput& output)
+{
+  // the path of a directory mapped with all its content ends with a separator, which
+  // leaves "." as its file name
+  bfs::path fullPath(match.realPath);
+  if (fullPath.filename().wstring() == L".") {
+    fullPath = fullPath.parent_path();
+  }
+  std::wstring directoryPath = fullPath.parent_path().wstring();
+  if (directoryPath.length() >= MAX_PATH &&
+      !ush::startswith(directoryPath.c_str(), LR"(\\?\)")) {
+    directoryPath = LR"(\\?\)" + directoryPath;
+  }
+  const OwnedHandle directory(CreateFileW(
+      directoryPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+  if (!directory.isValid()) {
+    spdlog::get("hooks")->warn("failed to open the directory of {0} to list it: {1}",
+                               fullPath.string(), ::GetLastError());
+    return false;
+  }
+
+  // shouldVirtualize lets through only the classes that have a layout
+  const DirectoryRecordLayout layout =
+      findDirectoryRecordLayout(query.informationClass).value();
+  const std::wstring fileName =
+      ush::string_cast<std::wstring>(fullPath.filename().string(), ush::CodePage::UTF8);
+  UnicodeString pattern(fileName.c_str());
+  m_staging.resize(query.length);
+  IO_STATUS_BLOCK status;
+  const NTSTATUS result = NtQueryDirectoryFile(
+      directory.get(), nullptr, nullptr, nullptr, &status, m_staging.data(),
+      query.length, query.informationClass, query.isSingleEntry(),
+      fileName != L"." ? static_cast<PUNICODE_STRING>(pattern) : nullptr, FALSE);
+  if (result != STATUS_SUCCESS) {
+    spdlog::get("hooks")->warn("error reported listing files in {0}: {1:x}",
+                               fullPath.string(), static_cast<uint32_t>(result));
+    return false;
+  }
+
+  // the pattern is the name of the file, so the read starts with its record
+  const DirectoryRecord record(layout, std::span(m_staging).first(status.Information));
+  if (match.virtualName.empty()) {
+    return m_names.insert(record.fileName()) && output.append(record);
+  }
+  return m_names.insert(match.virtualName) &&
+         output.appendRenamed(record, match.virtualName);
+}
+
 // The state of one scan: the queries on a handle from its first query or restart on.
 class DirectoryScan
 {
@@ -310,12 +274,7 @@ public:
   NTSTATUS query(const DirectoryQuery& query);
 
 private:
-  NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output, ULONG& dataRead);
-  bool addVirtualSearchResult(PVOID& FileInformation,
-                              FILE_INFORMATION_CLASS FileInformationClass,
-                              const std::wstring& realPath,
-                              const std::wstring& virtualName,
-                              BOOLEAN ReturnSingleEntry, ULONG& dataRead);
+  NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
   // whether the queries go straight to ntdll; fixed at construction, so read
   // without the lock
@@ -327,13 +286,7 @@ private:
   std::mutex m_mutex;
   // has a value while the scan lists the regular entries, before the virtual ones
   std::optional<RegularEntryReader> m_regular;
-  // the names of the virtual entries written, so that none is written twice
-  CaseInsensitiveNameSet m_foundFiles;
-  // the directory the next virtual entry is read from
-  OwnedHandle m_currentSearchHandle;
-  std::vector<VirtualMatch> m_virtualMatches;
-  // index of the next match to return; the ones before it are done
-  size_t m_nextVirtualMatch{0};
+  VirtualEntryReader m_virtual;
   // an empty result is STATUS_NO_SUCH_FILE on the first call only
   bool m_isFirstCall{true};
 };
@@ -487,6 +440,7 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query)
   // The stored search path also names the virtual directory, so it is looked up
   // under the same context lock as the virtual entries.
   std::optional<std::wstring> storedSearchPath;
+  std::vector<VirtualMatch> virtualMatches;
   {
     HookContext::Ptr context = WRITE_CONTEXT();
 
@@ -498,70 +452,16 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query)
     const UnicodeString searchPath = storedSearchPath
                                          ? UnicodeString(storedSearchPath->c_str())
                                          : ntdllHandleTracker.lookup(query.handle);
-    m_virtualMatches =
+    virtualMatches =
         gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName);
   }
   CaseInsensitiveNameSet shadowedNames;
-  for (const VirtualMatch& match : m_virtualMatches) {
+  for (const VirtualMatch& match : virtualMatches) {
     shadowedNames.insert(match.virtualName);
   }
   // opened without the context lock, since CreateFileW reenters the hooks
   m_regular.emplace(openRegularSource(storedSearchPath), std::move(shadowedNames));
-}
-
-/**
- * @brief insert a virtual entry into the search result
- * @param FileInformation
- * @param FileInformationClass
- * @param realPath path were the actual file resides
- * @param virtualName virtual file name (without path). will often be the same
- *        as the name component of realpath
- * @param ReturnSingleEntry
- * @param dataRead
- * @return true if a virtual result was added, false if the current search handle
- *         yields no more results
- */
-bool DirectoryScan::addVirtualSearchResult(PVOID& FileInformation,
-                                           FILE_INFORMATION_CLASS FileInformationClass,
-                                           const std::wstring& realPath,
-                                           const std::wstring& virtualName,
-                                           BOOLEAN ReturnSingleEntry, ULONG& dataRead)
-{
-  // this opens a search in the real location, then copies the information about
-  // files we care about (the ones being mapped) to the result we intend to
-  // return
-  bfs::path fullPath(realPath);
-  if (fullPath.filename().wstring() == L".") {
-    fullPath = fullPath.parent_path();
-  }
-  if (!m_currentSearchHandle.isValid()) {
-    std::wstring dirName = fullPath.parent_path().wstring();
-    if (dirName.length() >= MAX_PATH && !ush::startswith(dirName.c_str(), LR"(\\?\)"))
-      dirName = LR"(\\?\)" + dirName;
-    m_currentSearchHandle = OwnedHandle(
-        CreateFileW(dirName.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-  }
-  std::wstring fileName =
-      ush::string_cast<std::wstring>(fullPath.filename().string(), ush::CodePage::UTF8);
-  NTSTATUS subRes = addNtSearchData(
-      m_currentSearchHandle.get(),
-      (fileName != L".") ? static_cast<PUNICODE_STRING>(UnicodeString(fileName.c_str()))
-                         : nullptr,
-      virtualName, FileInformationClass, FileInformation, dataRead, m_foundFiles,
-      ReturnSingleEntry);
-  if (subRes == STATUS_SUCCESS) {
-    return true;
-  } else {
-    // STATUS_NO_MORE_FILES merely means the search ended, everything else is an
-    // error message. Either way, the search here is finished and we should
-    // resume in the next mapped directory
-    if (subRes != STATUS_NO_MORE_FILES) {
-      spdlog::get("hooks")->warn("error reported listing files in {0}: {1:x}",
-                                 fullPath.string(), static_cast<uint32_t>(subRes));
-    }
-    return false;
-  }
+  m_virtual = VirtualEntryReader(std::move(virtualMatches));
 }
 
 NTSTATUS queryNative(const DirectoryQuery& query)
@@ -626,63 +526,20 @@ bool shouldVirtualize(const DirectoryQuery& query)
              0;
 }
 
-// this is quite messy...
-// first, this will gather the virtual locations mapping to the iterated one
-// then we return results from the real location, skipping those that exist
-//   in the virtual locations, as those take precedence
-// finally the virtual results are returned, adding each result to a skip
-//   list, so they don't get added twice
-//
-// if we don't add the regular files first, "." and ".." wouldn't be in the
-//   first search result of wildcard searches which may confuse the caller
-//
-// Writes the next entries, the regular ones into the output and the virtual ones
-// still straight into the buffer of the query, and their size into dataRead.
-// Returns STATUS_SUCCESS if it wrote any, and STATUS_NO_MORE_FILES once both the
-// regular and the virtual entries are exhausted.
-NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, DirectoryOutput& output,
-                             ULONG& dataRead)
+// Writes the next entries of the scan: the regular ones first, so that "." and ".."
+// come with the first query of a wildcard search as callers expect, then the virtual
+// ones. Returns STATUS_SUCCESS if it wrote any, and STATUS_NO_MORE_FILES once both
+// are exhausted.
+NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, DirectoryOutput& output)
 {
   if (m_regular) {
     if (m_regular->fill(query, output) == STATUS_SUCCESS) {
-      dataRead = output.size();
       return STATUS_SUCCESS;
     }
     // the regular entries are done, and the reader's handle and staging area with them
     m_regular.reset();
   }
-
-  // add virtual results, into the buffer the regular entries left empty
-  PVOID FileInformationCurrent = query.buffer;
-  bool dataReturned            = false;
-  while (!dataReturned && m_nextVirtualMatch < m_virtualMatches.size()) {
-    const VirtualMatch& match = m_virtualMatches[m_nextVirtualMatch];
-    if (match.realPath.size() != 0) {
-      dataRead = query.length;
-      if (addVirtualSearchResult(FileInformationCurrent, query.informationClass,
-                                 match.realPath, match.virtualName,
-                                 query.isSingleEntry(), dataRead)) {
-        // a positive result here means the call returned data and there may
-        // be further objects to be retrieved by repeating the call
-        dataReturned = true;
-      } else {
-        // proceed to next search handle
-
-        // TODO: doesn't append search results from more than one redirection
-        // per call. This is bad for performance but otherwise we'd need to
-        // re-write the offsets between information objects
-        ++m_nextVirtualMatch;
-        m_currentSearchHandle.reset();
-      }
-    }
-  }
-  if (!dataReturned) {
-    // the read of a virtual entry whose source did not open leaves the capacity in
-    // dataRead
-    dataRead = 0;
-    return STATUS_NO_MORE_FILES;
-  }
-  return STATUS_SUCCESS;
+  return m_virtual.fill(query, output);
 }
 
 NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
@@ -691,24 +548,14 @@ NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
     return queryNative(query);
   }
   std::lock_guard lock(m_mutex);
-  const bool isFirstCall = std::exchange(m_isFirstCall, false);
-
   // shouldVirtualize lets through only the classes that have a layout
-  DirectoryOutput output(
-      std::span(static_cast<std::byte*>(query.buffer), query.length),
-      findDirectoryRecordLayout(query.informationClass).value(),
-      {.isSingleEntry = query.isSingleEntry(), .isFirstCall = isFirstCall});
-  ULONG dataRead;
-  const NTSTATUS res = fill(query, output, dataRead);
-  // an empty first result is an error, and ntdll leaves the status block of a
-  // failed query alone
-  if (res == STATUS_NO_MORE_FILES && isFirstCall) {
-    return STATUS_NO_SUCH_FILE;
-  }
-  query.statusBlock->Status      = res;
-  query.statusBlock->Information = dataRead;
+  DirectoryOutput output(std::span(static_cast<std::byte*>(query.buffer), query.length),
+                         findDirectoryRecordLayout(query.informationClass).value(),
+                         {.isSingleEntry = query.isSingleEntry(),
+                          .isFirstCall   = std::exchange(m_isFirstCall, false)});
+  const NTSTATUS res = output.complete(fill(query, output), *query.statusBlock);
 
-  size_t numVirtualFiles = m_virtualMatches.size() - m_nextVirtualMatch;
+  size_t numVirtualFiles = m_virtual.remainingCount();
   if ((numVirtualFiles > 0)) {
     // log under the hook's name so both entry points stay distinguishable
     ulog::CallLogger(query.isEx ? "hook_NtQueryDirectoryFileEx"

@@ -1448,3 +1448,70 @@ TEST_F(USVFSTest, NtQueryDirectoryFileEndsWithTheLastRegularEntryLikeNtdll)
     }
   }
 }
+
+namespace
+{
+
+// Expects the same fields between NextEntryOffset and FileName, but for the name's
+// length and the 8.3 name, which a renamed record does not take from its file.
+void expectSameFixedFields(const DirectoryRecordLayout& layout,
+                           std::span<const std::byte> expected,
+                           std::span<const std::byte> actual)
+{
+  ASSERT_LE(layout.fileNameOffset, expected.size());
+  ASSERT_LE(layout.fileNameOffset, actual.size());
+  for (size_t offset = sizeof(ULONG); offset < layout.fileNameOffset; ++offset) {
+    const bool isFileNameLength = offset >= layout.fileNameLengthOffset &&
+                                  offset < layout.fileNameLengthOffset + sizeof(ULONG);
+    const bool isShortName = layout.shortName &&
+                             offset >= layout.shortName->lengthOffset &&
+                             offset < layout.shortName->offset + 12 * sizeof(WCHAR);
+    if (!isFileNameLength && !isShortName) {
+      EXPECT_EQ(expected[offset], actual[offset]) << "byte " << offset;
+    }
+  }
+}
+
+}  // namespace
+
+// ntdll is the reference for a virtual entry: the record ntdll lists for the file the
+// entry maps to, under the virtual name, reported up to the end of that name
+TEST_F(USVFSTest, NtQueryDirectoryFileListsAVirtualEntryLikeNtdllListsItsFile)
+{
+  constexpr std::wstring_view VIRTUAL_NAME = L"usvfs_a_name_longer_than_notepad.exe";
+  auto params                              = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  ctx->redirectionTable().addFile((L"C:\\" + std::wstring(VIRTUAL_NAME)).c_str(),
+                                  usvfs::RedirectionDataLocal(REAL_FILEA));
+
+  for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
+    SCOPED_TRACE(std::format("class {}", static_cast<int>(informationClass)));
+    HANDLE nativeHandle = openHookedDirectory(L"C:\\Windows");
+    HANDLE hookedHandle = openHookedDirectory(L"C:\\");
+    ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+    const ListedQuery native =
+        queryOnce(nativeQueryDirectoryFile(), nativeHandle,
+                  {informationClass, 0x1000, false, L"notepad.exe"});
+    const ListedQuery hooked =
+        queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle,
+                  {informationClass, 0x1000, false, VIRTUAL_NAME});
+
+    ASSERT_EQ(STATUS_SUCCESS, native.outcome.result);
+    const DirectoryRecordLayout layout =
+        findDirectoryRecordLayout(informationClass).value();
+    QueryOutcome expected = native.outcome;
+    expected.statusBlock.Information =
+        layout.fileNameOffset + VIRTUAL_NAME.size() * sizeof(WCHAR);
+    expectSameOutcome(expected, hooked.outcome);
+    const DirectoryRecord record(layout, hooked.data);
+    EXPECT_EQ(0u, record.nextEntryOffset());
+    EXPECT_EQ(VIRTUAL_NAME, record.fileName());
+    expectSameFixedFields(layout, native.data, hooked.data);
+
+    usvfs::hook_NtClose(nativeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
+}
