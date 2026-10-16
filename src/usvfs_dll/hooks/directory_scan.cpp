@@ -107,7 +107,8 @@ public:
 
   // Writes the entries of the next reads, reading only while the output is empty.
   // Returns STATUS_SUCCESS once it wrote some, STATUS_BUFFER_OVERFLOW once it wrote
-  // the partial record of a read, and STATUS_NO_MORE_FILES when a read fails.
+  // the partial record of a read, STATUS_NO_MORE_FILES once the entries are done, and
+  // the error of a read that fails otherwise.
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
 private:
@@ -145,10 +146,12 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
       output.mirror(std::span(m_staging).first(status.Information));
       return result;
     }
-    // Kept from the stock code until errors from ntdll are passed on: any other
-    // result ends the regular entries.
-    if (result != STATUS_SUCCESS) {
+    // a pattern that matches nothing ends the entries on the first read already
+    if (result == STATUS_NO_MORE_FILES || result == STATUS_NO_SUCH_FILE) {
       return STATUS_NO_MORE_FILES;
+    }
+    if (result != STATUS_SUCCESS) {
+      return result;
     }
 
     std::span<const std::byte> data(m_staging.data(), status.Information);
@@ -574,7 +577,8 @@ bool shouldVirtualize(const DirectoryQuery& query)
 // Writes the next entries of the scan: the regular ones first, so that "." and ".."
 // come with the first query of a wildcard search as callers expect, then the virtual
 // ones. Returns STATUS_SUCCESS if it wrote any, STATUS_BUFFER_OVERFLOW if it passed
-// on a partial record from ntdll, and STATUS_NO_MORE_FILES once both are exhausted.
+// on a partial record from ntdll, STATUS_NO_MORE_FILES once both are exhausted, and
+// the error of a regular read that fails, after which the next query reads again.
 NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, DirectoryOutput& output)
 {
   if (m_regular) {

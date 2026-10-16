@@ -1789,3 +1789,49 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsPastAVirtualPartialRecordLikeNtdll)
     usvfs::hook_NtClose(hookedHandle);
   }
 }
+
+// ntdll is the reference for a directory read that fails, also where virtual entries
+// would follow: the error, on every query. The I/O manager refuses a handle without
+// FILE_LIST_DIRECTORY before the filesystem sees the query, so every filesystem fails
+// it alike.
+TEST_F(USVFSTest, NtQueryDirectoryFilePassesAFailedRegularReadOnLikeNtdll)
+{
+  // from ntstatus.h, which ntdll_declarations.h copies only what usvfs uses of
+  constexpr auto STATUS_ACCESS_DENIED = static_cast<NTSTATUS>(0xC0000022L);
+
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const std::vector<std::filesystem::path> directories = nativeListingDirectories();
+  for (const std::filesystem::path& directory : directories) {
+    ctx->redirectionTable().addFile((directory / L"usvfs_virtual.txt").c_str(),
+                                    usvfs::RedirectionDataLocal(REAL_FILEA));
+  }
+
+  for (const std::filesystem::path& directory : directories) {
+    SCOPED_TRACE(describeDirectory(directory));
+    const auto openUnlistable = [&] {
+      return hooked_NtOpenFile(directory.c_str(), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+    };
+    HANDLE nativeHandle = openUnlistable();
+    HANDLE hookedHandle = openUnlistable();
+    ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+    const ListingQuery listing{FileDirectoryInformation, 0x1000, false, L"*"};
+    for (int query = 0; query < 2; ++query) {
+      SCOPED_TRACE(query);
+      const ListedQuery expected =
+          queryOnce(nativeQueryDirectoryFile(), nativeHandle, listing);
+      const ListedQuery actual =
+          queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+      ASSERT_EQ(STATUS_ACCESS_DENIED, expected.outcome.result);
+      expectSameOutcome(expected.outcome, actual.outcome);
+    }
+
+    usvfs::hook_NtClose(nativeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
+}
