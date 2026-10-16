@@ -74,10 +74,11 @@ TEST_F(USVFSTest, NtQueryDirectoryFileFindsVirtualFile)
                                    1024, FileDirectoryInformation, TRUE,
                                    static_cast<PUNICODE_STRING>(fileName), TRUE);
 
-  FILE_DIRECTORY_INFORMATION* info =
-      reinterpret_cast<FILE_DIRECTORY_INFORMATION*>(buffer);
+  // FileName is not terminated: FileNameLength tells where it ends
+  const auto* info = reinterpret_cast<FILE_DIRECTORY_INFORMATION*>(buffer);
   ASSERT_EQ(STATUS_SUCCESS, status.Status);
-  ASSERT_EQ(0, wcscmp(info->FileName, L"np.exe"));
+  ASSERT_EQ(L"np.exe",
+            std::wstring(info->FileName, info->FileNameLength / sizeof(WCHAR)));
 
   usvfs::hook_NtClose(hdl);
 }
