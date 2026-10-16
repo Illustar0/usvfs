@@ -9,6 +9,7 @@
 #include <set>
 #include <shared_mutex>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -205,6 +206,70 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
   return STATUS_SUCCESS;
 }
 
+// Reads the records of a directory through a handle of its own, for a query that
+// usvfs makes itself rather than one of the caller. Closes the handle when destroyed.
+class NativeDirectoryReader
+{
+public:
+  // Scans directory for the entries that match pattern, or for all of them without
+  // one, in the information class of layout. Reads into buffer, which it sizes to
+  // hold a record with the longest name there is; a record returned stays valid in
+  // the buffer until the reader reads again.
+  NativeDirectoryReader(OwnedHandle directory, const DirectoryRecordLayout& layout,
+                        std::optional<std::wstring_view> pattern,
+                        std::vector<std::byte>& buffer);
+
+  // Returns the next record of the scan, or nothing once the scan ends.
+  std::optional<DirectoryRecord> next();
+  // what ended the scan, STATUS_SUCCESS while it goes on
+  NTSTATUS endStatus() const { return m_endStatus; }
+
+private:
+  OwnedHandle m_directory;
+  DirectoryRecordLayout m_layout;
+  std::optional<UnicodeString> m_pattern;
+  std::vector<std::byte>& m_buffer;
+  // the records of the last read that next has not returned yet
+  std::span<const std::byte> m_records;
+  NTSTATUS m_endStatus = STATUS_SUCCESS;
+};
+
+NativeDirectoryReader::NativeDirectoryReader(OwnedHandle directory,
+                                             const DirectoryRecordLayout& layout,
+                                             std::optional<std::wstring_view> pattern,
+                                             std::vector<std::byte>& buffer)
+    : m_directory(std::move(directory)), m_layout(layout), m_buffer(buffer)
+{
+  if (pattern) {
+    m_pattern.emplace(pattern->data(), pattern->size());
+  }
+  m_buffer.resize(m_layout.fileNameOffset + UNICODE_STRING_MAX_BYTES);
+}
+
+std::optional<DirectoryRecord> NativeDirectoryReader::next()
+{
+  if (m_records.empty()) {
+    if (m_endStatus != STATUS_SUCCESS) {
+      return std::nullopt;
+    }
+    IO_STATUS_BLOCK status;
+    const NTSTATUS result = NtQueryDirectoryFile(
+        m_directory.get(), nullptr, nullptr, nullptr, &status, m_buffer.data(),
+        static_cast<ULONG>(m_buffer.size()), m_layout.informationClass, FALSE,
+        m_pattern ? static_cast<PUNICODE_STRING>(*m_pattern) : nullptr, FALSE);
+    if (result != STATUS_SUCCESS) {
+      m_endStatus = result;
+      return std::nullopt;
+    }
+    m_records = std::span(m_buffer).first(status.Information);
+  }
+  const DirectoryRecord record(m_layout, m_records);
+  m_records = record.nextEntryOffset() == 0
+                  ? std::span<const std::byte>()
+                  : m_records.subspan(record.nextEntryOffset());
+  return record;
+}
+
 // A virtual entry of the scanned directory.
 struct VirtualMatch
 {
@@ -245,7 +310,9 @@ private:
   size_t m_nextMatch = 0;
   // the names of the entries written, so that none is written twice
   CaseInsensitiveNameSet m_names;
-  // where a read goes before its entry is written, aligned as the regular reader's
+  // where a read goes before its entry is written, aligned as the regular reader's.
+  // The reader reads a record whole, whatever the length of its name: the entry goes
+  // out under its virtual name, whose length alone decides whether it fits the query.
   std::vector<std::byte> m_staging;
 };
 
@@ -292,7 +359,7 @@ std::optional<DirectoryRecord> VirtualEntryReader::read(const VirtualMatch& matc
       !ush::startswith(directoryPath.c_str(), LR"(\\?\)")) {
     directoryPath = LR"(\\?\)" + directoryPath;
   }
-  const OwnedHandle directory = openScanDirectory(directoryPath);
+  OwnedHandle directory = openScanDirectory(directoryPath);
   if (!directory.isValid()) {
     spdlog::get("hooks")->warn("failed to open the directory of {0} to list it: {1}",
                                fullPath.string(), ::GetLastError());
@@ -304,24 +371,18 @@ std::optional<DirectoryRecord> VirtualEntryReader::read(const VirtualMatch& matc
       findDirectoryRecordLayout(query.informationClass).value();
   const std::wstring fileName =
       ush::string_cast<std::wstring>(fullPath.filename().string(), ush::CodePage::UTF8);
-  UnicodeString pattern(fileName.c_str());
-  // holds a record with the longest name there is, as the record goes out under the
-  // virtual name, whose length alone decides whether it fits the buffer of the query
-  m_staging.resize(layout.fileNameOffset + UNICODE_STRING_MAX_BYTES);
-  IO_STATUS_BLOCK status;
-  const NTSTATUS result = NtQueryDirectoryFile(
-      directory.get(), nullptr, nullptr, nullptr, &status, m_staging.data(),
-      static_cast<ULONG>(m_staging.size()), query.informationClass,
-      query.isSingleEntry(),
-      fileName != L"." ? static_cast<PUNICODE_STRING>(pattern) : nullptr, FALSE);
-  if (result != STATUS_SUCCESS) {
+  NativeDirectoryReader reader(
+      std::move(directory), layout,
+      fileName != L"." ? std::optional<std::wstring_view>(fileName) : std::nullopt,
+      m_staging);
+  // the pattern is the name of the file, so the scan starts with its record
+  const std::optional<DirectoryRecord> record = reader.next();
+  if (!record) {
     spdlog::get("hooks")->warn("error reported listing files in {0}: {1:x}",
-                               fullPath.string(), static_cast<uint32_t>(result));
-    return std::nullopt;
+                               fullPath.string(),
+                               static_cast<uint32_t>(reader.endStatus()));
   }
-
-  // the pattern is the name of the file, so the read starts with its record
-  return DirectoryRecord(layout, std::span(m_staging).first(status.Information));
+  return record;
 }
 
 // The state of one scan: the queries on a handle from its first query or restart on.
