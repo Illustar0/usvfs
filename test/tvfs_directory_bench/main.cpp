@@ -1,5 +1,6 @@
 // Measures a full listing of a directory that mods are mapped into, through the hooks,
-// against ntdll listing a directory that holds the same files on disk.
+// against ntdll listing a directory that holds the same files on disk, and against the
+// hooks listing that directory.
 //
 // The hooks are called directly, as tvfs_test calls them: they are not installed in
 // this process. The calls a listing makes to ntdll are counted by hooks on ntdll
@@ -242,19 +243,35 @@ void NativeListing(benchmark::State& state)
                  {::NtOpenFile, ::NtQueryDirectoryFile, ::NtClose}, layout.entryCount);
 }
 
-void VirtualListing(benchmark::State& state)
+const ListingFunctions HOOKS{&usvfs::hook_NtOpenFile, &usvfs::hook_NtQueryDirectoryFile,
+                             &usvfs::hook_NtClose};
+
+// Maps the mods of the layout into its data directory, and nothing else.
+void mapMods(const Layout& layout)
 {
-  const Layout& layout = layoutOf(static_cast<std::size_t>(state.range(0)),
-                                  static_cast<std::size_t>(state.range(1)));
   usvfsClearVirtualMappings();
   for (const std::filesystem::path& mod : layout.mods) {
     usvfsVirtualLinkDirectoryStatic(mod.c_str(), layout.data.c_str(),
                                     LINKFLAG_RECURSIVE);
   }
-  measureListing(state, layout.data,
-                 {&usvfs::hook_NtOpenFile, &usvfs::hook_NtQueryDirectoryFile,
-                  &usvfs::hook_NtClose},
-                 layout.entryCount);
+}
+
+void VirtualListing(benchmark::State& state)
+{
+  const Layout& layout = layoutOf(static_cast<std::size_t>(state.range(0)),
+                                  static_cast<std::size_t>(state.range(1)));
+  mapMods(layout);
+  measureListing(state, layout.data, HOOKS, layout.entryCount);
+}
+
+// The hooks listing a directory that nothing is mapped into, as most directories a
+// process lists are, while the mods are mapped into another one.
+void UnmappedListing(benchmark::State& state)
+{
+  const Layout& layout = layoutOf(static_cast<std::size_t>(state.range(0)),
+                                  static_cast<std::size_t>(state.range(1)));
+  mapMods(layout);
+  measureListing(state, layout.physical, HOOKS, layout.entryCount);
 }
 
 void layoutArguments(benchmark::Benchmark* benchmark)
@@ -266,6 +283,7 @@ void layoutArguments(benchmark::Benchmark* benchmark)
 
 BENCHMARK(NativeListing)->Apply(layoutArguments);
 BENCHMARK(VirtualListing)->Apply(layoutArguments);
+BENCHMARK(UnmappedListing)->Apply(layoutArguments);
 
 }  // namespace
 
