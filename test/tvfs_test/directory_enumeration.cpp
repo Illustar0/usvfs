@@ -2692,27 +2692,35 @@ TEST_F(USVFSTest, NtQueryDirectoryFileFoldsNamesLikeNtdll)
   }
   // The tree folds ASCII only, so it holds both entries of each pair. It orders the
   // rest of the names bytewise in UTF-8, so "Ä" (C3 84) comes before "ä" (C3 A4).
-  const std::wstring virtualNames[] = {
+  std::vector<std::wstring> virtualNames = {
       L"usvfs_ÄRGER.txt",
       std::format(L"usvfs_{}.txt", DESERET_SMALL),
       L"usvfs_virtual_ä.txt",
       L"usvfs_virtual_Ä.txt",
       std::format(L"usvfs_virtual_{}.txt", DESERET_SMALL),
       std::format(L"usvfs_virtual_{}.txt", DESERET_CAPITAL)};
-  const std::wstring listedNames[] = {
+  std::vector<std::wstring> listedNames = {
       L"usvfs_ÄRGER.txt",
       std::format(L"usvfs_{}.txt", DESERET_CAPITAL),
       std::format(L"usvfs_{}.txt", DESERET_SMALL),
       L"usvfs_virtual_Ä.txt",
       std::format(L"usvfs_virtual_{}.txt", DESERET_SMALL),
       std::format(L"usvfs_virtual_{}.txt", DESERET_CAPITAL)};
+  // Enough more names that the sets of names spread over many buckets, where two
+  // names that fold into one another meet only if their hashes fold too. They come
+  // first in the tree, so the set that drops the second of a pair has grown by then.
+  for (int filler = 0; filler < 16; ++filler) {
+    const std::wstring name = std::format(L"usvfs_filler_{:02}.txt", filler);
+    virtualNames.push_back(name);
+    listedNames.push_back(name);
+  }
   for (const std::wstring& name : listedNames) {
     std::ofstream(namesakeDirectory / name);
   }
   auto params = defaultUsvfsParams();
   std::unique_ptr<usvfs::HookContext> ctx(
       usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
-  for (size_t index = 0; index < std::size(virtualNames); ++index) {
+  for (size_t index = 0; index < virtualNames.size(); ++index) {
     const std::filesystem::path sourceFile =
         sourceDirectory / std::format(L"source_{}.txt", index);
     std::ofstream{sourceFile};
@@ -2723,23 +2731,31 @@ TEST_F(USVFSTest, NtQueryDirectoryFileFoldsNamesLikeNtdll)
         usvfs::RedirectionDataLocal(sourceFile.string()));
   }
 
-  const ListingQuery listing{FileDirectoryInformation, 0x1000, false, L"usvfs_*"};
-  HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
-  HANDLE hookedHandle   = openHookedDirectory(virtualDirectory);
-  ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
-  ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+  // every name, and the pair that differs in the case of U+00E4 alone, so that no name
+  // of the listing lies beyond U+00FF
+  const std::pair<std::wstring_view, size_t> listings[] = {
+      {L"usvfs_*", listedNames.size()}, {L"usvfs_virtual_?.txt", 1}};
+  for (const auto& [pattern, listedCount] : listings) {
+    SCOPED_TRACE(usvfs::shared::string_cast<std::string>(
+        std::wstring(pattern), usvfs::shared::CodePage::UTF8));
+    const ListingQuery listing{FileDirectoryInformation, 0x1000, false, pattern};
+    HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
+    HANDLE hookedHandle   = openHookedDirectory(virtualDirectory);
+    ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
 
-  const std::vector<ListedQuery> expected =
-      listQueries(nativeQueryDirectoryFile(), namesakeHandle, listing);
-  const std::vector<ListedQuery> actual =
-      listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+    const std::vector<ListedQuery> expected =
+        listQueries(nativeQueryDirectoryFile(), namesakeHandle, listing);
+    const std::vector<ListedQuery> actual =
+        listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
 
-  ASSERT_EQ(std::size(listedNames), sortedNames(expected).size())
-      << "the volume folds the Deseret names into one another";
-  EXPECT_EQ(sortedNames(expected), sortedNames(actual));
+    ASSERT_EQ(listedCount, sortedNames(expected).size())
+        << "ntdll lists other namesakes, as if the volume folded the Deseret names";
+    EXPECT_EQ(sortedNames(expected), sortedNames(actual));
 
-  usvfs::hook_NtClose(namesakeHandle);
-  usvfs::hook_NtClose(hookedHandle);
+    usvfs::hook_NtClose(namesakeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
 }
 
 // ntdll is the reference for a handle that takes the value of one the hooks did not
