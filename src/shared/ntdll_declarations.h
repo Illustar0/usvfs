@@ -588,6 +588,13 @@ using RtlDosPathNameToRelativeNtPathName_U_WithStatus_type =
                      PRTL_RELATIVE_NAME RelativeName);
 using RtlReleaseRelativeName_type = void(NTAPI*)(PRTL_RELATIVE_NAME RelativeName);
 using RtlGetVersion_type          = NTSTATUS(NTAPI*)(PRTL_OSVERSIONINFOW);
+using RtlIsNameInExpression_type  = BOOLEAN(NTAPI*)(PUNICODE_STRING Expression,
+                                                    PUNICODE_STRING Name,
+                                                    BOOLEAN IgnoreCase,
+                                                    PWCH UpcaseTable);
+using RtlUpcaseUnicodeString_type = NTSTATUS(NTAPI*)(PUNICODE_STRING DestinationString,
+                                                     PCUNICODE_STRING SourceString,
+                                                     BOOLEAN AllocateDestinationString);
 
 extern NtQueryDirectoryFile_type NtQueryDirectoryFile;
 extern NtQueryDirectoryFileEx_type NtQueryDirectoryFileEx;
@@ -605,6 +612,8 @@ extern RtlDosPathNameToRelativeNtPathName_U_WithStatus_type
     RtlDosPathNameToRelativeNtPathName_U_WithStatus;
 extern RtlReleaseRelativeName_type RtlReleaseRelativeName;
 extern RtlGetVersion_type RtlGetVersion;
+extern RtlIsNameInExpression_type RtlIsNameInExpression;
+extern RtlUpcaseUnicodeString_type RtlUpcaseUnicodeString;
 
 // ensures ntdll functions have been initialized (only needed during static objects
 // initialization)

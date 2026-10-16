@@ -40,6 +40,8 @@ RtlDosPathNameToRelativeNtPathName_U_WithStatus_type
     RtlDosPathNameToRelativeNtPathName_U_WithStatus;
 RtlReleaseRelativeName_type RtlReleaseRelativeName;
 RtlGetVersion_type RtlGetVersion;
+RtlIsNameInExpression_type RtlIsNameInExpression;
+RtlUpcaseUnicodeString_type RtlUpcaseUnicodeString;
 NtTerminateProcess_type NtTerminateProcess;
 
 static bool ntdll_initialized;
@@ -63,6 +65,8 @@ void ntdll_declarations_init()
     LOAD_EXT(ntDLLMod, RtlDosPathNameToRelativeNtPathName_U_WithStatus);
     LOAD_EXT(ntDLLMod, RtlReleaseRelativeName);
     LOAD_EXT(ntDLLMod, RtlGetVersion);
+    LOAD_EXT(ntDLLMod, RtlIsNameInExpression);
+    LOAD_EXT(ntDLLMod, RtlUpcaseUnicodeString);
     LOAD_EXT(ntDLLMod, NtTerminateProcess);
 
     ntdll_initialized = true;

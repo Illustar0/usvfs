@@ -2002,6 +2002,84 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
   }
 }
 
+// ntdll is the reference for which virtual entries a pattern matches, as it matches
+// files of the virtual names: without regard to case, beyond ASCII too, with the DOS
+// wildcards "<", ">" and "\"" as the filesystem reads them, and with nothing of what
+// cmd.exe makes of a pattern.
+TEST_F(USVFSTest, NtQueryDirectoryFileMatchesVirtualEntriesLikeNtdll)
+{
+  const std::filesystem::path root = test::path_of_test_temp(L"virtual_patterns");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path namesakeDirectory = root / L"namesakes";
+  const std::filesystem::path virtualDirectory  = root / L"virtual";
+  const std::filesystem::path sourceDirectory   = root / L"source";
+  for (const std::filesystem::path& directory :
+       {namesakeDirectory, virtualDirectory, sourceDirectory}) {
+    std::filesystem::create_directories(directory);
+  }
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const std::wstring_view names[] = {L"readme.txt", L"Report.TXT", L"a.txt",
+                                     L"ab.txt",     L"noext",      L"two.dots.txt",
+                                     L".hidden",    L"foo",        L"foo.bar",
+                                     L"Ärger.dat",  L"über.txt"};
+  for (size_t index = 0; index < std::size(names); ++index) {
+    const std::filesystem::path sourceFile =
+        sourceDirectory / std::format(L"source_{}.txt", index);
+    std::ofstream(namesakeDirectory / names[index]);
+    std::ofstream{sourceFile};
+    // in UTF-8, as usvfsVirtualLinkFile adds it: a wide path would go through the
+    // locale of the Boost.Filesystem of this executable, which is not UTF-8
+    ctx->redirectionTable().addFile(
+        usvfs::shared::string_cast<std::string>(
+            (virtualDirectory / names[index]).wstring(), usvfs::shared::CodePage::UTF8),
+        usvfs::RedirectionDataLocal(sourceFile.string()));
+  }
+
+  const std::wstring_view patterns[] = {
+      L"*",       L"*.*",       L"*.txt",  L"*.TXT",     L"?.txt",
+      L"??.txt",  L"a*",        L"foo.*",  L"foo*",      L"*.",
+      L"noext.",  L".hidden",   L"hidden", L"äRGER.DAT", L"Über.txt",
+      L"<.txt",   L"<",         L"foo>",   L">.txt",     L"readme\"txt",
+      L"noext\"", L"foo.bar\"", L"two<",   L"missing",   L""};
+  for (const std::wstring_view pattern : patterns) {
+    SCOPED_TRACE(std::format(
+        "pattern \"{}\"", usvfs::shared::string_cast<std::string>(
+                              std::wstring(pattern), usvfs::shared::CodePage::UTF8)));
+    const ListingQuery listing{FileDirectoryInformation, 0x1000, false, pattern};
+    HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
+    HANDLE hookedHandle   = openHookedDirectory(virtualDirectory);
+    ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+    const std::vector<ListedQuery> expected =
+        listQueries(nativeQueryDirectoryFile(), namesakeHandle, listing);
+    const std::vector<ListedQuery> actual =
+        listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+
+    // the virtual entries follow the regular ones in an order of their own, so only
+    // which names a pattern matches is compared
+    const auto listedNames = [](const std::vector<ListedQuery>& queries) {
+      const DirectoryRecordLayout layout =
+          findDirectoryRecordLayout(FileDirectoryInformation).value();
+      std::vector<std::wstring> names;
+      for (const ListedQuery& query : queries) {
+        if (!query.data.empty()) {
+          std::ranges::move(recordNames(layout, query.data), std::back_inserter(names));
+        }
+      }
+      std::ranges::sort(names);
+      return names;
+    };
+    EXPECT_EQ(expected.front().outcome.result, actual.front().outcome.result);
+    EXPECT_EQ(listedNames(expected), listedNames(actual));
+
+    usvfs::hook_NtClose(namesakeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
+}
+
 // ntdll is the reference for a directory read that fails, also where virtual entries
 // would follow: the error, on every query. The I/O manager refuses a handle without
 // FILE_LIST_DIRECTORY before the filesystem sees the query, so every filesystem fails

@@ -15,7 +15,6 @@
 #include <utility>
 #include <vector>
 
-#include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 
 #include <loghelpers.h>
@@ -629,34 +628,46 @@ gatherVirtualEntries(const UnicodeString& dirName,
     dirNameW += 4;
   }
   auto node = redir->findNode(boost::filesystem::path(dirNameW));
-  if (node.get() != nullptr) {
-    std::string searchPattern =
-        FileName != nullptr
-            ? ush::string_cast<std::string>(FileName->Buffer, ush::CodePage::UTF8,
-                                            FileName->Length / sizeof(WCHAR))
-            : "*.*";
+  if (node.get() == nullptr) {
+    return matches;
+  }
 
-    boost::replace_all(searchPattern, "\"", ".");
+  // ntdll lists every entry for a pattern that is null or empty. RtlIsNameInExpression
+  // wants the pattern upcased, as it ignores case; it reads the DOS wildcards as the
+  // filesystem does.
+  std::optional<std::wstring> upcasedPattern;
+  UNICODE_STRING expression{};
+  if (FileName != nullptr && FileName->Length > 0) {
+    upcasedPattern.emplace(FileName->Length / sizeof(WCHAR), L'\0');
+    expression = {FileName->Length, FileName->Length, upcasedPattern->data()};
+    RtlUpcaseUnicodeString(&expression, FileName, FALSE);
+  }
 
-    for (const auto& subNode : node->find(searchPattern)) {
-      if (((subNode->data().linkTarget.length() > 0) || subNode->isDirectory()) &&
-          !subNode->hasFlag(usvfs::shared::FLAG_DUMMY)) {
-        std::wstring vName =
-            ush::string_cast<std::wstring>(subNode->name(), ush::CodePage::UTF8);
-
-        VirtualMatch m;
-        if (subNode->data().linkTarget.length() > 0) {
-          m = {ush::string_cast<std::wstring>(subNode->data().linkTarget.c_str(),
-                                              ush::CodePage::UTF8),
-               vName};
-        } else {
-          m = {ush::string_cast<std::wstring>(subNode->path().c_str(),
-                                              ush::CodePage::UTF8),
-               vName};
-        }
-
-        matches.push_back(std::move(m));
+  for (auto child = node->filesBegin(); child != node->filesEnd(); ++child) {
+    const auto& subNode = child->second;
+    if (((subNode->data().linkTarget.length() == 0) && !subNode->isDirectory()) ||
+        subNode->hasFlag(usvfs::shared::FLAG_DUMMY)) {
+      continue;
+    }
+    std::wstring vName =
+        ush::string_cast<std::wstring>(subNode->name(), ush::CodePage::UTF8);
+    if (upcasedPattern) {
+      UNICODE_STRING name{static_cast<USHORT>(vName.size() * sizeof(WCHAR)),
+                          static_cast<USHORT>(vName.size() * sizeof(WCHAR)),
+                          vName.data()};
+      if (!RtlIsNameInExpression(&expression, &name, TRUE, nullptr)) {
+        continue;
       }
+    }
+
+    if (subNode->data().linkTarget.length() > 0) {
+      matches.push_back({ush::string_cast<std::wstring>(
+                             subNode->data().linkTarget.c_str(), ush::CodePage::UTF8),
+                         std::move(vName)});
+    } else {
+      matches.push_back(
+          {ush::string_cast<std::wstring>(subNode->path().c_str(), ush::CodePage::UTF8),
+           std::move(vName)});
     }
   }
   return matches;
