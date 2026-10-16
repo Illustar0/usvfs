@@ -607,6 +607,7 @@ using RtlIsNameInExpression_type  = BOOLEAN(NTAPI*)(PUNICODE_STRING Expression,
 using RtlUpcaseUnicodeString_type = NTSTATUS(NTAPI*)(PUNICODE_STRING DestinationString,
                                                      PCUNICODE_STRING SourceString,
                                                      BOOLEAN AllocateDestinationString);
+using RtlUpcaseUnicodeChar_type   = WCHAR(NTAPI*)(WCHAR SourceCharacter);
 
 extern NtQueryDirectoryFile_type NtQueryDirectoryFile;
 extern NtQueryDirectoryFileEx_type NtQueryDirectoryFileEx;
@@ -626,6 +627,7 @@ extern RtlReleaseRelativeName_type RtlReleaseRelativeName;
 extern RtlGetVersion_type RtlGetVersion;
 extern RtlIsNameInExpression_type RtlIsNameInExpression;
 extern RtlUpcaseUnicodeString_type RtlUpcaseUnicodeString;
+extern RtlUpcaseUnicodeChar_type RtlUpcaseUnicodeChar;
 
 // ensures ntdll functions have been initialized (only needed during static objects
 // initialization)

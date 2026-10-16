@@ -2006,6 +2006,27 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
   }
 }
 
+namespace
+{
+
+// The names a listing holds, sorted: the virtual entries follow the regular ones in an
+// order of their own, so a test that mixes them compares only which names are listed.
+std::vector<std::wstring> sortedNames(const std::vector<ListedQuery>& queries)
+{
+  const DirectoryRecordLayout layout =
+      findDirectoryRecordLayout(FileDirectoryInformation).value();
+  std::vector<std::wstring> names;
+  for (const ListedQuery& query : queries) {
+    if (!query.data.empty()) {
+      std::ranges::move(recordNames(layout, query.data), std::back_inserter(names));
+    }
+  }
+  std::ranges::sort(names);
+  return names;
+}
+
+}  // namespace
+
 // ntdll is the reference for which virtual entries a pattern matches, as it matches
 // files of the virtual names: without regard to case, beyond ASCII too, with the DOS
 // wildcards "<", ">" and "\"" as the filesystem reads them, and with nothing of what
@@ -2062,22 +2083,8 @@ TEST_F(USVFSTest, NtQueryDirectoryFileMatchesVirtualEntriesLikeNtdll)
     const std::vector<ListedQuery> actual =
         listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
 
-    // the virtual entries follow the regular ones in an order of their own, so only
-    // which names a pattern matches is compared
-    const auto listedNames = [](const std::vector<ListedQuery>& queries) {
-      const DirectoryRecordLayout layout =
-          findDirectoryRecordLayout(FileDirectoryInformation).value();
-      std::vector<std::wstring> names;
-      for (const ListedQuery& query : queries) {
-        if (!query.data.empty()) {
-          std::ranges::move(recordNames(layout, query.data), std::back_inserter(names));
-        }
-      }
-      std::ranges::sort(names);
-      return names;
-    };
     EXPECT_EQ(expected.front().outcome.result, actual.front().outcome.result);
-    EXPECT_EQ(listedNames(expected), listedNames(actual));
+    EXPECT_EQ(sortedNames(expected), sortedNames(actual));
 
     usvfs::hook_NtClose(namesakeHandle);
     usvfs::hook_NtClose(hookedHandle);
@@ -2612,6 +2619,82 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsCaseVariantsLikeNtdll)
   }
 
   usvfs::hook_NtClose(nativeHandle);
+  usvfs::hook_NtClose(hookedHandle);
+}
+
+// ntdll is the reference for which names are one: NTFS and ReFS fold a name one UTF-16
+// code unit at a time, through the upcase table of the volume. A virtual entry shadows
+// the regular entry whose name folds into its own, and of two virtual entries whose
+// names do, only the first is listed. Names that differ in the case of a character
+// beyond the BMP only stay apart, as the table leaves a surrogate pair as it is.
+TEST_F(USVFSTest, NtQueryDirectoryFileFoldsNamesLikeNtdll)
+{
+  // DESERET SMALL LETTER LONG I and DESERET CAPITAL LETTER LONG I, which LCMapStringW
+  // folds into one another
+  constexpr std::wstring_view DESERET_SMALL   = L"\U00010428";
+  constexpr std::wstring_view DESERET_CAPITAL = L"\U00010400";
+  const std::filesystem::path root = test::path_of_test_temp(L"folded_names");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path namesakeDirectory = root / L"namesakes";
+  const std::filesystem::path virtualDirectory  = root / L"virtual";
+  const std::filesystem::path sourceDirectory   = root / L"source";
+  for (const std::filesystem::path& directory :
+       {namesakeDirectory, virtualDirectory, sourceDirectory}) {
+    std::filesystem::create_directories(directory);
+  }
+  for (const std::wstring& name : {std::wstring(L"usvfs_ärger.txt"),
+                                   std::format(L"usvfs_{}.txt", DESERET_CAPITAL)}) {
+    std::ofstream(virtualDirectory / name);
+  }
+  // The tree folds ASCII only, so it holds both entries of each pair. It orders the
+  // rest of the names bytewise in UTF-8, so "Ä" (C3 84) comes before "ä" (C3 A4).
+  const std::wstring virtualNames[] = {
+      L"usvfs_ÄRGER.txt",
+      std::format(L"usvfs_{}.txt", DESERET_SMALL),
+      L"usvfs_virtual_ä.txt",
+      L"usvfs_virtual_Ä.txt",
+      std::format(L"usvfs_virtual_{}.txt", DESERET_SMALL),
+      std::format(L"usvfs_virtual_{}.txt", DESERET_CAPITAL)};
+  const std::wstring listedNames[] = {
+      L"usvfs_ÄRGER.txt",
+      std::format(L"usvfs_{}.txt", DESERET_CAPITAL),
+      std::format(L"usvfs_{}.txt", DESERET_SMALL),
+      L"usvfs_virtual_Ä.txt",
+      std::format(L"usvfs_virtual_{}.txt", DESERET_SMALL),
+      std::format(L"usvfs_virtual_{}.txt", DESERET_CAPITAL)};
+  for (const std::wstring& name : listedNames) {
+    std::ofstream(namesakeDirectory / name);
+  }
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  for (size_t index = 0; index < std::size(virtualNames); ++index) {
+    const std::filesystem::path sourceFile =
+        sourceDirectory / std::format(L"source_{}.txt", index);
+    std::ofstream{sourceFile};
+    ctx->redirectionTable().addFile(
+        usvfs::shared::string_cast<std::string>(
+            (virtualDirectory / virtualNames[index]).wstring(),
+            usvfs::shared::CodePage::UTF8),
+        usvfs::RedirectionDataLocal(sourceFile.string()));
+  }
+
+  const ListingQuery listing{FileDirectoryInformation, 0x1000, false, L"usvfs_*"};
+  HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
+  HANDLE hookedHandle   = openHookedDirectory(virtualDirectory);
+  ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+  const std::vector<ListedQuery> expected =
+      listQueries(nativeQueryDirectoryFile(), namesakeHandle, listing);
+  const std::vector<ListedQuery> actual =
+      listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+
+  ASSERT_EQ(std::size(listedNames), sortedNames(expected).size())
+      << "the volume folds the Deseret names into one another";
+  EXPECT_EQ(sortedNames(expected), sortedNames(actual));
+
+  usvfs::hook_NtClose(namesakeHandle);
   usvfs::hook_NtClose(hookedHandle);
 }
 

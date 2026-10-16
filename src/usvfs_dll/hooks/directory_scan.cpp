@@ -1,5 +1,6 @@
 #include "directory_scan.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cwchar>
@@ -35,22 +36,31 @@ namespace bfs  = boost::filesystem;
 using usvfs::UnicodeString;
 
 // File names compared without regard to case, as shadowing and deduplication
-// compare them.
+// compare them. NTFS and ReFS fold a name one UTF-16 code unit at a time, through the
+// upcase table of the volume, which leaves a surrogate pair as it is; LCMapStringW
+// folds some characters beyond the BMP, and so would merge names that the volume
+// keeps apart.
 class CaseInsensitiveNameSet
 {
 public:
   // Returns whether the name was not in the set yet.
   bool insert(const std::wstring& name)
   {
-    return m_upperNames.insert(ush::to_upper(name)).second;
+    return m_upperNames.insert(upcase(name)).second;
   }
 
   bool contains(const std::wstring& name) const
   {
-    return m_upperNames.contains(ush::to_upper(name));
+    return m_upperNames.contains(upcase(name));
   }
 
 private:
+  static std::wstring upcase(std::wstring name)
+  {
+    std::ranges::transform(name, name.begin(), RtlUpcaseUnicodeChar);
+    return name;
+  }
+
   std::set<std::wstring> m_upperNames;
 };
 
