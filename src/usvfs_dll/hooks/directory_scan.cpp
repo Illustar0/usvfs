@@ -11,6 +11,7 @@
 #include <span>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -270,6 +271,125 @@ std::optional<DirectoryRecord> NativeDirectoryReader::next()
   return record;
 }
 
+// A directory that virtual entries map files or directories of. Read whole the first
+// time an entry needs it, keeping the records of what the entries map, so that it is
+// read once rather than once per entry, and its handle closes before the query that
+// reads it returns.
+class SourceDirectory
+{
+public:
+  explicit SourceDirectory(std::wstring path) : m_path(std::move(path)) {}
+
+  // Adds the name of a file or directory that an entry maps.
+  void addFileName(std::wstring fileName) { m_fileNames.insert(std::move(fileName)); }
+
+  // Returns the record of a file or directory in the information class of layout, or
+  // nothing when it cannot be read. Reads through buffer, as NativeDirectoryReader
+  // does; the record stays valid until the next call.
+  std::optional<DirectoryRecord> find(const std::wstring& fileName,
+                                      const DirectoryRecordLayout& layout,
+                                      std::vector<std::byte>& buffer);
+
+private:
+  // Reads the directory whole and keeps the records of the file names.
+  void read(const DirectoryRecordLayout& layout, std::vector<std::byte>& buffer);
+  // Queries the directory for a file name.
+  std::optional<DirectoryRecord> query(const std::wstring& fileName,
+                                       const DirectoryRecordLayout& layout,
+                                       std::vector<std::byte>& buffer);
+
+  // where a kept record lies in m_records
+  struct RecordPlace
+  {
+    size_t offset;
+    size_t size;
+  };
+
+  std::wstring m_path;
+  std::unordered_set<std::wstring> m_fileNames;
+  // the information class of the records kept, nothing before the first read
+  std::optional<FILE_INFORMATION_CLASS> m_recordClass;
+  // the records kept, one after another, without the padding between them
+  std::vector<std::byte> m_records;
+  std::unordered_map<std::wstring, RecordPlace> m_recordPlaces;
+};
+
+std::optional<DirectoryRecord>
+SourceDirectory::find(const std::wstring& fileName, const DirectoryRecordLayout& layout,
+                      std::vector<std::byte>& buffer)
+{
+  if (m_recordClass != layout.informationClass) {
+    read(layout, buffer);
+  }
+  if (const auto place = m_recordPlaces.find(fileName); place != m_recordPlaces.end()) {
+    return DirectoryRecord(
+        layout, std::span(m_records).subspan(place->second.offset, place->second.size));
+  }
+  // The file is missing, or the mapping names it in another case or by its 8.3 name,
+  // which a query by name leaves to the filesystem to match.
+  return query(fileName, layout, buffer);
+}
+
+void SourceDirectory::read(const DirectoryRecordLayout& layout,
+                           std::vector<std::byte>& buffer)
+{
+  // set before the read, so that a directory that fails to read is not read again
+  // for every entry
+  m_recordClass = layout.informationClass;
+  m_records.clear();
+  m_recordPlaces.clear();
+  OwnedHandle directory = openScanDirectory(m_path);
+  if (!directory.isValid()) {
+    spdlog::get("hooks")->warn(
+        "failed to open {0} to list it: {1}",
+        ush::string_cast<std::string>(m_path, ush::CodePage::UTF8), ::GetLastError());
+    return;
+  }
+  NativeDirectoryReader reader(std::move(directory), layout, std::nullopt, buffer);
+  while (const std::optional<DirectoryRecord> record = reader.next()) {
+    std::wstring fileName = record->fileName();
+    if (!m_fileNames.contains(fileName)) {
+      continue;
+    }
+    const std::span<const std::byte> bytes = record->bytes();
+    m_recordPlaces.try_emplace(std::move(fileName),
+                               RecordPlace{m_records.size(), bytes.size()});
+    m_records.insert(m_records.end(), bytes.begin(), bytes.end());
+  }
+  if (reader.endStatus() != STATUS_NO_MORE_FILES) {
+    spdlog::get("hooks")->warn(
+        "error reported listing files in {0}: {1:x}",
+        ush::string_cast<std::string>(m_path, ush::CodePage::UTF8),
+        static_cast<uint32_t>(reader.endStatus()));
+  }
+}
+
+std::optional<DirectoryRecord>
+SourceDirectory::query(const std::wstring& fileName,
+                       const DirectoryRecordLayout& layout,
+                       std::vector<std::byte>& buffer)
+{
+  const std::string filePath =
+      ush::string_cast<std::string>(m_path + L"\\" + fileName, ush::CodePage::UTF8);
+  OwnedHandle directory = openScanDirectory(m_path);
+  if (!directory.isValid()) {
+    spdlog::get("hooks")->warn("failed to open the directory of {0} to list it: {1}",
+                               filePath, ::GetLastError());
+    return std::nullopt;
+  }
+  NativeDirectoryReader reader(
+      std::move(directory), layout,
+      fileName != L"." ? std::optional<std::wstring_view>(fileName) : std::nullopt,
+      buffer);
+  // the pattern is the name of the file, so the scan starts with its record
+  const std::optional<DirectoryRecord> record = reader.next();
+  if (!record) {
+    spdlog::get("hooks")->warn("error reported listing files in {0}: {1:x}", filePath,
+                               static_cast<uint32_t>(reader.endStatus()));
+  }
+  return record;
+}
+
 // A virtual entry of the scanned directory.
 struct VirtualMatch
 {
@@ -288,9 +408,7 @@ class VirtualEntryReader
 {
 public:
   VirtualEntryReader() = default;
-  explicit VirtualEntryReader(std::vector<VirtualMatch> matches)
-      : m_matches(std::move(matches))
-  {}
+  explicit VirtualEntryReader(const std::vector<VirtualMatch>& matches);
 
   // Writes the entries left to list, as many as the output takes; the first that does
   // not fit stays for the next call. Skips an entry whose record cannot be read or
@@ -300,89 +418,86 @@ public:
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
 private:
-  // Reads the record of what a match maps to from the directory it lies in. Returns
-  // nothing when the read fails.
-  std::optional<DirectoryRecord> read(const VirtualMatch& match,
-                                      const DirectoryQuery& query);
+  // A file or directory of a source directory, listed under its virtual name.
+  struct Entry
+  {
+    // index into m_sources
+    size_t source;
+    std::wstring fileName;
+    // empty for an entry listed under the name of its file
+    std::wstring virtualName;
+  };
 
-  std::vector<VirtualMatch> m_matches;
-  // index of the next match to try; the ones before it are done
-  size_t m_nextMatch = 0;
+  std::vector<SourceDirectory> m_sources;
+  // in the order of the matches, which is the order they are listed in
+  std::vector<Entry> m_entries;
+  // index of the next entry to try; the ones before it are done
+  size_t m_nextEntry = 0;
   // the names of the entries written, so that none is written twice
   CaseInsensitiveNameSet m_names;
-  // where a read goes before its entry is written, aligned as the regular reader's.
-  // The reader reads a record whole, whatever the length of its name: the entry goes
-  // out under its virtual name, whose length alone decides whether it fits the query.
+  // where the source directories read, aligned as the regular reader's staging area.
+  // A read holds a record whole, whatever the length of its name: the entry goes out
+  // under its virtual name, whose length alone decides whether it fits the query.
   std::vector<std::byte> m_staging;
 };
 
+VirtualEntryReader::VirtualEntryReader(const std::vector<VirtualMatch>& matches)
+{
+  std::unordered_map<std::wstring, size_t> sourceIndexes;
+  for (const VirtualMatch& match : matches) {
+    // the path of a directory mapped with all its content ends with a separator,
+    // which leaves "." as its file name
+    bfs::path fullPath(match.realPath);
+    if (fullPath.filename().wstring() == L".") {
+      fullPath = fullPath.parent_path();
+    }
+    std::wstring sourcePath = fullPath.parent_path().wstring();
+    if (sourcePath.length() >= MAX_PATH &&
+        !ush::startswith(sourcePath.c_str(), LR"(\\?\)")) {
+      sourcePath = LR"(\\?\)" + sourcePath;
+    }
+    const auto [sourceIndex, isNew] =
+        sourceIndexes.try_emplace(sourcePath, m_sources.size());
+    if (isNew) {
+      m_sources.emplace_back(sourcePath);
+    }
+    std::wstring fileName = ush::string_cast<std::wstring>(fullPath.filename().string(),
+                                                           ush::CodePage::UTF8);
+    m_sources[sourceIndex->second].addFileName(fileName);
+    m_entries.push_back({sourceIndex->second, std::move(fileName), match.virtualName});
+  }
+}
+
 NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& output)
 {
+  // shouldVirtualize lets through only the classes that have a layout
+  const DirectoryRecordLayout layout =
+      findDirectoryRecordLayout(query.informationClass).value();
   // the skipped entries are dropped as the stock code dropped them; a single-entry
   // query stops before reading an entry it would not take
-  for (; m_nextMatch < m_matches.size() && !output.isSatisfied(); ++m_nextMatch) {
-    const VirtualMatch& match                   = m_matches[m_nextMatch];
-    const std::optional<DirectoryRecord> record = read(match, query);
+  for (; m_nextEntry < m_entries.size() && !output.isSatisfied(); ++m_nextEntry) {
+    const Entry& entry = m_entries[m_nextEntry];
+    const std::optional<DirectoryRecord> record =
+        m_sources[entry.source].find(entry.fileName, layout, m_staging);
     if (!record) {
       continue;
     }
     const std::wstring name =
-        match.virtualName.empty() ? record->fileName() : match.virtualName;
+        entry.virtualName.empty() ? record->fileName() : entry.virtualName;
     if (m_names.contains(name)) {
       continue;
     }
-    const bool isWritten = match.virtualName.empty()
+    const bool isWritten = entry.virtualName.empty()
                                ? output.append(*record)
                                : output.appendRenamed(*record, name);
     // like ntdll, an entry that does not fit stays for the next call to return, be it
-    // after its partial record or after the entries the output holds. That call reads
-    // it again: one extra read per call, so that no record is kept between calls.
+    // after its partial record or after the entries the output holds
     if (!isWritten) {
       return output.isOverflowed() ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     }
     m_names.insert(name);
   }
   return output.isEmpty() ? STATUS_NO_MORE_FILES : STATUS_SUCCESS;
-}
-
-std::optional<DirectoryRecord> VirtualEntryReader::read(const VirtualMatch& match,
-                                                        const DirectoryQuery& query)
-{
-  // the path of a directory mapped with all its content ends with a separator, which
-  // leaves "." as its file name
-  bfs::path fullPath(match.realPath);
-  if (fullPath.filename().wstring() == L".") {
-    fullPath = fullPath.parent_path();
-  }
-  std::wstring directoryPath = fullPath.parent_path().wstring();
-  if (directoryPath.length() >= MAX_PATH &&
-      !ush::startswith(directoryPath.c_str(), LR"(\\?\)")) {
-    directoryPath = LR"(\\?\)" + directoryPath;
-  }
-  OwnedHandle directory = openScanDirectory(directoryPath);
-  if (!directory.isValid()) {
-    spdlog::get("hooks")->warn("failed to open the directory of {0} to list it: {1}",
-                               fullPath.string(), ::GetLastError());
-    return std::nullopt;
-  }
-
-  // shouldVirtualize lets through only the classes that have a layout
-  const DirectoryRecordLayout layout =
-      findDirectoryRecordLayout(query.informationClass).value();
-  const std::wstring fileName =
-      ush::string_cast<std::wstring>(fullPath.filename().string(), ush::CodePage::UTF8);
-  NativeDirectoryReader reader(
-      std::move(directory), layout,
-      fileName != L"." ? std::optional<std::wstring_view>(fileName) : std::nullopt,
-      m_staging);
-  // the pattern is the name of the file, so the scan starts with its record
-  const std::optional<DirectoryRecord> record = reader.next();
-  if (!record) {
-    spdlog::get("hooks")->warn("error reported listing files in {0}: {1:x}",
-                               fullPath.string(),
-                               static_cast<uint32_t>(reader.endStatus()));
-  }
-  return record;
 }
 
 // The state of one scan: the queries on a handle from its first query or restart on.
@@ -612,7 +727,7 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, bool isFirstOfHandle)
   }
   m_regular.emplace(std::move(regularSource), std::move(shadowedNames),
                     query.isRestart());
-  m_virtual = VirtualEntryReader(std::move(virtualMatches));
+  m_virtual = VirtualEntryReader(virtualMatches);
 }
 
 NTSTATUS queryNative(const DirectoryQuery& query)

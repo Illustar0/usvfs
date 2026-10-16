@@ -1883,6 +1883,106 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsSeveralVirtualEntriesPerQueryLikeNtdl
   }
 }
 
+// ntdll is the reference for virtual entries that map files of several directories,
+// as it lists files of the virtual names: every entry whose file exists, also when
+// the mapping names it in another case, and none twice or out of order, also when a
+// query asks for another information class than the one before it.
+TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
+{
+  constexpr int ENTRY_COUNT           = 12;
+  constexpr std::wstring_view PATTERN = L"usvfs_entry_*";
+  const std::filesystem::path root    = test::path_of_test_temp(L"several_sources");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path namesakeDirectory = root / L"namesakes";
+  const std::filesystem::path virtualDirectory  = root / L"virtual";
+  const std::array sourceDirectories{root / L"source_a", root / L"source_b"};
+  for (const std::filesystem::path& directory :
+       {namesakeDirectory, virtualDirectory, sourceDirectories[0],
+        sourceDirectories[1]}) {
+    std::filesystem::create_directories(directory);
+  }
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  for (int entry = 0; entry < ENTRY_COUNT; ++entry) {
+    const std::wstring name = std::format(L"usvfs_entry_{:02}.txt", entry);
+    // the entries alternate between the sources, so that the scans interleave
+    const std::filesystem::path& source = sourceDirectories[entry % 2];
+    const std::wstring sourceName       = std::format(L"source_{}.txt", entry);
+    std::filesystem::path linkTarget    = source / sourceName;
+    if (entry == 5) {
+      // the file exists under the name in another case
+      linkTarget = source / std::format(L"SOURCE_{}.TXT", entry);
+    }
+    if (entry == 8) {
+      // the file does not exist, so the entry is not listed
+      linkTarget = source / L"missing.txt";
+    } else {
+      std::ofstream(source / sourceName);
+      std::ofstream(namesakeDirectory / name);
+    }
+    ctx->redirectionTable().addFile((virtualDirectory / name).c_str(),
+                                    usvfs::RedirectionDataLocal(linkTarget.string()));
+  }
+
+  for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
+    const DirectoryRecordLayout layout =
+        findDirectoryRecordLayout(informationClass).value();
+    HANDLE wholeHandle = openHookedDirectory(namesakeDirectory);
+    ASSERT_NE(INVALID_HANDLE_VALUE, wholeHandle);
+    const ListedQuery whole = queryOnce(nativeQueryDirectoryFile(), wholeHandle,
+                                        {informationClass, 0x1000, false, PATTERN});
+    usvfs::hook_NtClose(wholeHandle);
+    const std::vector<size_t> offsets = recordOffsets(layout, whole.data);
+    ASSERT_EQ(static_cast<size_t>(ENTRY_COUNT - 1), offsets.size());
+
+    // the first holds every entry; the second ends where the fourth record starts, so
+    // it holds three, and so does it with the class changed on every query
+    for (const auto& [length, isClassChanging] :
+         {std::pair{0x1000ul, false}, std::pair{static_cast<ULONG>(offsets[3]), false},
+          std::pair{static_cast<ULONG>(offsets[3]), true}}) {
+      SCOPED_TRACE(std::format("class {}, length {}{}",
+                               static_cast<int>(informationClass), length,
+                               isClassChanging ? ", class changing" : ""));
+      HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
+      HANDLE hookedHandle   = openHookedDirectory(virtualDirectory);
+      ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
+      ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+      size_t classIndex =
+          std::ranges::find(DIRECTORY_INFORMATION_CLASSES, informationClass) -
+          std::begin(DIRECTORY_INFORMATION_CLASSES);
+      for (size_t query = 0;; ++query) {
+        SCOPED_TRACE(query);
+        const FILE_INFORMATION_CLASS queryClass =
+            DIRECTORY_INFORMATION_CLASSES[classIndex];
+        const ListingQuery listing{queryClass, length, false, PATTERN};
+        const ListedQuery expected =
+            queryOnce(nativeQueryDirectoryFile(), namesakeHandle, listing);
+        const ListedQuery actual =
+            queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+
+        expectSameOutcome(expected.outcome, actual.outcome);
+        const DirectoryRecordLayout queryLayout =
+            findDirectoryRecordLayout(queryClass).value();
+        EXPECT_EQ(recordOffsets(queryLayout, expected.data),
+                  recordOffsets(queryLayout, actual.data));
+        EXPECT_EQ(recordNames(queryLayout, expected.data),
+                  recordNames(queryLayout, actual.data));
+        if (expected.outcome.result != STATUS_SUCCESS || query > ENTRY_COUNT) {
+          break;
+        }
+        if (isClassChanging) {
+          classIndex = (classIndex + 1) % std::size(DIRECTORY_INFORMATION_CLASSES);
+        }
+      }
+
+      usvfs::hook_NtClose(namesakeHandle);
+      usvfs::hook_NtClose(hookedHandle);
+    }
+  }
+}
+
 // ntdll is the reference for a directory read that fails, also where virtual entries
 // would follow: the error, on every query. The I/O manager refuses a handle without
 // FILE_LIST_DIRECTORY before the filesystem sees the query, so every filesystem fails
