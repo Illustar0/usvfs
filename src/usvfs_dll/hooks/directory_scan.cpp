@@ -127,14 +127,19 @@ OwnedHandle openScanDirectory(const std::wstring& path)
 class RegularEntryReader
 {
 public:
-  // Reads source, or the handle of the query if source is invalid. The shadowed
-  // names are those of the virtual entries, which take precedence. A reader for a
-  // restarted scan restarts the native scan with its first read.
-  RegularEntryReader(OwnedHandle source, CaseInsensitiveNameSet shadowedNames,
-                     bool isRestart)
+  // Reads source, or the handle of the query if source is invalid, with the pattern
+  // of the scan, or every entry without one. The shadowed names are those of the
+  // virtual entries, which take precedence. A reader for a restarted scan restarts
+  // the native scan with its first read.
+  RegularEntryReader(OwnedHandle source, std::optional<std::wstring_view> pattern,
+                     CaseInsensitiveNameSet shadowedNames, bool isRestart)
       : m_source(std::move(source)), m_shadowedNames(std::move(shadowedNames)),
         m_isRestartPending(isRestart)
-  {}
+  {
+    if (pattern) {
+      m_pattern.emplace(pattern->data(), pattern->size());
+    }
+  }
 
   // Writes the entries of the next reads, reading only while the output is empty.
   // Returns STATUS_SUCCESS once it wrote some, STATUS_BUFFER_OVERFLOW once it wrote
@@ -144,6 +149,7 @@ public:
 
 private:
   OwnedHandle m_source;
+  std::optional<UnicodeString> m_pattern;
   // Only these are left out: ntdll lists every entry once, and names that differ in
   // case only are different entries in a case-sensitive directory.
   CaseInsensitiveNameSet m_shadowedNames;
@@ -165,14 +171,15 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
 
   while (output.isEmpty()) {
     // The handle completes synchronously and the caller's notifications belong to
-    // the caller's query, so this read asks for none. A restart goes on to the native
-    // scan of the caller's handle, which would go on from where it was otherwise;
-    // ntdll then lists with the pattern of the restart, or the one it latched when
-    // the restart brings none. A reopened source starts at its first entry anyway.
+    // the caller's query, so this read asks for none. A restart is passed on, as the
+    // native scan of the caller's handle would go on from where it was otherwise.
+    // The pattern of the scan is passed on every read: the first read of a handle
+    // latches it, which a reopened source needs, and ntdll ignores it otherwise.
     IO_STATUS_BLOCK status;
     const NTSTATUS result = NtQueryDirectoryFile(
         source, nullptr, nullptr, nullptr, &status, m_staging.data(), query.length,
-        query.informationClass, query.isSingleEntry(), query.fileName,
+        query.informationClass, query.isSingleEntry(),
+        m_pattern ? static_cast<PUNICODE_STRING>(*m_pattern) : nullptr,
         std::exchange(m_isRestartPending, false));
     // ntdll cuts a first record that does not fit short, and returns it again on
     // every query until a buffer holds it, so the regular entries do not end here.
@@ -523,9 +530,10 @@ class DirectoryScan
 {
 public:
   // Starts the scan: picks the directory the regular entries are read from and
-  // gathers the virtual entries matching the pattern of the query. The first scan of
-  // a handle is the one its first query starts; a restart starts the others.
-  DirectoryScan(const DirectoryQuery& query, bool isFirstOfHandle);
+  // gathers the virtual entries matching the pattern of the scan. The first query of
+  // a handle starts its first scan, with replaced null; a restart starts the others,
+  // replacing the scan before it.
+  DirectoryScan(const DirectoryQuery& query, const DirectoryScan* replaced);
 
   // Answers a query with the next entries of the scan. Like ntdll, reports the
   // result both as the return value and in the status block. Queries on the same
@@ -538,6 +546,9 @@ private:
   // whether the queries go straight to ntdll; fixed at construction, so read
   // without the lock
   const bool m_isPassthrough;
+  // the pattern the scan lists with, std::nullopt for every entry (see latchPattern);
+  // fixed at construction, so the restart replacing the scan reads it unlocked
+  const std::optional<std::wstring> m_pattern;
 
   // Guards the state below. Taken after the registry lock is released; nested
   // directory queries made while holding it go straight to ntdll, so it is never
@@ -574,7 +585,7 @@ public:
     // Constructed without the lock, since construction takes the hook context
     // lock and reenters hooks. Declared before the lock, so that a scan that is
     // unused or replaced is destroyed after unlocking.
-    auto scan = std::make_shared<DirectoryScan>(query, current == nullptr);
+    auto scan = std::make_shared<DirectoryScan>(query, current.get());
     std::unique_lock lock(m_mutex);
     const auto [entry, isInserted] = m_scans.try_emplace(query.handle, scan);
     if (!isInserted && query.isRestart()) {
@@ -615,11 +626,12 @@ private:
 // running while the DLL unloads do not touch a destroyed registry.
 DirectoryScans& directoryScans = *new DirectoryScans;
 
-// Returns the virtual entries of a directory that match the pattern of a query.
+// Returns the virtual entries of a directory that match a pattern, all of them
+// without one.
 std::vector<VirtualMatch>
 gatherVirtualEntries(const UnicodeString& dirName,
                      const usvfs::RedirectionTreeContainer& redir,
-                     PUNICODE_STRING FileName)
+                     const std::optional<std::wstring>& pattern)
 {
   std::vector<VirtualMatch> matches;
   LPCWSTR dirNameW = static_cast<LPCWSTR>(dirName);
@@ -634,15 +646,17 @@ gatherVirtualEntries(const UnicodeString& dirName,
     return matches;
   }
 
-  // ntdll lists every entry for a pattern that is null or empty. RtlIsNameInExpression
-  // wants the pattern upcased, as it ignores case; it reads the DOS wildcards as the
-  // filesystem does.
+  // RtlIsNameInExpression wants the pattern upcased, as it ignores case; it reads the
+  // DOS wildcards as the filesystem does.
   std::optional<std::wstring> upcasedPattern;
   UNICODE_STRING expression{};
-  if (FileName != nullptr && FileName->Length > 0) {
-    upcasedPattern.emplace(FileName->Length / sizeof(WCHAR), L'\0');
-    expression = {FileName->Length, FileName->Length, upcasedPattern->data()};
-    RtlUpcaseUnicodeString(&expression, FileName, FALSE);
+  if (pattern) {
+    const auto length = static_cast<USHORT>(pattern->size() * sizeof(WCHAR));
+    // only read, though UNICODE_STRING has no const buffer
+    const UNICODE_STRING source{length, length, const_cast<PWSTR>(pattern->data())};
+    upcasedPattern.emplace(pattern->size(), L'\0');
+    expression = {length, length, upcasedPattern->data()};
+    RtlUpcaseUnicodeString(&expression, &source, FALSE);
   }
 
   for (auto child = node->filesBegin(); child != node->filesEnd(); ++child) {
@@ -704,11 +718,26 @@ bool isSynchronousHandle(HANDLE handle)
          (mode.Mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
 }
 
+// Returns the pattern a scan lists with, std::nullopt for every entry, as NTFS and
+// ReFS latch it: that of the query starting the scan, unless it is null or empty.
+// Then they keep the pattern of the scan it replaces, which is every entry for the
+// first scan of a handle.
+std::optional<std::wstring>
+latchPattern(const DirectoryQuery& query,
+             const std::optional<std::wstring>& replacedPattern)
+{
+  if (query.fileName == nullptr || query.fileName->Length == 0) {
+    return replacedPattern;
+  }
+  return std::wstring(query.fileName->Buffer, query.fileName->Length / sizeof(WCHAR));
+}
+
 // An asynchronous handle gets a scan that only forwards its queries, so that the
 // handle is checked once rather than on every query.
-DirectoryScan::DirectoryScan(const DirectoryQuery& query, bool isFirstOfHandle)
+DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* replaced)
     : m_isPassthrough(!isSynchronousHandle(query.handle)),
-      m_isFirstCall(isFirstOfHandle)
+      m_pattern(latchPattern(query, replaced ? replaced->m_pattern : std::nullopt)),
+      m_isFirstCall(replaced == nullptr)
 {
   using namespace usvfs;
 
@@ -732,7 +761,7 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, bool isFirstOfHandle)
     searchPath = storedSearchPath ? UnicodeString(storedSearchPath->c_str())
                                   : ntdllHandleTracker.lookup(query.handle);
     virtualMatches =
-        gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName);
+        gatherVirtualEntries(searchPath, context->redirectionTable(), m_pattern);
   }
   // opened without the context lock, since CreateFileW reenters the hooks
   OwnedHandle regularSource = openRegularSource(storedSearchPath);
@@ -742,10 +771,7 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, bool isFirstOfHandle)
   ulog::CallLogger(query.isEx ? "hook_NtQueryDirectoryFileEx"
                               : "hook_NtQueryDirectoryFile")
       .addParam("path", searchPath)
-      .addParam("FileName", query.fileName != nullptr
-                                ? std::wstring(query.fileName->Buffer,
-                                               query.fileName->Length / sizeof(WCHAR))
-                                : std::wstring(L"<null>"))
+      .addParam("pattern", m_pattern.value_or(L"<every entry>"))
       .addParam("regularSource", regularSource.isValid()
                                      ? *storedSearchPath
                                      : std::wstring(L"<queried handle>"))
@@ -755,7 +781,7 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, bool isFirstOfHandle)
   for (const VirtualMatch& match : virtualMatches) {
     shadowedNames.insert(match.virtualName);
   }
-  m_regular.emplace(std::move(regularSource), std::move(shadowedNames),
+  m_regular.emplace(std::move(regularSource), m_pattern, std::move(shadowedNames),
                     query.isRestart());
   m_virtual = VirtualEntryReader(virtualMatches);
 }

@@ -2230,6 +2230,129 @@ TEST_F(USVFSTest, NtQueryDirectoryFileEndsAnEmptyRestartLikeNtdll)
   }
 }
 
+// ntdll is the reference for the pattern a restart lists with, as NTFS and ReFS latch
+// it: that of the first query, or every name without one, until a restart brings one
+// that is not empty; a query that does not restart ignores its pattern. The virtual
+// entries follow it as the regular ones do, also with a directory the scan reopens.
+TEST_F(USVFSTest, NtQueryDirectoryFileRestartsWithTheLatchedPatternLikeNtdll)
+{
+  // a guard against a listing that does not end
+  constexpr size_t MAXIMUM_QUERIES = 100;
+  const std::filesystem::path root = test::path_of_test_temp(L"latched_pattern");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path namesakeDirectory = root / L"namesakes";
+  const std::filesystem::path virtualDirectory  = root / L"virtual";
+  const std::filesystem::path sourceDirectory   = root / L"source";
+  for (const std::filesystem::path& directory :
+       {namesakeDirectory, virtualDirectory, sourceDirectory}) {
+    std::filesystem::create_directories(directory);
+  }
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  for (const std::wstring_view name : {L"a_regular.txt", L"b_regular.txt"}) {
+    std::ofstream{namesakeDirectory / name};
+    std::ofstream{virtualDirectory / name};
+  }
+  for (const std::wstring_view name : {L"a_virtual.txt", L"b_virtual.txt"}) {
+    std::ofstream{namesakeDirectory / name};
+    std::ofstream{sourceDirectory / name};
+    ctx->redirectionTable().addFile(
+        (virtualDirectory / name).c_str(),
+        usvfs::RedirectionDataLocal((sourceDirectory / name).string()));
+  }
+
+  // the patterns of the first query and of the restarts after it, std::nullopt for a
+  // query without FileName
+  struct Sequence
+  {
+    std::string_view description;
+    std::vector<std::optional<std::wstring_view>> patterns;
+  };
+  const Sequence sequences[] = {
+      {"a*, restart without FileName", {L"a*", std::nullopt}},
+      {"a*, restart b*, restart without FileName", {L"a*", L"b*", std::nullopt}},
+      {"no FileName, restart b*, restart without FileName",
+       {std::nullopt, L"b*", std::nullopt}},
+      {"a*, restart with an empty FileName", {L"a*", L""}}};
+  // What a query lists together with the queries after it, up to the next restart.
+  // Those pass a pattern that matches nothing, which a query that does not restart
+  // ignores.
+  struct Listing
+  {
+    NTSTATUS firstResult;
+    std::vector<std::wstring> names;
+    NTSTATUS endResult;
+  };
+  const auto list = [](NtQueryDirectoryFile_type query, HANDLE directory,
+                       const Sequence& sequence) {
+    const DirectoryRecordLayout layout =
+        findDirectoryRecordLayout(FileDirectoryInformation).value();
+    std::vector<Listing> listings;
+    for (size_t index = 0; index < sequence.patterns.size(); ++index) {
+      const bool isRestart = index > 0;
+      ListedQuery listed   = queryOnce(query, directory,
+                                       {FileDirectoryInformation, 0x1000, false,
+                                        sequence.patterns[index], isRestart});
+      Listing listing{.firstResult = listed.outcome.result};
+      for (size_t count = 0;
+           listed.outcome.result == STATUS_SUCCESS && count < MAXIMUM_QUERIES;
+           ++count) {
+        std::ranges::move(recordNames(layout, listed.data),
+                          std::back_inserter(listing.names));
+        listed =
+            queryOnce(query, directory,
+                      {FileDirectoryInformation, 0x1000, false, L"usvfs_no_match"});
+      }
+      listing.endResult = listed.outcome.result;
+      // the virtual entries follow the regular ones in an order of their own
+      std::ranges::sort(listing.names);
+      listings.push_back(std::move(listing));
+    }
+    return listings;
+  };
+
+  // ntdll keeps a* on the restart without FileName, so that the comparisons below tell
+  // the latched pattern from every entry
+  HANDLE referenceHandle = openHookedDirectory(namesakeDirectory);
+  ASSERT_NE(INVALID_HANDLE_VALUE, referenceHandle);
+  const std::vector<Listing> reference =
+      list(nativeQueryDirectoryFile(), referenceHandle, sequences[0]);
+  usvfs::hook_NtClose(referenceHandle);
+  ASSERT_EQ((std::vector<std::wstring>{L"a_regular.txt", L"a_virtual.txt"}),
+            reference.back().names);
+
+  // backup intent makes the scan reopen the directory into a handle of its own
+  const std::pair<std::string_view, ULONG> handleKinds[] = {
+      {"queried handle", 0}, {"reopened directory", FILE_OPEN_FOR_BACKUP_INTENT}};
+  for (const auto& [handleDescription, backupIntent] : handleKinds) {
+    for (const Sequence& sequence : sequences) {
+      SCOPED_TRACE(std::format("{}, {}", handleDescription, sequence.description));
+      HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
+      HANDLE hookedHandle   = hooked_NtOpenFile(
+          virtualDirectory.c_str(), FILE_GENERIC_READ,
+          FILE_SHARE_READ | FILE_SHARE_WRITE,
+          FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | backupIntent);
+      ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
+      ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+      const std::vector<Listing> expected =
+          list(nativeQueryDirectoryFile(), namesakeHandle, sequence);
+      const std::vector<Listing> actual =
+          list(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, sequence);
+      for (size_t index = 0; index < sequence.patterns.size(); ++index) {
+        SCOPED_TRACE(std::format("listing {}", index));
+        EXPECT_EQ(expected[index].firstResult, actual[index].firstResult);
+        EXPECT_EQ(expected[index].names, actual[index].names);
+        EXPECT_EQ(expected[index].endResult, actual[index].endResult);
+      }
+
+      usvfs::hook_NtClose(namesakeHandle);
+      usvfs::hook_NtClose(hookedHandle);
+    }
+  }
+}
+
 namespace
 {
 
