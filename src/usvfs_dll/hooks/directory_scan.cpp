@@ -181,9 +181,6 @@ public:
   // STATUS_SUCCESS once it wrote one, and STATUS_NO_MORE_FILES when none is left.
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
-  // the entries not tried yet
-  size_t remainingCount() const { return m_matches.size() - m_nextMatch; }
-
 private:
   // Reads the entry of a match and writes it. Returns whether it wrote it.
   bool append(const VirtualMatch& match, const DirectoryQuery& query,
@@ -440,6 +437,7 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query)
   // The stored search path also names the virtual directory, so it is looked up
   // under the same context lock as the virtual entries.
   std::optional<std::wstring> storedSearchPath;
+  UnicodeString searchPath;
   std::vector<VirtualMatch> virtualMatches;
   {
     HookContext::Ptr context = WRITE_CONTEXT();
@@ -449,18 +447,33 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query)
     if (const auto iter = searchMap.find(query.handle); iter != searchMap.end()) {
       storedSearchPath = iter->second;
     }
-    const UnicodeString searchPath = storedSearchPath
-                                         ? UnicodeString(storedSearchPath->c_str())
-                                         : ntdllHandleTracker.lookup(query.handle);
+    searchPath = storedSearchPath ? UnicodeString(storedSearchPath->c_str())
+                                  : ntdllHandleTracker.lookup(query.handle);
     virtualMatches =
         gatherVirtualEntries(searchPath, context->redirectionTable(), query.fileName);
   }
+  // opened without the context lock, since CreateFileW reenters the hooks
+  OwnedHandle regularSource = openRegularSource(storedSearchPath);
+
+  // logged once per scan, under the hook's name so that both entry points stay
+  // distinguishable
+  ulog::CallLogger(query.isEx ? "hook_NtQueryDirectoryFileEx"
+                              : "hook_NtQueryDirectoryFile")
+      .addParam("path", searchPath)
+      .addParam("FileName", query.fileName != nullptr
+                                ? std::wstring(query.fileName->Buffer,
+                                               query.fileName->Length / sizeof(WCHAR))
+                                : std::wstring(L"<null>"))
+      .addParam("regularSource", regularSource.isValid()
+                                     ? *storedSearchPath
+                                     : std::wstring(L"<queried handle>"))
+      .addParam("numVirtualFiles", virtualMatches.size());
+
   CaseInsensitiveNameSet shadowedNames;
   for (const VirtualMatch& match : virtualMatches) {
     shadowedNames.insert(match.virtualName);
   }
-  // opened without the context lock, since CreateFileW reenters the hooks
-  m_regular.emplace(openRegularSource(storedSearchPath), std::move(shadowedNames));
+  m_regular.emplace(std::move(regularSource), std::move(shadowedNames));
   m_virtual = VirtualEntryReader(std::move(virtualMatches));
 }
 
@@ -553,22 +566,7 @@ NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
                          findDirectoryRecordLayout(query.informationClass).value(),
                          {.isSingleEntry = query.isSingleEntry(),
                           .isFirstCall   = std::exchange(m_isFirstCall, false)});
-  const NTSTATUS res = output.complete(fill(query, output), *query.statusBlock);
-
-  size_t numVirtualFiles = m_virtual.remainingCount();
-  if ((numVirtualFiles > 0)) {
-    // log under the hook's name so both entry points stay distinguishable
-    ulog::CallLogger(query.isEx ? "hook_NtQueryDirectoryFileEx"
-                                : "hook_NtQueryDirectoryFile")
-        .addParam("path", ntdllHandleTracker.lookup(query.handle))
-        .addParam("FileInformationClass", query.informationClass)
-        .addParam("FileName", query.fileName)
-        .addParam("QueryFlags", query.flags)
-        .PARAM(numVirtualFiles)
-        .PARAMWRAP(res);
-  }
-
-  return res;
+  return output.complete(fill(query, output), *query.statusBlock);
 }
 
 NTSTATUS queryDirectory(const DirectoryQuery& query)
