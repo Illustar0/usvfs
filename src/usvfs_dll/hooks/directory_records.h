@@ -54,10 +54,16 @@ public:
   // place: WOW64 accepts the buffer of a legacy query at any address, so the name
   // need not be aligned for WCHAR.
   std::wstring fileName() const;
+  // The name in place, or as much of it as the bytes hold. Only for a record that lies
+  // aligned for WCHAR, as one in a buffer of usvfs's own does.
+  std::wstring_view fileNameView() const;
   // the bytes of the record without the padding, or as many of them as there are
   std::span<const std::byte> bytes() const;
 
 private:
+  // the bytes of the name, or as many of them as there are
+  std::span<const std::byte> fileNameBytes() const;
+
   // reads 0 for a field past the bytes
   ULONG readField(ULONG offset) const;
 

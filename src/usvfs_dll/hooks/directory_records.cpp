@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
+#include <cstdint>
 #include <cstring>
 
 namespace
@@ -84,14 +86,26 @@ bool DirectoryRecord::isTruncated() const
 
 std::wstring DirectoryRecord::fileName() const
 {
+  const std::span<const std::byte> bytes = fileNameBytes();
+  std::wstring name(bytes.size() / sizeof(WCHAR), L'\0');
+  std::memcpy(name.data(), bytes.data(), name.size() * sizeof(WCHAR));
+  return name;
+}
+
+std::wstring_view DirectoryRecord::fileNameView() const
+{
+  const std::span<const std::byte> bytes = fileNameBytes();
+  assert(reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(WCHAR) == 0);
+  return {reinterpret_cast<const WCHAR*>(bytes.data()), bytes.size() / sizeof(WCHAR)};
+}
+
+std::span<const std::byte> DirectoryRecord::fileNameBytes() const
+{
   const size_t end = std::min<size_t>(size(), m_bytes.size());
   if (end <= m_layout.fileNameOffset) {
     return {};
   }
-  std::wstring name((end - m_layout.fileNameOffset) / sizeof(WCHAR), L'\0');
-  std::memcpy(name.data(), m_bytes.data() + m_layout.fileNameOffset,
-              name.size() * sizeof(WCHAR));
-  return name;
+  return m_bytes.subspan(m_layout.fileNameOffset, end - m_layout.fileNameOffset);
 }
 
 std::span<const std::byte> DirectoryRecord::bytes() const

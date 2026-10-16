@@ -5,10 +5,10 @@
 #include <cstdint>
 #include <cwchar>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <set>
 #include <shared_mutex>
 #include <span>
 #include <string_view>
@@ -39,29 +39,53 @@ using usvfs::UnicodeString;
 // compare them. NTFS and ReFS fold a name one UTF-16 code unit at a time, through the
 // upcase table of the volume, which leaves a surrogate pair as it is; LCMapStringW
 // folds some characters beyond the BMP, and so would merge names that the volume
-// keeps apart.
+// keeps apart. The names are folded while hashed and compared, so that a lookup does
+// not allocate.
 class CaseInsensitiveNameSet
 {
 public:
   // Returns whether the name was not in the set yet.
-  bool insert(const std::wstring& name)
-  {
-    return m_upperNames.insert(upcase(name)).second;
-  }
+  bool insert(std::wstring_view name) { return m_names.emplace(name).second; }
 
-  bool contains(const std::wstring& name) const
-  {
-    return m_upperNames.contains(upcase(name));
-  }
+  bool contains(std::wstring_view name) const { return m_names.contains(name); }
 
 private:
-  static std::wstring upcase(std::wstring name)
+  // Folds ASCII, which most names are made of, without the call to
+  // RtlUpcaseUnicodeChar, which folds it the same.
+  static WCHAR fold(WCHAR c)
   {
-    std::ranges::transform(name, name.begin(), RtlUpcaseUnicodeChar);
-    return name;
+    if (c >= 0x80) {
+      return RtlUpcaseUnicodeChar(c);
+    }
+    return c >= L'a' && c <= L'z' ? static_cast<WCHAR>(c - (L'a' - L'A')) : c;
   }
 
-  std::set<std::wstring> m_upperNames;
+  // FNV-1a over the folded code units
+  struct FoldedHash
+  {
+    using is_transparent = void;
+
+    size_t operator()(std::wstring_view name) const
+    {
+      std::uint64_t hash = 0xcbf29ce484222325;
+      for (const WCHAR c : name) {
+        hash = (hash ^ fold(c)) * 0x100000001b3;
+      }
+      return static_cast<size_t>(hash);
+    }
+  };
+
+  struct FoldedEqual
+  {
+    using is_transparent = void;
+
+    bool operator()(std::wstring_view lhs, std::wstring_view rhs) const
+    {
+      return std::ranges::equal(lhs, rhs, {}, fold, fold);
+    }
+  };
+
+  std::unordered_set<std::wstring, FoldedHash, FoldedEqual> m_names;
 };
 
 // Marks the calling thread as doing I/O of the scan itself while it lives: the
@@ -184,11 +208,15 @@ class RegularEntryReader
 public:
   // Reads source, or the handle of the query if source is invalid, with the pattern
   // of the scan, or every entry without one. The shadowed names are those of the
-  // virtual entries, which take precedence. A reader for a restarted scan restarts
-  // the native scan with its first read.
+  // virtual entries, which take precedence; gatherShadowedNames returns them, and is
+  // called once an entry other than "." and ".." comes, as a directory that holds
+  // nothing else on disk needs none. A reader for a restarted scan restarts the
+  // native scan with its first read.
   RegularEntryReader(OwnedHandle source, std::optional<std::wstring_view> pattern,
-                     CaseInsensitiveNameSet shadowedNames, bool isRestart)
-      : m_source(std::move(source)), m_shadowedNames(std::move(shadowedNames)),
+                     std::function<CaseInsensitiveNameSet()> gatherShadowedNames,
+                     bool isRestart)
+      : m_source(std::move(source)),
+        m_gatherShadowedNames(std::move(gatherShadowedNames)),
         m_isRestartPending(isRestart)
   {
     if (pattern) {
@@ -203,11 +231,14 @@ public:
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
 private:
+  bool isShadowed(std::wstring_view name);
+
   OwnedHandle m_source;
   std::optional<UnicodeString> m_pattern;
+  std::function<CaseInsensitiveNameSet()> m_gatherShadowedNames;
   // Only these are left out: ntdll lists every entry once, and names that differ in
   // case only are different entries in a case-sensitive directory.
-  CaseInsensitiveNameSet m_shadowedNames;
+  std::optional<CaseInsensitiveNameSet> m_shadowedNames;
   bool m_isRestartPending;
   // where a read goes before its entries are filtered; vector storage is aligned for
   // every record, as operator new aligns to 8 bytes or more
@@ -255,7 +286,7 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
     std::span<const std::byte> data(m_staging.data(), status.Information);
     while (!data.empty()) {
       const DirectoryRecord record(layout, data);
-      if (!m_shadowedNames.contains(record.fileName())) {
+      if (!isShadowed(record.fileNameView())) {
         // fits, since the records before it in the output are those before it in
         // the read, or fewer
         output.append(record);
@@ -267,6 +298,18 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
     }
   }
   return STATUS_SUCCESS;
+}
+
+bool RegularEntryReader::isShadowed(std::wstring_view name)
+{
+  // no virtual entry is named so, as no node of the redirection tree is
+  if (name == L"." || name == L"..") {
+    return false;
+  }
+  if (!m_shadowedNames) {
+    m_shadowedNames = m_gatherShadowedNames();
+  }
+  return m_shadowedNames->contains(name);
 }
 
 // Reads the records of a directory through a handle of its own, for a query that
@@ -496,6 +539,16 @@ public:
   // STATUS_NO_MORE_FILES when none is left.
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
+  // the virtual names of all the entries, listed or not
+  CaseInsensitiveNameSet names() const
+  {
+    CaseInsensitiveNameSet names;
+    for (const Entry& entry : m_entries) {
+      names.insert(entry.virtualName);
+    }
+    return names;
+  }
+
 private:
   // A file or directory of a source directory, listed under its virtual name.
   struct Entry
@@ -562,8 +615,9 @@ NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
     if (!record) {
       continue;
     }
-    const std::wstring name =
-        entry.virtualName.empty() ? record->fileName() : entry.virtualName;
+    // the records of a source directory lie in a buffer of its own, aligned for WCHAR
+    const std::wstring_view name =
+        entry.virtualName.empty() ? record->fileNameView() : entry.virtualName;
     if (m_names.contains(name)) {
       continue;
     }
@@ -868,12 +922,14 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* r
                                                      : L"<queried handle>"))
       .addParam("numVirtualFiles", matches.size());
 
-  CaseInsensitiveNameSet shadowedNames;
-  for (const VirtualMatch& match : matches) {
-    shadowedNames.insert(match.virtualName);
-  }
-  m_regular.emplace(std::move(regularSource), m_pattern, std::move(shadowedNames),
-                    query.isRestart());
+  // called during a query, by when m_virtual is set, and under m_mutex like every
+  // other use of it
+  m_regular.emplace(
+      std::move(regularSource), m_pattern,
+      [this] {
+        return m_virtual.names();
+      },
+      query.isRestart());
   m_virtual = VirtualEntryReader(matches);
 }
 
