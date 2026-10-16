@@ -1903,3 +1903,45 @@ TEST_F(USVFSTest, NtQueryDirectoryFileRestartsTheRegularEntriesLikeNtdll)
     }
   }
 }
+
+// ntdll is the reference for a restart that matches nothing: STATUS_NO_MORE_FILES,
+// as NTFS and ReFS keep STATUS_NO_SUCH_FILE for the first query of a handle. A
+// filesystem that pends the query reports it in the status block too (see
+// FailsAQueryThatMatchesNothingLikeNtdll), so a pended one is a reference for the
+// result only.
+TEST_F(USVFSTest, NtQueryDirectoryFileEndsAnEmptyRestartLikeNtdll)
+{
+  constexpr std::wstring_view NO_MATCH = L"usvfs_no_such_file_*";
+  auto params                          = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+
+  for (const std::filesystem::path& directory : nativeListingDirectories()) {
+    SCOPED_TRACE(describeDirectory(directory));
+    HANDLE nativeHandle = openHookedDirectory(directory);
+    HANDLE hookedHandle = openHookedDirectory(directory);
+    ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+    const bool isPended = isFirstQueryPended(directory, NO_MATCH);
+    for (const ListingQuery& listing :
+         {ListingQuery{FileDirectoryInformation, 0x800, false, L"*"},
+          ListingQuery{FileDirectoryInformation, 0x800, false, NO_MATCH, true},
+          ListingQuery{FileDirectoryInformation, 0x800, false, L"*"}}) {
+      SCOPED_TRACE(listing.isRestart ? "restart" : "query");
+      const ListedQuery expected =
+          queryOnce(nativeQueryDirectoryFile(), nativeHandle, listing);
+      const ListedQuery actual =
+          queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+      if (listing.isRestart && isPended) {
+        EXPECT_EQ(expected.outcome.result, actual.outcome.result);
+      } else {
+        expectSameOutcome(expected.outcome, actual.outcome);
+      }
+      EXPECT_EQ(expected.data.size(), actual.data.size());
+    }
+
+    usvfs::hook_NtClose(nativeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
+}

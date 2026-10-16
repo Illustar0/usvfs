@@ -304,8 +304,9 @@ class DirectoryScan
 {
 public:
   // Starts the scan: picks the directory the regular entries are read from and
-  // gathers the virtual entries matching the pattern of the query.
-  explicit DirectoryScan(const DirectoryQuery& query);
+  // gathers the virtual entries matching the pattern of the query. The first scan of
+  // a handle is the one its first query starts; a restart starts the others.
+  DirectoryScan(const DirectoryQuery& query, bool isFirstOfHandle);
 
   // Answers a query with the next entries of the scan. Like ntdll, reports the
   // result both as the return value and in the status block. Queries on the same
@@ -326,8 +327,10 @@ private:
   // has a value while the scan lists the regular entries, before the virtual ones
   std::optional<RegularEntryReader> m_regular;
   VirtualEntryReader m_virtual;
-  // an empty result is STATUS_NO_SUCH_FILE on the first call only
-  bool m_isFirstCall{true};
+  // An empty result is STATUS_NO_SUCH_FILE on the first query of a handle only, as
+  // NTFS and ReFS tell it by whether the handle has a pattern yet, which a restart
+  // does not drop.
+  bool m_isFirstCall;
 };
 
 // The scans of all directory handles. The lock is a leaf: nothing else is called
@@ -352,7 +355,7 @@ public:
     // Constructed without the lock, since construction takes the hook context
     // lock and reenters hooks. Declared before the lock, so that a scan that is
     // unused or replaced is destroyed after unlocking.
-    auto scan = std::make_shared<DirectoryScan>(query);
+    auto scan = std::make_shared<DirectoryScan>(query, current == nullptr);
     std::unique_lock lock(m_mutex);
     const auto [entry, isInserted] = m_scans.try_emplace(query.handle, scan);
     if (!isInserted && query.isRestart()) {
@@ -467,8 +470,9 @@ bool isSynchronousHandle(HANDLE handle)
 
 // An asynchronous handle gets a scan that only forwards its queries, so that the
 // handle is checked once rather than on every query.
-DirectoryScan::DirectoryScan(const DirectoryQuery& query)
-    : m_isPassthrough(!isSynchronousHandle(query.handle))
+DirectoryScan::DirectoryScan(const DirectoryQuery& query, bool isFirstOfHandle)
+    : m_isPassthrough(!isSynchronousHandle(query.handle)),
+      m_isFirstCall(isFirstOfHandle)
 {
   using namespace usvfs;
 
