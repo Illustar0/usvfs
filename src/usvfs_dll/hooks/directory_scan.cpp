@@ -1,6 +1,7 @@
 #include "directory_scan.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cwchar>
@@ -159,9 +160,16 @@ private:
   HANDLE m_handle = INVALID_HANDLE_VALUE;
 };
 
+// A directory the scan opened, or why it could not.
+struct OpenedDirectory
+{
+  // invalid if the open failed
+  OwnedHandle handle;
+  NTSTATUS status;
+};
+
 // Opens a directory, named by a DOS path or one in the \??\ form, for synchronous
-// enumeration by the scan itself, with the usvfs hooks suppressed. Returns an invalid
-// handle if it cannot be opened.
+// enumeration by the scan itself, with the usvfs hooks suppressed.
 //
 // The legacy implementation opened mapping source directories with CreateFileW
 // without suppressing the hooks, so every internal directory open re-entered the
@@ -175,13 +183,14 @@ private:
 // opened (ERROR_PATH_NOT_FOUND); preserving that accidental enumeration behavior has
 // little practical value while significantly hurting performance for normal physical
 // source directories.
-OwnedHandle openScanDirectory(const std::wstring& path)
+OpenedDirectory openScanDirectory(const std::wstring& path)
 {
   // keeps a path in the \??\ form as it is
   UNICODE_STRING ntPath{};
-  if (RtlDosPathNameToRelativeNtPathName_U_WithStatus(path.c_str(), &ntPath, nullptr,
-                                                      nullptr) < 0) {
-    return OwnedHandle();
+  const NTSTATUS conversion = RtlDosPathNameToRelativeNtPathName_U_WithStatus(
+      path.c_str(), &ntPath, nullptr, nullptr);
+  if (conversion < 0) {
+    return {OwnedHandle(), conversion};
   }
   // case-insensitive, as CreateFileW opens, since the tree may spell a directory in
   // another case than the disk does
@@ -198,29 +207,48 @@ OwnedHandle openScanDirectory(const std::wstring& path)
                             FILE_OPEN_FOR_BACKUP_INTENT);
   }
   HeapFree(GetProcessHeap(), 0, ntPath.Buffer);
-  return OwnedHandle(result >= 0 ? handle : INVALID_HANDLE_VALUE);
+  return {OwnedHandle(result >= 0 ? handle : INVALID_HANDLE_VALUE), result};
 }
+
+// Where the regular entries of a directory in the redirection tree are read from.
+struct RegularSource
+{
+  // the physical directory, or invalid for the caller's handle
+  OwnedHandle handle;
+  // Whether only "." and ".." of the caller's handle are read: the directory holds
+  // nothing on disk, so the open hook rerouted that handle to a mapping source, whose
+  // other entries are not the directory's. Its dots may stand for the directory, whose
+  // information the hooks take from the mapping source anyway.
+  bool isDotsOnly;
+};
+
+// in the order NTFS and ReFS return them: both or neither, and before any entry of the
+// directory index, as they make them up rather than store them
+constexpr std::array<std::wstring_view, 2> DOT_ENTRIES{L".", L".."};
 
 // Reads the regular entries of the scanned directory from ntdll and writes those that
 // no virtual entry shadows.
 class RegularEntryReader
 {
 public:
-  // Reads source, or the handle of the query if source is invalid, with the pattern
-  // of the scan, or every entry without one. The shadowed names are those of the
-  // virtual entries, which take precedence; gatherShadowedNames returns them, and is
-  // called once an entry other than "." and ".." comes, as a directory that holds
-  // nothing else on disk needs none. A reader for a restarted scan restarts the
-  // native scan with its first read.
-  RegularEntryReader(OwnedHandle source, std::optional<std::wstring_view> pattern,
+  // Reads the source with the pattern of the scan, or every entry without one. The
+  // shadowed names are those of the virtual entries, which take precedence;
+  // gatherShadowedNames returns them, and is called once an entry other than "." and
+  // ".." comes, as a directory that holds nothing else on disk needs none. A source of
+  // the dots only ends the entries with the dots. A reader for a restarted scan
+  // restarts the native scan with its first read.
+  RegularEntryReader(RegularSource source, std::optional<std::wstring_view> pattern,
                      std::function<CaseInsensitiveNameSet()> gatherShadowedNames,
                      bool isRestart)
-      : m_source(std::move(source)),
+      : m_source(std::move(source.handle)),
         m_gatherShadowedNames(std::move(gatherShadowedNames)),
         m_isRestartPending(isRestart)
   {
     if (pattern) {
       m_pattern.emplace(pattern->data(), pattern->size());
+    }
+    if (source.isDotsOnly) {
+      m_pendingDots = DOT_ENTRIES;
     }
   }
 
@@ -232,6 +260,8 @@ public:
 
 private:
   bool isShadowed(std::wstring_view name);
+  bool isNextDot(const DirectoryRecord& record) const;
+  bool areDotsDone() const { return m_pendingDots && m_pendingDots->empty(); }
 
   OwnedHandle m_source;
   std::optional<UnicodeString> m_pattern;
@@ -239,6 +269,9 @@ private:
   // Only these are left out: ntdll lists every entry once, and names that differ in
   // case only are different entries in a case-sensitive directory.
   std::optional<CaseInsensitiveNameSet> m_shadowedNames;
+  // the dots a source of the dots only has yet to give, empty once they are done or
+  // another entry came; nothing for a source of every entry
+  std::optional<std::span<const std::wstring_view>> m_pendingDots;
   bool m_isRestartPending;
   // where a read goes before its entries are filtered; vector storage is aligned for
   // every record, as operator new aligns to 8 bytes or more
@@ -247,6 +280,10 @@ private:
 
 NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& output)
 {
+  // what follows the dots belongs to the mapping source, not to the directory
+  if (areDotsDone()) {
+    return STATUS_NO_MORE_FILES;
+  }
   // shouldVirtualize lets through only the classes that have a layout
   const DirectoryRecordLayout layout =
       findDirectoryRecordLayout(query.informationClass).value();
@@ -277,7 +314,13 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
     // Its name may be cut short too, which leaves no telling whether a virtual entry
     // shadows it: it is passed on either way, and filtered once it comes whole.
     if (result == STATUS_BUFFER_OVERFLOW) {
-      output.mirror(std::span(m_staging).first(status.Information));
+      const std::span<const std::byte> partial =
+          std::span(m_staging).first(status.Information);
+      if (m_pendingDots && !isNextDot(DirectoryRecord(layout, partial))) {
+        m_pendingDots.emplace();
+        return STATUS_NO_MORE_FILES;
+      }
+      output.mirror(partial);
       return result;
     }
     // a pattern that matches nothing ends the entries on the first read already
@@ -288,12 +331,22 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
       return result;
     }
 
+    // every record written fits, since the records before it in the output are those
+    // before it in the read, or fewer
     std::span<const std::byte> data(m_staging.data(), status.Information);
     while (!data.empty()) {
       const DirectoryRecord record(layout, data);
-      if (!isShadowed(record.fileNameView())) {
-        // fits, since the records before it in the output are those before it in
-        // the read, or fewer
+      if (m_pendingDots) {
+        if (!isNextDot(record)) {
+          m_pendingDots.emplace();
+          break;
+        }
+        m_pendingDots = m_pendingDots->subspan(1);
+        output.append(record);
+        if (m_pendingDots->empty()) {
+          break;
+        }
+      } else if (!isShadowed(record.fileNameView())) {
         output.append(record);
       }
       if (record.nextEntryOffset() == 0) {
@@ -301,8 +354,22 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
       }
       data = data.subspan(record.nextEntryOffset());
     }
+    if (areDotsDone()) {
+      return output.isEmpty() ? STATUS_NO_MORE_FILES : STATUS_SUCCESS;
+    }
   }
   return STATUS_SUCCESS;
+}
+
+// Returns whether a record, whole or cut short, is that of the next dot. The length the
+// record states tells a ".." that ntdll cut short, as the smallest buffer of
+// FileBothDirectoryInformation holds one character of a name; another two-character
+// name cut short to "." cannot come there, as ".." directly follows ".".
+bool RegularEntryReader::isNextDot(const DirectoryRecord& record) const
+{
+  const std::wstring_view dot = m_pendingDots->front();
+  return record.fileNameLength() == dot.size() * sizeof(WCHAR) &&
+         dot.starts_with(record.fileNameView());
 }
 
 bool RegularEntryReader::isShadowed(std::wstring_view name)
@@ -461,7 +528,7 @@ void SourceDirectory::read(const DirectoryRecordLayout& layout,
     }
     return;
   }
-  OwnedHandle directory = openScanDirectory(m_path);
+  OwnedHandle directory = openScanDirectory(m_path).handle;
   if (!directory.isValid()) {
     spdlog::get("hooks")->warn(
         "failed to open {0} to list it: {1}",
@@ -490,7 +557,7 @@ SourceDirectory::query(const std::wstring& fileName,
 {
   const std::string filePath =
       ush::string_cast<std::string>(m_path + L"\\" + fileName, ush::CodePage::UTF8);
-  OwnedHandle directory = openScanDirectory(m_path);
+  OwnedHandle directory = openScanDirectory(m_path).handle;
   if (!directory.isValid()) {
     spdlog::get("hooks")->warn("failed to open the directory of {0} to list it: {1}",
                                filePath, ::GetLastError());
@@ -865,18 +932,32 @@ bool canListDirectory(HANDLE handle)
          (information.GrantedAccess & FILE_LIST_DIRECTORY) != 0;
 }
 
+// Returns whether the status an open of a directory failed with shows that it holds
+// nothing on disk but "." and "..": there is no directory at its path, or one pending
+// deletion, which is empty, as NTFS and ReFS mark only an empty directory for deletion.
+bool holdsNothingOnDisk(NTSTATUS openStatus)
+{
+  return openStatus == STATUS_OBJECT_NAME_NOT_FOUND ||
+         openStatus == STATUS_OBJECT_PATH_NOT_FOUND ||
+         openStatus == STATUS_NOT_A_DIRECTORY || openStatus == STATUS_DELETE_PENDING;
+}
+
 // Opens the directory the regular entries of a directory in the redirection tree are
 // read from: the physical directory at its virtual path, since the open hook may have
-// rerouted the caller's handle to a mapping source. Returns an invalid handle if it
-// does not exist on disk, where the hooks reroute any open of it, or if the caller's
-// handle may not list it, which only a read of that handle reports like ntdll does;
-// the caller's handle is read then.
-OwnedHandle openRegularSource(HANDLE callerHandle, const UnicodeString& virtualPath)
+// rerouted the caller's handle to a mapping source. The caller's handle is read
+// instead: only its dots where the directory holds nothing on disk; whole where it may
+// not list the directory, which only a read of it reports like ntdll does, or where
+// the directory cannot be opened otherwise. It is the physical directory then, unless
+// the NtOpenFile hook opened it, which reroutes every directory the tree maps.
+RegularSource openRegularSource(HANDLE callerHandle, const UnicodeString& virtualPath)
 {
   if (!canListDirectory(callerHandle)) {
-    return OwnedHandle();
+    return {OwnedHandle(), false};
   }
-  return openScanDirectory(static_cast<LPCWSTR>(virtualPath));
+  OpenedDirectory directory = openScanDirectory(static_cast<LPCWSTR>(virtualPath));
+  const bool isDotsOnly =
+      !directory.handle.isValid() && holdsNothingOnDisk(directory.status);
+  return {std::move(directory.handle), isDotsOnly};
 }
 
 // Returns whether every I/O on the handle completes before returning. Only then may
@@ -931,7 +1012,7 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* r
     m_isPassthrough = true;
     return;
   }
-  OwnedHandle regularSource = openRegularSource(query.handle, virtualPath);
+  RegularSource regularSource = openRegularSource(query.handle, virtualPath);
   const std::vector<VirtualMatch> matches = gatherVirtualEntries(*snapshot, m_pattern);
 
   // logged once per scan, under the hook's name so that both entry points stay
@@ -941,8 +1022,9 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* r
       .addParam("path", virtualPath)
       .addParam("pattern", m_pattern.value_or(L"<every entry>"))
       .addParam("regularSource",
-                std::wstring(regularSource.isValid() ? L"<physical directory>"
-                                                     : L"<queried handle>"))
+                std::wstring(regularSource.handle.isValid() ? L"<physical directory>"
+                             : regularSource.isDotsOnly ? L"<dots of queried handle>"
+                                                        : L"<queried handle>"))
       .addParam("numVirtualFiles", matches.size());
 
   // called during a query, by when m_virtual is set, and under m_mutex like every

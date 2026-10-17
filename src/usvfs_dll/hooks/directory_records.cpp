@@ -76,7 +76,12 @@ ULONG DirectoryRecord::nextEntryOffset() const
 
 ULONG DirectoryRecord::size() const
 {
-  return m_layout.fileNameOffset + readField(m_layout.fileNameLengthOffset);
+  return m_layout.fileNameOffset + fileNameLength();
+}
+
+ULONG DirectoryRecord::fileNameLength() const
+{
+  return readField(m_layout.fileNameLengthOffset);
 }
 
 bool DirectoryRecord::isTruncated() const

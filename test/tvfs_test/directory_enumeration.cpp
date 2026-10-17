@@ -2580,6 +2580,271 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsUnlinkedTreeDirectoriesLikeNtdll)
 namespace
 {
 
+// A game directory that two mods are mapped into, and a directory that holds on disk
+// what the directories the game directory has only virtually list.
+struct ModdedDirectory
+{
+  std::filesystem::path data;
+  std::filesystem::path namesakes;
+};
+
+// Lays out two mods and maps them into a game directory as
+// usvfsVirtualLinkDirectoryStatic links a mod recursively, the first mapped winning,
+// without what the skip lists of Mod Organizer leave out: a ".mohidden" suffix and
+// ".git". These stay in the mod directories, which the open hook reroutes the
+// directories of the game directory to, as does "x", a file the mod gains after the
+// mapping. "sub" and "sub\deep" are in the mods only.
+ModdedDirectory mapModsWithSkippedEntries(usvfs::RedirectionTreeContainer& tree,
+                                          const std::filesystem::path& root)
+{
+  std::filesystem::remove_all(root);
+  const ModdedDirectory modded{root / L"data", root / L"namesakes"};
+  const std::filesystem::path modA = root / L"mod_a";
+  const std::filesystem::path modB = root / L"mod_b";
+  for (const std::filesystem::path& directory :
+       {modded.data, modA / L"sub" / L".git", modA / L"sub" / L"deep", modB / L"sub",
+        modded.namesakes / L"sub" / L"deep"}) {
+    std::filesystem::create_directories(directory);
+  }
+  for (const std::filesystem::path& file :
+       {modA / L"sub" / L"a.txt", modA / L"sub" / L"hidden.txt.mohidden",
+        modA / L"sub" / L".git" / L"HEAD", modA / L"sub" / L"x",
+        modA / L"sub" / L"deep" / L"c.txt", modA / L"sub" / L"deep" / L"d.txt.mohidden",
+        modB / L"sub" / L"b.txt", modded.namesakes / L"sub" / L"a.txt",
+        modded.namesakes / L"sub" / L"b.txt",
+        modded.namesakes / L"sub" / L"deep" / L"c.txt"}) {
+    std::ofstream{file};
+  }
+
+  const auto linkDirectory = [&](const std::filesystem::path& source,
+                                 const std::filesystem::path& destination) {
+    tree.addDirectory(destination.c_str(),
+                      usvfs::RedirectionDataLocal(source.string() + "\\"),
+                      usvfs::shared::FLAG_DIRECTORY, false);
+  };
+  const auto linkFile = [&](const std::filesystem::path& source,
+                            const std::filesystem::path& destination) {
+    tree.addFile(destination.c_str(), usvfs::RedirectionDataLocal(source.string()));
+  };
+  for (const std::filesystem::path& mod : {modA, modB}) {
+    linkDirectory(mod, modded.data);
+    linkDirectory(mod / L"sub", modded.data / L"sub");
+  }
+  linkDirectory(modA / L"sub" / L"deep", modded.data / L"sub" / L"deep");
+  linkFile(modA / L"sub" / L"a.txt", modded.data / L"sub" / L"a.txt");
+  linkFile(modB / L"sub" / L"b.txt", modded.data / L"sub" / L"b.txt");
+  linkFile(modA / L"sub" / L"deep" / L"c.txt",
+           modded.data / L"sub" / L"deep" / L"c.txt");
+  return modded;
+}
+
+// Lists a directory one entry per query, with the smallest buffer ntdll accepts until
+// a record does not fit it, then with a buffer that holds any.
+std::vector<ListedQuery>
+listEntriesFromTheSmallestBuffer(NtQueryDirectoryFile_type query, HANDLE directory,
+                                 FILE_INFORMATION_CLASS informationClass,
+                                 std::wstring_view pattern)
+{
+  ULONG length = findDirectoryRecordLayout(informationClass).value().minimumLength;
+  std::vector<ListedQuery> queries;
+  for (;;) {
+    queries.push_back(
+        queryOnce(query, directory, {informationClass, length, true, pattern}));
+    const NTSTATUS result = queries.back().outcome.result;
+    if (result == STATUS_BUFFER_OVERFLOW) {
+      length = 0x1000;
+    } else if (result != STATUS_SUCCESS) {
+      return queries;
+    }
+  }
+}
+
+// The names of the records a query returned, whole or cut short.
+std::vector<std::wstring> namesOf(const DirectoryRecordLayout& layout,
+                                  const ListedQuery& query)
+{
+  return query.data.empty() ? std::vector<std::wstring>()
+                            : recordNames(layout, query.data);
+}
+
+// Expects the same outcome, but for the status block of a query that fails: ReFS
+// writes it when nothing matches, unlike NTFS, and the hook never does, a difference
+// of its own.
+void expectSameListingOutcome(const QueryOutcome& expected, const QueryOutcome& actual)
+{
+  const bool isError = (static_cast<ULONG>(expected.result) >> 30) == 3;
+  if (isError) {
+    EXPECT_EQ(expected.result, actual.result);
+  } else {
+    expectSameOutcome(expected, actual);
+  }
+}
+
+// Expects a directory that the tree holds only virtually to list as ntdll lists its
+// namesake on disk: query by query when each query lists one entry, and name by name
+// otherwise, as the hook returns regular and virtual entries in separate queries. Only
+// the names are compared, as "." and ".." carry the fields of the mod directory the
+// handle is rerouted to.
+void expectListedLikeNamesake(const std::filesystem::path& directory,
+                              const std::filesystem::path& namesake)
+{
+  for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
+    const DirectoryRecordLayout layout =
+        findDirectoryRecordLayout(informationClass).value();
+    // ".git" and "x" match only entries the tree leaves out, and no dots: ".git"
+    // starts like ".", and "x" is as long, which the reader must tell from a dot
+    for (const std::wstring_view pattern : {L"*", L"*.txt", L".git", L"x"}) {
+      SCOPED_TRACE(std::format("class {}, pattern {}",
+                               static_cast<int>(informationClass),
+                               std::filesystem::path(pattern).string()));
+      // a query moves its handle through the directory, so ntdll and the hook each
+      // list through a handle of their own, opened anew for each listing
+      HANDLE nativeHandle = openHookedDirectory(namesake);
+      HANDLE hookedHandle = openHookedDirectory(directory);
+      ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+      ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+      const std::vector<ListedQuery> expectedEntries = listEntriesFromTheSmallestBuffer(
+          nativeQueryDirectoryFile(), nativeHandle, informationClass, pattern);
+      const std::vector<ListedQuery> actualEntries = listEntriesFromTheSmallestBuffer(
+          &usvfs::hook_NtQueryDirectoryFile, hookedHandle, informationClass, pattern);
+      ASSERT_EQ(expectedEntries.size(), actualEntries.size());
+      for (size_t query = 0; query < expectedEntries.size(); ++query) {
+        SCOPED_TRACE(query);
+        expectSameListingOutcome(expectedEntries[query].outcome,
+                                 actualEntries[query].outcome);
+        EXPECT_EQ(namesOf(layout, expectedEntries[query]),
+                  namesOf(layout, actualEntries[query]));
+      }
+      usvfs::hook_NtClose(nativeHandle);
+      usvfs::hook_NtClose(hookedHandle);
+
+      nativeHandle = openHookedDirectory(namesake);
+      hookedHandle = openHookedDirectory(directory);
+      ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+      ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+      const ListingQuery listing{informationClass, 0x1000, false, pattern};
+      const std::vector<ListedQuery> expected =
+          listQueries(nativeQueryDirectoryFile(), nativeHandle, listing);
+      const std::vector<ListedQuery> actual =
+          listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
+      const auto listedNames = [&](const std::vector<ListedQuery>& queries) {
+        std::vector<std::wstring> names;
+        for (const ListedQuery& query : queries) {
+          std::ranges::move(namesOf(layout, query), std::back_inserter(names));
+        }
+        return names;
+      };
+      EXPECT_EQ(listedNames(expected), listedNames(actual));
+      expectSameListingOutcome(expected.back().outcome, actual.back().outcome);
+      usvfs::hook_NtClose(nativeHandle);
+      usvfs::hook_NtClose(hookedHandle);
+    }
+  }
+}
+
+}  // namespace
+
+// ntdll is the reference for a directory that only the mods hold, as it lists a
+// namesake that holds the mapped files on disk: the open hook reroutes the directory to
+// that of the first mod, whose files and directories that the tree leaves out are not
+// listed. A file, or an empty directory pending deletion, at its path on disk adds no
+// entries either.
+TEST_F(USVFSTest, NtQueryDirectoryFileListsPurelyVirtualDirectoriesLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const std::filesystem::path root = test::path_of_test_temp(L"purely_virtual");
+
+  {
+    SCOPED_TRACE("nothing on disk");
+    const ModdedDirectory modded =
+        mapModsWithSkippedEntries(ctx->redirectionTable(), root / L"nothing");
+    expectListedLikeNamesake(modded.data / L"sub", modded.namesakes / L"sub");
+    expectListedLikeNamesake(modded.data / L"sub" / L"deep",
+                             modded.namesakes / L"sub" / L"deep");
+  }
+  {
+    SCOPED_TRACE("a file on disk");
+    const ModdedDirectory modded =
+        mapModsWithSkippedEntries(ctx->redirectionTable(), root / L"file");
+    std::ofstream(modded.data / L"sub");
+    expectListedLikeNamesake(modded.data / L"sub", modded.namesakes / L"sub");
+    expectListedLikeNamesake(modded.data / L"sub" / L"deep",
+                             modded.namesakes / L"sub" / L"deep");
+  }
+  {
+    SCOPED_TRACE("a directory pending deletion on disk");
+    const ModdedDirectory modded =
+        mapModsWithSkippedEntries(ctx->redirectionTable(), root / L"pending");
+    std::filesystem::create_directory(modded.data / L"sub");
+    const HANDLE deleter =
+        ::CreateFileW((modded.data / L"sub").c_str(), DELETE,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    ASSERT_NE(INVALID_HANDLE_VALUE, deleter);
+    FILE_DISPOSITION_INFO disposition{TRUE};
+    ASSERT_TRUE(::SetFileInformationByHandle(deleter, FileDispositionInfo, &disposition,
+                                             sizeof(disposition)));
+    expectListedLikeNamesake(modded.data / L"sub", modded.namesakes / L"sub");
+    ::CloseHandle(deleter);
+  }
+}
+
+// ntdll is the reference for a physical directory that the hook cannot open to read
+// the regular entries from: here as a handle with DELETE access holds it, which the
+// hook does not share. The caller's handle is read then; the NtCreateFile hook leaves
+// it on the physical directory, as the tree holds a directory there too.
+TEST_F(USVFSTest, NtQueryDirectoryFileListsAPhysicalDirectoryItCannotOpenLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const ModdedDirectory modded = mapModsWithSkippedEntries(
+      ctx->redirectionTable(), test::path_of_test_temp(L"physical_held"));
+  const std::filesystem::path directory = modded.data / L"sub";
+  const std::filesystem::path namesake  = modded.namesakes / L"sub";
+  std::filesystem::create_directory(directory);
+  std::ofstream(directory / L"on_disk.txt");
+  std::ofstream(namesake / L"on_disk.txt");
+  const HANDLE holder = ::CreateFileW(
+      directory.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  ASSERT_NE(INVALID_HANDLE_VALUE, holder);
+
+  usvfs::UnicodeString ntPath(L"\\??\\" + directory.wstring());
+  OBJECT_ATTRIBUTES attributes{sizeof(attributes),
+                               nullptr,
+                               static_cast<PUNICODE_STRING>(ntPath),
+                               0,
+                               nullptr,
+                               nullptr};
+  IO_STATUS_BLOCK statusBlock;
+  HANDLE hookedHandle = INVALID_HANDLE_VALUE;
+  // FILE_OPEN of the DDK, which the SDK headers do not declare
+  constexpr ULONG OPEN_EXISTING_DISPOSITION = 1;
+  ASSERT_EQ(STATUS_SUCCESS,
+            usvfs::hook_NtCreateFile(
+                &hookedHandle, FILE_GENERIC_READ, &attributes, &statusBlock, nullptr, 0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                OPEN_EXISTING_DISPOSITION,
+                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0));
+  HANDLE nativeHandle = openHookedDirectory(namesake);
+  ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+
+  const ListingQuery listing{FileDirectoryInformation, 0x1000, false, L"*"};
+  EXPECT_EQ(sortedNames(listQueries(nativeQueryDirectoryFile(), nativeHandle, listing)),
+            sortedNames(
+                listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing)));
+
+  usvfs::hook_NtClose(nativeHandle);
+  usvfs::hook_NtClose(hookedHandle);
+  ::CloseHandle(holder);
+}
+
+namespace
+{
+
 // A directory whose names are case-sensitive, with two files whose names differ in
 // case only. The flag can be set on an empty directory only, and takes
 // FILE_DELETE_CHILD, which a volume may give users only with full control, so the

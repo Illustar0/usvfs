@@ -47,6 +47,8 @@ public:
   ULONG nextEntryOffset() const;
   // the size of the record without the padding up to the next one
   ULONG size() const;
+  // the full length of the name in bytes, also for a record cut short
+  ULONG fileNameLength() const;
   // whether the record runs past the bytes, as the partial record that comes with
   // STATUS_BUFFER_OVERFLOW does
   bool isTruncated() const;
