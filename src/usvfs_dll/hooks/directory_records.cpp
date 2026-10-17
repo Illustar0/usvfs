@@ -153,7 +153,7 @@ DirectoryOutput::DirectoryOutput(std::span<std::byte> buffer,
 
 bool DirectoryOutput::isEmpty() const
 {
-  return !m_lastRecordOffset;
+  return !m_lastRecordOffset.has_value();
 }
 
 bool DirectoryOutput::isSatisfied() const
@@ -269,7 +269,7 @@ std::optional<std::span<std::byte>> DirectoryOutput::place(size_t recordSize)
   if (offset + recordSize > m_buffer.size()) {
     return std::nullopt;
   }
-  if (m_lastRecordOffset) {
+  if (m_lastRecordOffset.has_value()) {
     writeField(m_buffer.subspan(*m_lastRecordOffset), 0,
                static_cast<ULONG>(offset - *m_lastRecordOffset));
   }
