@@ -262,6 +262,8 @@ public:
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
 private:
+  void appendListedRecords(const DirectoryRecordLayout& layout,
+                           std::span<const std::byte> data, DirectoryOutput& output);
   bool isShadowed(std::wstring_view name);
   bool isNextDot(const DirectoryRecord& record) const;
   bool areDotsDone() const { return m_pendingDots && m_pendingDots->empty(); }
@@ -334,34 +336,42 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
       return result;
     }
 
-    // every record written fits, since the records before it in the output are those
-    // before it in the read, or fewer
-    std::span<const std::byte> data(m_staging.data(), status.Information);
-    while (!data.empty()) {
-      const DirectoryRecord record(layout, data);
-      if (m_pendingDots) {
-        if (!isNextDot(record)) {
-          m_pendingDots.emplace();
-          break;
-        }
-        m_pendingDots = m_pendingDots->subspan(1);
-        output.append(record);
-        if (m_pendingDots->empty()) {
-          break;
-        }
-      } else if (!isShadowed(record.fileNameView())) {
-        output.append(record);
-      }
-      if (record.nextEntryOffset() == 0) {
-        break;
-      }
-      data = data.subspan(record.nextEntryOffset());
-    }
+    appendListedRecords(layout, std::span(m_staging).first(status.Information), output);
     if (areDotsDone()) {
       return output.isEmpty() ? STATUS_NO_MORE_FILES : STATUS_SUCCESS;
     }
   }
   return STATUS_SUCCESS;
+}
+
+// Writes the records of a read that the directory lists: for a source of the dots only,
+// the dots up to the first other entry; for a source of every entry, those that no
+// virtual entry shadows. Every record written fits, since the records before it in the
+// output are those before it in the read, or fewer.
+void RegularEntryReader::appendListedRecords(const DirectoryRecordLayout& layout,
+                                             std::span<const std::byte> data,
+                                             DirectoryOutput& output)
+{
+  while (!data.empty()) {
+    const DirectoryRecord record(layout, data);
+    if (m_pendingDots) {
+      if (!isNextDot(record)) {
+        m_pendingDots.emplace();
+        return;
+      }
+      m_pendingDots = m_pendingDots->subspan(1);
+      output.append(record);
+      if (m_pendingDots->empty()) {
+        return;
+      }
+    } else if (!isShadowed(record.fileNameView())) {
+      output.append(record);
+    }
+    if (record.nextEntryOffset() == 0) {
+      return;
+    }
+    data = data.subspan(record.nextEntryOffset());
+  }
 }
 
 // Returns whether a record, whole or cut short, is that of the next dot. The length the
