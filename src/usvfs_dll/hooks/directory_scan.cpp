@@ -724,9 +724,7 @@ NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
     if (m_names && m_names->contains(name)) {
       continue;
     }
-    const bool isWritten = entry.virtualName.empty()
-                               ? output.append(*record)
-                               : output.appendRenamed(*record, name);
+    const bool isWritten = output.appendRenamed(*record, name);
     // like ntdll, an entry that does not fit stays for the next call to return, be it
     // after its partial record or after the entries the output holds
     if (!isWritten) {

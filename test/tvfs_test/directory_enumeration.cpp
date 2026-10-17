@@ -1136,6 +1136,53 @@ TYPED_TEST(DirectoryRecordTest, RefusesATruncatedRecord)
 namespace
 {
 
+using ShortNameRecordTypes = ::testing::Types<
+    RecordType<FileBothDirectoryInformation, FILE_BOTH_DIR_INFORMATION>,
+    RecordType<FileIdBothDirectoryInformation, FILE_ID_BOTH_DIR_INFORMATION>,
+    RecordType<FileIdExtdBothDirectoryInformation, FILE_ID_EXTD_BOTH_DIR_INFORMATION>,
+    RecordType<FileId64ExtdBothDirectoryInformation,
+               FILE_ID_64_EXTD_BOTH_DIR_INFORMATION>,
+    RecordType<FileIdAllExtdBothDirectoryInformation,
+               FILE_ID_ALL_EXTD_BOTH_DIR_INFORMATION>>;
+
+template <typename T>
+class ShortNameRecordTest : public DirectoryRecordTest<T>
+{};
+
+}  // namespace
+
+TYPED_TEST_SUITE(ShortNameRecordTest, ShortNameRecordTypes);
+
+// An 8.3 name is an alias of the name a record had, so a record written under another
+// name goes without one, as NTFS writes a record that has none: with a zero length
+// and a zeroed name, over whatever the buffer held.
+TYPED_TEST(ShortNameRecordTest, DropsTheShortNameOfARenamedRecord)
+{
+  using Record                           = typename TestFixture::Record;
+  constexpr std::wstring_view SHORT_NAME = L"USVFS_~1.TXT";
+  SyntheticRecord<Record> synthetic(L"usvfs_a_long_name.txt", 0);
+  synthetic.fields().ShortNameLength =
+      static_cast<CCHAR>(SHORT_NAME.size() * sizeof(WCHAR));
+  std::memcpy(synthetic.fields().ShortName, SHORT_NAME.data(),
+              SHORT_NAME.size() * sizeof(WCHAR));
+  std::vector<std::byte> buffer(0x400, std::byte{0xCC});
+  DirectoryOutput output(buffer, TestFixture::layout(),
+                         {.isSingleEntry = false, .isFirstCall = false});
+
+  ASSERT_TRUE(output.appendRenamed(
+      DirectoryRecord(TestFixture::layout(), synthetic.bytes()), L"usvfs_v.txt"));
+
+  const auto& renamed = *reinterpret_cast<const Record*>(buffer.data());
+  EXPECT_EQ(0, renamed.ShortNameLength);
+  EXPECT_TRUE(std::ranges::all_of(std::as_bytes(std::span(renamed.ShortName)),
+                                  [](std::byte value) {
+                                    return value == std::byte{0};
+                                  }));
+}
+
+namespace
+{
+
 struct ListedQuery
 {
   QueryOutcome outcome;
@@ -1563,6 +1610,65 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsAVirtualEntryLikeNtdllListsItsFile)
 
     usvfs::hook_NtClose(nativeHandle);
     usvfs::hook_NtClose(hookedHandle);
+  }
+}
+
+// A virtual entry has no 8.3 name, as an entry of a volume that makes none: the 8.3
+// name of its file belongs to another directory, where the redirection tree does not
+// find it, and GetShortPathNameW builds paths of the 8.3 names that listings return.
+TEST_F(USVFSTest, NtQueryDirectoryFileListsVirtualEntriesWithoutShortNames)
+{
+  // a directory that Windows setup gives an 8.3 name on nearly every system
+  const std::filesystem::path sourceParent = L"C:\\";
+  constexpr std::wstring_view SOURCE_NAME  = L"Program Files";
+  constexpr std::wstring_view VIRTUAL_NAME = L"usvfs_virtual_program_files";
+  auto params                              = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const std::filesystem::path directory =
+      test::path_of_test_temp(L"virtual_short_names");
+  std::filesystem::remove_all(directory);
+  std::filesystem::create_directories(directory);
+  ctx->redirectionTable().addDirectory(
+      (directory / VIRTUAL_NAME).c_str(),
+      usvfs::RedirectionDataLocal((sourceParent / SOURCE_NAME).string() + "\\"),
+      usvfs::shared::FLAG_DIRECTORY, false);
+
+  for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
+    const DirectoryRecordLayout layout =
+        findDirectoryRecordLayout(informationClass).value();
+    if (!layout.shortName) {
+      continue;
+    }
+    SCOPED_TRACE(std::format("class {}", static_cast<int>(informationClass)));
+    HANDLE nativeHandle = openHookedDirectory(sourceParent);
+    HANDLE hookedHandle = openHookedDirectory(directory);
+    ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+    const ListedQuery native =
+        queryOnce(nativeQueryDirectoryFile(), nativeHandle,
+                  {informationClass, 0x1000, false, SOURCE_NAME});
+    const ListedQuery hooked =
+        queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle,
+                  {informationClass, 0x1000, false, VIRTUAL_NAME});
+    usvfs::hook_NtClose(nativeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+
+    ASSERT_EQ(STATUS_SUCCESS, native.outcome.result);
+    ASSERT_EQ(STATUS_SUCCESS, hooked.outcome.result);
+    const size_t shortNameEnd = layout.shortName->offset + 12 * sizeof(WCHAR);
+    if (native.data[layout.shortName->lengthOffset] == std::byte{0}) {
+      GTEST_SKIP() << "the source has no 8.3 name on this volume";
+    }
+    EXPECT_TRUE(
+        std::ranges::all_of(std::span(hooked.data)
+                                .subspan(layout.shortName->lengthOffset,
+                                         shortNameEnd - layout.shortName->lengthOffset),
+                            [](std::byte value) {
+                              return value == std::byte{0};
+                            }));
+    expectSameFixedFields(layout, native.data, hooked.data);
   }
 }
 

@@ -105,7 +105,8 @@ public:
   // empty output is the exception: like ntdll, it writes as much of it as fits, with
   // the full FileNameLength, and still returns false.
   bool append(const DirectoryRecord& record);
-  // Writes a record under another name, on the same terms as append.
+  // Writes a record of another directory under its name here, on the same terms as
+  // append, and without an 8.3 name.
   bool appendRenamed(const DirectoryRecord& record, std::wstring_view name);
   // Writes the data of a native read that ended with STATUS_BUFFER_OVERFLOW, its
   // partial record, as it is into an empty output that it fits.

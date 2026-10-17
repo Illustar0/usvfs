@@ -204,21 +204,14 @@ bool DirectoryOutput::appendRenamed(const DirectoryRecord& record,
       target->data() + m_layout.fileNameOffset, name.data(),
       std::min<size_t>(fileNameLength, target->size() - m_layout.fileNameOffset));
 
-  // Kept from the stock code until virtual entries go without 8.3 names (D1): an
-  // 8.3 name is replaced by what GetShortPathNameW makes of the new name, relative
-  // to the current directory, stored as a count of characters.
+  // An 8.3 name is an alias that the filesystem made unique only in the directory of
+  // the record, and GetShortPathNameW builds paths of the 8.3 names that a listing
+  // returns, so it would build paths that lead nowhere or to another file. NTFS and
+  // ReFS zero the fields of a record that has no 8.3 name.
   if (m_layout.shortName) {
-    CCHAR shortNameLength;
-    std::memcpy(&shortNameLength, target->data() + m_layout.shortName->lengthOffset,
-                sizeof(shortNameLength));
-    if (shortNameLength > 0) {
-      const std::wstring terminatedName(name);
-      shortNameLength = static_cast<CCHAR>(GetShortPathNameW(
-          terminatedName.c_str(),
-          reinterpret_cast<LPWSTR>(target->data() + m_layout.shortName->offset), 8));
-      std::memcpy(target->data() + m_layout.shortName->lengthOffset, &shortNameLength,
-                  sizeof(shortNameLength));
-    }
+    std::fill(target->begin() + m_layout.shortName->lengthOffset,
+              target->begin() + m_layout.shortName->offset + 12 * sizeof(WCHAR),
+              std::byte{0});
   }
   return !m_isOverflowed;
 }
