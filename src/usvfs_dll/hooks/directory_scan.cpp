@@ -251,8 +251,13 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
   const DirectoryRecordLayout layout =
       findDirectoryRecordLayout(query.informationClass).value();
   const HANDLE source = m_source.isValid() ? m_source.get() : query.handle;
-  // as large as the buffer of the query, so that a read returns what a read into that
-  // buffer would, and every record it returns fits there too
+  // As large as the buffer of the query, so that a read returns what a read into that
+  // buffer would, and every record it returns fits there too. Reading ahead in larger
+  // reads would save system calls on small queries (FindNextFile asks for 4 KB), but
+  // noticeably only for large directories on disk; and a query that changes the
+  // information class would then find records of the old class read past a native
+  // cursor that cannot go back, while a read ahead through the caller's handle would
+  // move its cursor past what the caller got.
   m_staging.resize(query.length);
 
   while (output.isEmpty()) {
