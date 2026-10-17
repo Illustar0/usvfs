@@ -531,14 +531,16 @@ void SourceDirectory::read(const DirectoryRecordLayout& layout,
     }
     return;
   }
-  OwnedHandle directory = openScanDirectory(m_path).handle;
-  if (!directory.isValid()) {
+  OpenedDirectory directory = openScanDirectory(m_path);
+  if (!directory.handle.isValid()) {
     spdlog::get("hooks")->warn(
-        "failed to open {0} to list it: {1}",
-        ush::string_cast<std::string>(m_path, ush::CodePage::UTF8), ::GetLastError());
+        "failed to open {0} to list it: {1:x}",
+        ush::string_cast<std::string>(m_path, ush::CodePage::UTF8),
+        static_cast<uint32_t>(directory.status));
     return;
   }
-  NativeDirectoryReader reader(std::move(directory), layout, std::nullopt, buffer);
+  NativeDirectoryReader reader(std::move(directory.handle), layout, std::nullopt,
+                               buffer);
   while (const std::optional<DirectoryRecord> record = reader.next()) {
     std::wstring fileName = record->fileName();
     if (m_fileNames.contains(fileName)) {
@@ -560,14 +562,14 @@ SourceDirectory::query(const std::wstring& fileName,
 {
   const std::string filePath =
       ush::string_cast<std::string>(m_path + L"\\" + fileName, ush::CodePage::UTF8);
-  OwnedHandle directory = openScanDirectory(m_path).handle;
-  if (!directory.isValid()) {
-    spdlog::get("hooks")->warn("failed to open the directory of {0} to list it: {1}",
-                               filePath, ::GetLastError());
+  OpenedDirectory directory = openScanDirectory(m_path);
+  if (!directory.handle.isValid()) {
+    spdlog::get("hooks")->warn("failed to open the directory of {0} to list it: {1:x}",
+                               filePath, static_cast<uint32_t>(directory.status));
     return std::nullopt;
   }
   NativeDirectoryReader reader(
-      std::move(directory), layout,
+      std::move(directory.handle), layout,
       fileName != L"." ? std::optional<std::wstring_view>(fileName) : std::nullopt,
       buffer);
   // the pattern is the name of the file, so the scan starts with its record
