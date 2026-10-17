@@ -2791,28 +2791,25 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsPurelyVirtualDirectoriesLikeNtdll)
   }
 }
 
-// ntdll is the reference for a physical directory that the hook cannot open to read
-// the regular entries from: here as a handle with DELETE access holds it, which the
-// hook does not share. The caller's handle is read then; the NtCreateFile hook leaves
-// it on the physical directory, as the tree holds a directory there too.
-TEST_F(USVFSTest, NtQueryDirectoryFileListsAPhysicalDirectoryItCannotOpenLikeNtdll)
+namespace
 {
-  auto params = defaultUsvfsParams();
-  std::unique_ptr<usvfs::HookContext> ctx(
-      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
-  const ModdedDirectory modded = mapModsWithSkippedEntries(
-      ctx->redirectionTable(), test::path_of_test_temp(L"physical_held"));
-  const std::filesystem::path directory = modded.data / L"sub";
-  const std::filesystem::path namesake  = modded.namesakes / L"sub";
-  std::filesystem::create_directory(directory);
-  std::ofstream(directory / L"on_disk.txt");
-  std::ofstream(namesake / L"on_disk.txt");
-  const HANDLE holder = ::CreateFileW(
-      directory.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-  ASSERT_NE(INVALID_HANDLE_VALUE, holder);
 
-  usvfs::UnicodeString ntPath(L"\\??\\" + directory.wstring());
+constexpr ULONG SHARE_ALL = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+// Gives "sub" of the game directory a file of its own on disk, which its namesake holds
+// too, so that "sub" lists the physical directory along with the mapped files.
+void putSubOnDisk(const ModdedDirectory& modded)
+{
+  std::filesystem::create_directory(modded.data / L"sub");
+  std::ofstream(modded.data / L"sub" / L"on_disk.txt");
+  std::ofstream(modded.namesakes / L"sub" / L"on_disk.txt");
+}
+
+// Opens a directory through the NtCreateFile hook, which leaves a directory that both
+// the tree and the disk hold on the physical one, unlike the NtOpenFile hook.
+HANDLE openThroughCreateHook(const std::filesystem::path& path)
+{
+  usvfs::UnicodeString ntPath(L"\\??\\" + path.wstring());
   OBJECT_ATTRIBUTES attributes{sizeof(attributes),
                                nullptr,
                                static_cast<PUNICODE_STRING>(ntPath),
@@ -2820,26 +2817,208 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsAPhysicalDirectoryItCannotOpenLikeNtd
                                nullptr,
                                nullptr};
   IO_STATUS_BLOCK statusBlock;
-  HANDLE hookedHandle = INVALID_HANDLE_VALUE;
+  HANDLE handle = INVALID_HANDLE_VALUE;
   // FILE_OPEN of the DDK, which the SDK headers do not declare
   constexpr ULONG OPEN_EXISTING_DISPOSITION = 1;
-  ASSERT_EQ(STATUS_SUCCESS,
-            usvfs::hook_NtCreateFile(
-                &hookedHandle, FILE_GENERIC_READ, &attributes, &statusBlock, nullptr, 0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                OPEN_EXISTING_DISPOSITION,
-                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0));
-  HANDLE nativeHandle = openHookedDirectory(namesake);
-  ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
 
+  const NTSTATUS result = usvfs::hook_NtCreateFile(
+      &handle, FILE_GENERIC_READ, &attributes, &statusBlock, nullptr, 0, SHARE_ALL,
+      OPEN_EXISTING_DISPOSITION, FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+      nullptr, 0);
+  return result >= 0 ? handle : INVALID_HANDLE_VALUE;
+}
+
+// Opens a directory through the NtOpenFile hook, sharing delete access as
+// FindFirstFileExW does.
+HANDLE openThroughOpenHook(const std::filesystem::path& path)
+{
+  return hooked_NtOpenFile(path.c_str(), FILE_GENERIC_READ, SHARE_ALL,
+                           FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+}
+
+// Expects the hook to list a directory through a handle as ntdll lists its namesake,
+// name by name.
+void expectSameNames(HANDLE nativeHandle, HANDLE hookedHandle)
+{
   const ListingQuery listing{FileDirectoryInformation, 0x1000, false, L"*"};
   EXPECT_EQ(sortedNames(listQueries(nativeQueryDirectoryFile(), nativeHandle, listing)),
             sortedNames(
                 listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing)));
+}
+
+// A listing of a directory that is renamed after its first query.
+struct RenamedListing
+{
+  DWORD renameError;
+  std::vector<std::wstring> names;
+};
+
+// Lists a directory through a handle of the NtOpenFile hook, renames it after the first
+// query, and names it back once the handle is closed.
+RenamedListing listRenamingAfterTheFirstQuery(NtQueryDirectoryFile_type query,
+                                              const std::filesystem::path& path)
+{
+  std::filesystem::path renamed = path;
+  renamed += L"_renamed";
+  const HANDLE handle = openThroughOpenHook(path);
+  EXPECT_NE(INVALID_HANDLE_VALUE, handle);
+  const ListingQuery listing{FileDirectoryInformation, 0x1000, true, L"*"};
+  std::vector<ListedQuery> queries{queryOnce(query, handle, listing)};
+  RenamedListing result{};
+  result.renameError = ::MoveFileExW(path.c_str(), renamed.c_str(), 0)
+                           ? static_cast<DWORD>(ERROR_SUCCESS)
+                           : ::GetLastError();
+  std::ranges::move(listQueries(query, handle, listing), std::back_inserter(queries));
+  result.names = sortedNames(queries);
+  usvfs::hook_NtClose(handle);
+  if (result.renameError == ERROR_SUCCESS) {
+    EXPECT_TRUE(::MoveFileExW(renamed.c_str(), path.c_str(), 0)) << ::GetLastError();
+  }
+  return result;
+}
+
+// Denies the current user listing a directory while it lives. The DACL is set through
+// a handle, as SetNamedSecurityInfoW and SetSecurityInfo pass the inheritable entries
+// on to the children, which takes listing the directory.
+class ListingDenial
+{
+public:
+  explicit ListingDenial(const std::filesystem::path& directory)
+      : m_handle(::CreateFileW(directory.c_str(), READ_CONTROL | WRITE_DAC, SHARE_ALL,
+                               nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                               nullptr))
+  {
+    EXPECT_NE(INVALID_HANDLE_VALUE, m_handle);
+    EXPECT_EQ(ERROR_SUCCESS,
+              ::GetSecurityInfo(m_handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                nullptr, nullptr, &m_dacl, nullptr, &m_descriptor));
+    EXPLICIT_ACCESS_W access{};
+    access.grfAccessPermissions = FILE_LIST_DIRECTORY;
+    access.grfAccessMode        = DENY_ACCESS;
+    access.grfInheritance       = NO_INHERITANCE;
+    BuildTrusteeWithNameW(&access.Trustee, const_cast<LPWSTR>(L"CURRENT_USER"));
+    PACL deniedDacl = nullptr;
+    EXPECT_EQ(ERROR_SUCCESS, ::SetEntriesInAclW(1, &access, m_dacl, &deniedDacl));
+    setDacl(deniedDacl);
+    ::LocalFree(deniedDacl);
+  }
+
+  ~ListingDenial()
+  {
+    setDacl(m_dacl);
+    ::LocalFree(m_descriptor);
+    ::CloseHandle(m_handle);
+  }
+
+  ListingDenial(const ListingDenial&)            = delete;
+  ListingDenial& operator=(const ListingDenial&) = delete;
+
+private:
+  void setDacl(PACL dacl)
+  {
+    SECURITY_DESCRIPTOR descriptor;
+    EXPECT_TRUE(
+        ::InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION));
+    EXPECT_TRUE(::SetSecurityDescriptorDacl(&descriptor, TRUE, dacl, FALSE));
+    EXPECT_TRUE(
+        ::SetKernelObjectSecurity(m_handle, DACL_SECURITY_INFORMATION, &descriptor))
+        << ::GetLastError();
+  }
+
+  HANDLE m_handle;
+  PACL m_dacl                       = nullptr;
+  PSECURITY_DESCRIPTOR m_descriptor = nullptr;
+};
+
+}  // namespace
+
+// ntdll is the reference for a directory that is renamed while it is listed: the
+// rename succeeds and the listing goes on, as FindFirstFileExW shares delete access.
+// The hook holds the physical directory open from the first query on to read the
+// regular entries from.
+TEST_F(USVFSTest, NtQueryDirectoryFileLetsAListedDirectoryBeRenamedLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const ModdedDirectory modded = mapModsWithSkippedEntries(
+      ctx->redirectionTable(), test::path_of_test_temp(L"physical_renamed"));
+  putSubOnDisk(modded);
+
+  const RenamedListing expected = listRenamingAfterTheFirstQuery(
+      nativeQueryDirectoryFile(), modded.namesakes / L"sub");
+  const RenamedListing actual = listRenamingAfterTheFirstQuery(
+      &usvfs::hook_NtQueryDirectoryFile, modded.data / L"sub");
+
+  ASSERT_EQ(ERROR_SUCCESS, expected.renameError);
+  EXPECT_EQ(expected.renameError, actual.renameError);
+  EXPECT_EQ(expected.names, actual.names);
+}
+
+// ntdll is the reference for a physical directory that a handle with DELETE access
+// holds: FindFirstFileExW shares delete access, so the hook opens the directory to read
+// the regular entries from as well, also where the NtOpenFile hook rerouted the
+// caller's handle to a mod directory.
+TEST_F(USVFSTest, NtQueryDirectoryFileListsAPhysicalDirectoryHeldForDeletionLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const ModdedDirectory modded = mapModsWithSkippedEntries(
+      ctx->redirectionTable(), test::path_of_test_temp(L"physical_held"));
+  putSubOnDisk(modded);
+  const HANDLE holder =
+      ::CreateFileW((modded.data / L"sub").c_str(), DELETE, SHARE_ALL, nullptr,
+                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  ASSERT_NE(INVALID_HANDLE_VALUE, holder);
+
+  for (const bool isOpenHook : {true, false}) {
+    SCOPED_TRACE(isOpenHook ? "NtOpenFile hook" : "NtCreateFile hook");
+    const HANDLE hookedHandle = isOpenHook
+                                    ? openThroughOpenHook(modded.data / L"sub")
+                                    : openThroughCreateHook(modded.data / L"sub");
+    const HANDLE nativeHandle = openThroughOpenHook(modded.namesakes / L"sub");
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+    expectSameNames(nativeHandle, hookedHandle);
+    usvfs::hook_NtClose(nativeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
+  ::CloseHandle(holder);
+}
+
+// ntdll is the reference for a physical directory that the hook cannot open to read
+// the regular entries from: here as the current user may no longer list it, which an
+// open handle that may still list it is not checked against. The caller's handle is
+// read then; the NtCreateFile hook leaves it on the physical directory, as the tree
+// holds a directory there too.
+TEST_F(USVFSTest, NtQueryDirectoryFileListsAPhysicalDirectoryItCannotOpenLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const ModdedDirectory modded = mapModsWithSkippedEntries(
+      ctx->redirectionTable(), test::path_of_test_temp(L"physical_denied"));
+  putSubOnDisk(modded);
+  const std::filesystem::path directory = modded.data / L"sub";
+
+  const HANDLE hookedHandle = openThroughCreateHook(directory);
+  const HANDLE nativeHandle = openThroughOpenHook(modded.namesakes / L"sub");
+  ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+  ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+
+  {
+    const ListingDenial denial(directory);
+    const HANDLE lister =
+        ::CreateFileW(directory.c_str(), FILE_LIST_DIRECTORY, SHARE_ALL, nullptr,
+                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    ASSERT_EQ(INVALID_HANDLE_VALUE, lister);
+    ASSERT_EQ(ERROR_ACCESS_DENIED, ::GetLastError());
+    expectSameNames(nativeHandle, hookedHandle);
+  }
 
   usvfs::hook_NtClose(nativeHandle);
   usvfs::hook_NtClose(hookedHandle);
-  ::CloseHandle(holder);
 }
 
 namespace

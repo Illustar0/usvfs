@@ -201,8 +201,11 @@ OpenedDirectory openScanDirectory(const std::wstring& path)
   NTSTATUS result;
   {
     const InternalIoScope internal;
+    // shares delete access, as FindFirstFileExW does: the scan holds the directory open
+    // across queries, which must neither keep others from renaming or deleting it nor
+    // fail where another handle holds it with DELETE access
     result = NtOpenFile(&handle, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attributes,
-                        &status, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        &status, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                         FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT |
                             FILE_OPEN_FOR_BACKUP_INTENT);
   }
