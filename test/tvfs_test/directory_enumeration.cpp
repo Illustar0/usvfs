@@ -1821,81 +1821,13 @@ std::vector<std::wstring> recordNames(const DirectoryRecordLayout& layout,
 
 }  // namespace
 
-// ntdll is the reference for how many virtual entries a query returns, as it lists
-// files of the virtual names: as many as the buffer holds, the first that does not fit
-// starting the next query. The pattern leaves out "." and "..", so the regular entries
-// end before the first query writes any.
-TEST_F(USVFSTest, NtQueryDirectoryFileListsSeveralVirtualEntriesPerQueryLikeNtdll)
-{
-  constexpr int ENTRY_COUNT           = 8;
-  constexpr std::wstring_view PATTERN = L"usvfs_entry_*";
-  const std::filesystem::path namesakeDirectory =
-      test::path_of_test_temp(L"virtual_entries_namesakes");
-  const std::filesystem::path virtualDirectory =
-      test::path_of_test_temp(L"virtual_entries");
-  std::filesystem::create_directories(namesakeDirectory);
-  std::filesystem::create_directories(virtualDirectory);
-  auto params = defaultUsvfsParams();
-  std::unique_ptr<usvfs::HookContext> ctx(
-      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
-  for (int entry = 0; entry < ENTRY_COUNT; ++entry) {
-    const std::wstring name = std::format(L"usvfs_entry_{}.txt", entry);
-    std::ofstream(namesakeDirectory / name);
-    ctx->redirectionTable().addFile((virtualDirectory / name).c_str(),
-                                    usvfs::RedirectionDataLocal(REAL_FILEA));
-  }
-
-  for (const FILE_INFORMATION_CLASS informationClass : DIRECTORY_INFORMATION_CLASSES) {
-    const DirectoryRecordLayout layout =
-        findDirectoryRecordLayout(informationClass).value();
-    HANDLE wholeHandle = openHookedDirectory(namesakeDirectory);
-    ASSERT_NE(INVALID_HANDLE_VALUE, wholeHandle);
-    const ListedQuery whole = queryOnce(nativeQueryDirectoryFile(), wholeHandle,
-                                        {informationClass, 0x1000, false, PATTERN});
-    usvfs::hook_NtClose(wholeHandle);
-    const std::vector<size_t> offsets = recordOffsets(layout, whole.data);
-    ASSERT_EQ(static_cast<size_t>(ENTRY_COUNT), offsets.size());
-
-    // the first holds every entry; the second ends where the fourth record starts, so
-    // it holds three
-    for (const ULONG length : {0x1000ul, static_cast<ULONG>(offsets[3])}) {
-      for (const bool isSingleEntry : {false, true}) {
-        SCOPED_TRACE(std::format("class {}, length {}, {}",
-                                 static_cast<int>(informationClass), length,
-                                 isSingleEntry ? "single entry" : "full buffer"));
-        const ListingQuery listing{informationClass, length, isSingleEntry, PATTERN};
-        HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
-        HANDLE hookedHandle   = openHookedDirectory(virtualDirectory);
-        ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
-        ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
-
-        const std::vector<ListedQuery> expected =
-            listQueries(nativeQueryDirectoryFile(), namesakeHandle, listing);
-        const std::vector<ListedQuery> actual =
-            listQueries(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
-
-        ASSERT_EQ(expected.size(), actual.size());
-        for (size_t query = 0; query < expected.size(); ++query) {
-          SCOPED_TRACE(query);
-          expectSameOutcome(expected[query].outcome, actual[query].outcome);
-          EXPECT_EQ(recordOffsets(layout, expected[query].data),
-                    recordOffsets(layout, actual[query].data));
-          EXPECT_EQ(recordNames(layout, expected[query].data),
-                    recordNames(layout, actual[query].data));
-        }
-
-        usvfs::hook_NtClose(namesakeHandle);
-        usvfs::hook_NtClose(hookedHandle);
-      }
-    }
-  }
-}
-
 // ntdll is the reference for virtual entries that map files of several directories,
 // some of them with one file mapped, as it lists files of the virtual names: every
 // entry whose file exists, also when the mapping names it in another case, and none
 // twice or out of order, also when a query asks for another information class than
-// the one before it.
+// the one before it. A query returns as many as the buffer holds, the first that does
+// not fit starting the next query. The pattern leaves out "." and "..", so the regular
+// entries end before the first query writes any.
 TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
 {
   constexpr int ENTRY_COUNT = 12;
@@ -1963,13 +1895,23 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
     const std::vector<size_t> offsets = recordOffsets(layout, whole.data);
     ASSERT_EQ(LISTED_COUNT, offsets.size());
 
-    // the first holds every entry; the second ends where the fourth record starts, so
-    // it holds three, and so does it with the class changed on every query
-    for (const auto& [length, isClassChanging] :
-         {std::pair{0x1000ul, false}, std::pair{static_cast<ULONG>(offsets[3]), false},
-          std::pair{static_cast<ULONG>(offsets[3]), true}}) {
-      SCOPED_TRACE(std::format("class {}, length {}{}",
+    struct ListingCase
+    {
+      ULONG length;
+      bool isSingleEntry;
+      bool isClassChanging;
+    };
+    // a buffer that holds every entry and one that ends where the fourth record
+    // starts, so that it holds three, each also for a single entry, and the second
+    // with the class changed on every query
+    const auto cutLength = static_cast<ULONG>(offsets[3]);
+    for (const auto& [length, isSingleEntry, isClassChanging] :
+         {ListingCase{0x1000, false, false}, ListingCase{0x1000, true, false},
+          ListingCase{cutLength, false, false}, ListingCase{cutLength, true, false},
+          ListingCase{cutLength, false, true}}) {
+      SCOPED_TRACE(std::format("class {}, length {}, {}{}",
                                static_cast<int>(informationClass), length,
+                               isSingleEntry ? "single entry" : "full buffer",
                                isClassChanging ? ", class changing" : ""));
       HANDLE namesakeHandle = openHookedDirectory(namesakeDirectory);
       HANDLE hookedHandle   = openHookedDirectory(virtualDirectory);
@@ -1983,7 +1925,7 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
         SCOPED_TRACE(query);
         const FILE_INFORMATION_CLASS queryClass =
             DIRECTORY_INFORMATION_CLASSES[classIndex];
-        const ListingQuery listing{queryClass, length, false, PATTERN};
+        const ListingQuery listing{queryClass, length, isSingleEntry, PATTERN};
         const ListedQuery expected =
             queryOnce(nativeQueryDirectoryFile(), namesakeHandle, listing);
         const ListedQuery actual =
