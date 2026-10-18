@@ -768,7 +768,7 @@ private:
   const std::uint64_t m_contextGeneration;
   // whether the queries go straight to ntdll; set only by the constructor, before the
   // scan is shared, so read without the lock
-  bool m_isPassthrough;
+  bool m_isPassthrough = true;
   // the pattern the scan lists with, std::nullopt for every entry (see latchPattern);
   // fixed at construction, so the restart replacing the scan reads it unlocked
   const std::optional<std::wstring> m_pattern;
@@ -1019,28 +1019,26 @@ latchPattern(const DirectoryQuery& query,
 }
 
 // A scan that the virtual listing cannot or need not serve only forwards its queries,
-// so that this is decided once rather than on every query: that of an asynchronous
-// handle, and that of a directory the redirection tree does not hold.
+// so that this is decided once rather than on every query: that of a directory the
+// redirection tree does not hold, and that of an asynchronous handle.
 DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* replaced)
     : m_contextGeneration(usvfs::HookContext::generation()),
-      m_isPassthrough(!isSynchronousHandle(query.handle)),
       m_pattern(latchPattern(query, replaced ? replaced->m_pattern : std::nullopt)),
       m_isFirstCall(replaced == nullptr)
 {
-  if (m_isPassthrough) {
-    return;
-  }
-
   // the path the caller opened, before the open hook rerouted it
   const UnicodeString virtualPath = ntdllHandleTracker.lookup(query.handle);
   const std::optional<TreeDirectorySnapshot> snapshot =
       snapshotTreeDirectory(virtualPath);
   // The open hook reroutes only a directory in the tree, so the caller's handle of any
-  // other is the physical directory, which has no virtual entries to add.
-  if (!snapshot) {
-    m_isPassthrough = true;
+  // other is the physical directory, which has no virtual entries to add. Checked
+  // before the handle, so that the scan of such a directory, as most are, makes no
+  // system call.
+  if (!snapshot || !isSynchronousHandle(query.handle)) {
     return;
   }
+  m_isPassthrough = false;
+
   RegularSource regularSource = openRegularSource(query.handle, virtualPath);
   const std::vector<VirtualMatch> matches = gatherVirtualEntries(*snapshot, m_pattern);
 
