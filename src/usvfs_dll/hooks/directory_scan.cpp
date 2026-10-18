@@ -752,9 +752,20 @@ public:
   // scan run one at a time, as ntdll runs them on a synchronous handle.
   NTSTATUS query(const DirectoryQuery& query);
 
+  // Whether the current hook context built the scan. One that replaces another may map
+  // other files, while the scan lists those of the one before; the stock code kept its
+  // scans in the context, which dropped them with it.
+  bool isFromCurrentContext() const
+  {
+    return m_contextGeneration == usvfs::HookContext::generation();
+  }
+
 private:
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
+  // taken before the tree is read, so that a context replaced meanwhile leaves the scan
+  // outdated rather than current
+  const std::uint64_t m_contextGeneration;
   // whether the queries go straight to ntdll; set only by the constructor, before the
   // scan is shared, so read without the lock
   bool m_isPassthrough;
@@ -780,12 +791,15 @@ private:
 class DirectoryScans
 {
 public:
-  // Returns the scan serving a query: a new one on the first query of a handle or
-  // on a restart, the current one otherwise.
+  // Returns the scan serving a query: a new one on the first query of a handle, on a
+  // restart, or once the hook context that built the current one is replaced; the
+  // current one otherwise. A scan replacing an outdated one takes over its pattern, as
+  // a restart does, but leaves the native cursor of the caller's handle where it is,
+  // so its regular entries start over only where it reads them through its own handle.
   std::shared_ptr<DirectoryScan> scanFor(const DirectoryQuery& query)
   {
     std::shared_ptr<DirectoryScan> current = find(query.handle);
-    if (current && !query.isRestart()) {
+    if (current && !query.isRestart() && current->isFromCurrentContext()) {
       return current;
     }
     // tradeoff time: we store this search status even if no virtual results
@@ -800,10 +814,11 @@ public:
     auto scan = std::make_shared<DirectoryScan>(query, current.get());
     std::unique_lock lock(m_mutex);
     const auto [entry, isInserted] = m_scans.try_emplace(query.handle, scan);
-    if (!isInserted && query.isRestart()) {
+    if (!isInserted && (query.isRestart() || !entry->second->isFromCurrentContext())) {
       entry->second.swap(scan);
     }
-    // concurrent first queries on one handle: the first scan inserted wins
+    // concurrent first queries on one handle, or concurrent replacements of an outdated
+    // scan: the first scan inserted wins
     return entry->second;
   }
 
@@ -1007,7 +1022,8 @@ latchPattern(const DirectoryQuery& query,
 // so that this is decided once rather than on every query: that of an asynchronous
 // handle, and that of a directory the redirection tree does not hold.
 DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* replaced)
-    : m_isPassthrough(!isSynchronousHandle(query.handle)),
+    : m_contextGeneration(usvfs::HookContext::generation()),
+      m_isPassthrough(!isSynchronousHandle(query.handle)),
       m_pattern(latchPattern(query, replaced ? replaced->m_pattern : std::nullopt)),
       m_isFirstCall(replaced == nullptr)
 {

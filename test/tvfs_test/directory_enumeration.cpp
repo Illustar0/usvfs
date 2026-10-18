@@ -3199,3 +3199,50 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsAReissuedHandleLikeNtdll)
   usvfs::hook_NtClose(reissuedHandle);
   usvfs::hook_NtClose(nativeHandle);
 }
+
+// A hook context that replaces another drops the scans of the one before, as the stock
+// code dropped those it kept in the context: the next query on a handle lists the
+// mappings of the new context rather than those the scan was built with.
+TEST_F(USVFSTest, NtQueryDirectoryFileListsTheMappingsOfAReplacingContext)
+{
+  const std::filesystem::path root = test::path_of_test_temp(L"replacing_context");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path data = root / L"data";
+  const std::filesystem::path mod  = root / L"mod";
+  std::filesystem::create_directories(data);
+  std::filesystem::create_directories(mod);
+  std::ofstream(mod / L"old.txt");
+  std::ofstream(mod / L"new.txt");
+  const auto mapIntoData = [&](usvfs::HookContext& context, const wchar_t* fileName) {
+    context.redirectionTable().addDirectory(
+        data.c_str(), usvfs::RedirectionDataLocal(mod.string() + "\\"),
+        usvfs::shared::FLAG_DIRECTORY, false);
+    context.redirectionTable().addFile(
+        (data / fileName).c_str(),
+        usvfs::RedirectionDataLocal((mod / fileName).string()));
+  };
+
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  mapIntoData(*ctx, L"old.txt");
+  HANDLE directory = openThroughCreateHook(data);
+  ASSERT_NE(INVALID_HANDLE_VALUE, directory);
+  const ListingQuery single{FileDirectoryInformation, 0x1000, true, L"*"};
+  ASSERT_EQ(
+      std::vector<std::wstring>{L"."},
+      sortedNames({queryOnce(&usvfs::hook_NtQueryDirectoryFile, directory, single)}));
+
+  ctx.reset();
+  ctx.reset(usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  mapIntoData(*ctx, L"new.txt");
+
+  // the regular entries start over, as the new scan reads the physical directory
+  // through a handle of its own
+  const ListingQuery rest{FileDirectoryInformation, 0x1000, false, std::nullopt};
+  EXPECT_EQ(
+      (std::vector<std::wstring>{L".", L"..", L"new.txt"}),
+      sortedNames(listQueries(&usvfs::hook_NtQueryDirectoryFile, directory, rest)));
+
+  usvfs::hook_NtClose(directory);
+}
