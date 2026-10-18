@@ -23,9 +23,9 @@ struct DirectoryQuery
 };
 
 NTSTATUS queryNative(const DirectoryQuery& query);
-// Routes a query: virtualizes it when shouldVirtualize allows, and forwards it to
-// ntdll otherwise. Like ntdll, reports the result both as the return value and in
-// the status block.
+// Routes a query: forwards it to ntdll when findForwardingReason finds a reason, and
+// virtualizes it otherwise. Like ntdll, reports the result both as the return value
+// and in the status block.
 NTSTATUS queryDirectory(const DirectoryQuery& query);
 
 // Whether the calling thread is opening or closing a handle of a directory scan, which

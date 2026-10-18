@@ -289,7 +289,7 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
   if (areDotsDone()) {
     return STATUS_NO_MORE_FILES;
   }
-  // shouldVirtualize lets through only the classes that have a layout
+  // queryDirectory forwards the classes that have no layout
   const DirectoryRecordLayout layout =
       findDirectoryRecordLayout(query.informationClass).value();
   const HANDLE source = m_source.isValid() ? m_source.get() : query.handle;
@@ -544,7 +544,7 @@ void SourceDirectory::read(const DirectoryRecordLayout& layout,
   OpenedDirectory directory = openScanDirectory(m_path);
   if (!directory.handle.isValid()) {
     spdlog::get("hooks")->warn(
-        "failed to open {0} to list it: {1:x}",
+        "failed to open {0}, which virtual entries map files of: {1:#x}",
         ush::string_cast<std::string>(m_path, ush::CodePage::UTF8),
         static_cast<uint32_t>(directory.status));
     return;
@@ -559,7 +559,7 @@ void SourceDirectory::read(const DirectoryRecordLayout& layout,
   }
   if (reader.endStatus() != STATUS_NO_MORE_FILES) {
     spdlog::get("hooks")->warn(
-        "error reported listing files in {0}: {1:x}",
+        "failed to list {0}, which virtual entries map files of: {1:#x}",
         ush::string_cast<std::string>(m_path, ush::CodePage::UTF8),
         static_cast<uint32_t>(reader.endStatus()));
   }
@@ -574,8 +574,9 @@ SourceDirectory::query(const std::wstring& fileName,
       ush::string_cast<std::string>(m_path + L"\\" + fileName, ush::CodePage::UTF8);
   OpenedDirectory directory = openScanDirectory(m_path);
   if (!directory.handle.isValid()) {
-    spdlog::get("hooks")->warn("failed to open the directory of {0} to list it: {1:x}",
-                               filePath, static_cast<uint32_t>(directory.status));
+    spdlog::get("hooks")->warn(
+        "failed to open the directory of {0}, which a virtual entry maps: {1:#x}",
+        filePath, static_cast<uint32_t>(directory.status));
     return std::nullopt;
   }
   NativeDirectoryReader reader(
@@ -585,8 +586,8 @@ SourceDirectory::query(const std::wstring& fileName,
   // the pattern is the name of the file, so the scan starts with its record
   const std::optional<DirectoryRecord> record = reader.next();
   if (!record) {
-    spdlog::get("hooks")->warn("error reported listing files in {0}: {1:x}", filePath,
-                               static_cast<uint32_t>(reader.endStatus()));
+    spdlog::get("hooks")->warn("failed to read {0}, which a virtual entry maps: {1:#x}",
+                               filePath, static_cast<uint32_t>(reader.endStatus()));
   }
   return record;
 }
@@ -706,7 +707,7 @@ VirtualEntryReader::VirtualEntryReader(const std::vector<VirtualMatch>& matches)
 
 NTSTATUS VirtualEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& output)
 {
-  // shouldVirtualize lets through only the classes that have a layout
+  // queryDirectory forwards the classes that have no layout
   const DirectoryRecordLayout layout =
       findDirectoryRecordLayout(query.informationClass).value();
   // the skipped entries are dropped as the stock code dropped them; a single-entry
@@ -802,6 +803,13 @@ public:
     if (current && !query.isRestart() && current->isFromCurrentContext()) {
       return current;
     }
+    if (current && !query.isRestart()) {
+      // logged as info, as contexts are rarely replaced, and the regular entries the
+      // handle listed already may come again
+      spdlog::get("hooks")->info(
+          "rebuilding the directory scan of handle {0:#x} for a new hook context",
+          reinterpret_cast<std::uintptr_t>(query.handle));
+    }
     // tradeoff time: we store this search status even if no virtual results
     // were found. This causes a little extra cost here and in NtClose every
     // time a non-virtual dir is being searched. However if we don't,
@@ -866,11 +874,9 @@ struct TreeDirectorySnapshot
   std::vector<Child> children;
 };
 
-// Copies the children of a directory out of the redirection tree, or returns nothing if
-// the tree does not hold it. Only copies while holding the hook context, which
-// excludes every other hook of the process; converting and matching the names is left
-// to gatherVirtualEntries.
-std::optional<TreeDirectorySnapshot> snapshotTreeDirectory(const UnicodeString& dirName)
+// Returns the path of a directory in the redirection tree, which leaves out the prefix
+// of the NT path the hooks track.
+bfs::path treePathOf(const UnicodeString& dirName)
 {
   LPCWSTR dirNameW = static_cast<LPCWSTR>(dirName);
   // fix directory name. I'd love to know why microsoft sometimes uses "\??\" vs
@@ -879,7 +885,24 @@ std::optional<TreeDirectorySnapshot> snapshotTreeDirectory(const UnicodeString& 
       (wcsncmp(dirNameW, LR"(\??\)", 4) == 0)) {
     dirNameW += 4;
   }
-  const bfs::path treePath(dirNameW);
+  return bfs::path(dirNameW);
+}
+
+// Returns whether the redirection tree holds a directory, which takes the hook context.
+bool isInRedirectionTree(const UnicodeString& dirName)
+{
+  using usvfs::HookContext;
+  return READ_CONTEXT()->redirectionTable()->findNode(treePathOf(dirName)).get() !=
+         nullptr;
+}
+
+// Copies the children of a directory out of the redirection tree, or returns nothing if
+// the tree does not hold it. Only copies while holding the hook context, which
+// excludes every other hook of the process; converting and matching the names is left
+// to gatherVirtualEntries.
+std::optional<TreeDirectorySnapshot> snapshotTreeDirectory(const UnicodeString& dirName)
+{
+  const bfs::path treePath = treePathOf(dirName);
 
   // Read access, though for now it takes the same exclusive lock as write access
   // (see HookContext::readAccess), so that only the shared side is taken once the two
@@ -985,6 +1008,16 @@ RegularSource openRegularSource(HANDLE callerHandle, const UnicodeString& virtua
   OpenedDirectory directory = openScanDirectory(static_cast<LPCWSTR>(virtualPath));
   const bool isDotsOnly =
       !directory.handle.isValid() && holdsNothingOnDisk(directory.status);
+  // a directory on disk that cannot be opened, as an ACL or a sharing mode may keep it
+  // from the scan: the caller's handle may be a mapping source, whose entries the
+  // listing then shows in place of those on disk
+  if (!directory.handle.isValid() && !isDotsOnly) {
+    spdlog::get("hooks")->warn(
+        "failed to open {0} to list its entries on disk, listing handle {1:#x} "
+        "instead: {2:#x}",
+        virtualPath, reinterpret_cast<std::uintptr_t>(callerHandle),
+        static_cast<uint32_t>(directory.status));
+  }
   return {std::move(directory.handle), isDotsOnly};
 }
 
@@ -1018,6 +1051,13 @@ latchPattern(const DirectoryQuery& query,
   return std::wstring(query.fileName->Buffer, query.fileName->Length / sizeof(WCHAR));
 }
 
+// Returns the name of the hook a query came through, which the log lines of a query
+// carry so that both entry points stay distinguishable.
+const char* hookNameOf(const DirectoryQuery& query)
+{
+  return query.isEx ? "hook_NtQueryDirectoryFileEx" : "hook_NtQueryDirectoryFile";
+}
+
 // A scan that the virtual listing cannot or need not serve only forwards its queries,
 // so that this is decided once rather than on every query: that of a directory the
 // redirection tree does not hold, and that of an asynchronous handle.
@@ -1034,7 +1074,15 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* r
   // other is the physical directory, which has no virtual entries to add. Checked
   // before the handle, so that the scan of such a directory, as most are, makes no
   // system call.
-  if (!snapshot || !isSynchronousHandle(query.handle)) {
+  if (!snapshot) {
+    return;
+  }
+  if (!isSynchronousHandle(query.handle)) {
+    // logged as info, which the default log level shows, since the mapped files go
+    // missing from what the caller lists
+    spdlog::get("hooks")->info(
+        "listing {0} without its virtual entries, as handle {1:#x} is asynchronous",
+        virtualPath, reinterpret_cast<std::uintptr_t>(query.handle));
     return;
   }
   m_isPassthrough = false;
@@ -1042,11 +1090,12 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* r
   RegularSource regularSource = openRegularSource(query.handle, virtualPath);
   const std::vector<VirtualMatch> matches = gatherVirtualEntries(*snapshot, m_pattern);
 
-  // logged once per scan, under the hook's name so that both entry points stay
-  // distinguishable
-  ulog::CallLogger(query.isEx ? "hook_NtQueryDirectoryFileEx"
-                              : "hook_NtQueryDirectoryFile")
+  // logged once per scan, with the handle that the later lines of the scan name
+  ulog::CallLogger(hookNameOf(query))
       .addParam("path", virtualPath)
+      .addParam("handle", query.handle)
+      .addParam("informationClass", query.informationClass)
+      .addParam("flags", query.flags, static_cast<uint8_t>(ulog::DisplayStyle::Hex))
       .addParam("pattern", m_pattern.value_or(L"<every entry>"))
       .addParam("regularSource",
                 std::wstring(regularSource.handle.isValid() ? L"<physical directory>"
@@ -1093,8 +1142,9 @@ ULONG requiredBufferAlignment(const DirectoryQuery& query,
   }
 }
 
-// Returns whether the virtual listing can serve this query.
-bool shouldVirtualize(const DirectoryQuery& query)
+// Returns why the virtual listing cannot serve a query, for the log, or nothing when it
+// can.
+std::optional<std::string_view> findForwardingReason(const DirectoryQuery& query)
 {
   // A query asking for an event, an APC or a completion packet is left to ntdll:
   // the virtual listing completes the query itself and delivers none of them.
@@ -1111,7 +1161,7 @@ bool shouldVirtualize(const DirectoryQuery& query)
   // with the port and key a NtSetInformationFile hook recorded for the handle (they
   // cannot be queried). Until then, these callers see only the physical directory.
   if (query.event || query.apcRoutine || query.apcContext) {
-    return false;
+    return "the query asks for an event, an APC or a completion packet";
   }
   // The I/O manager drops the flags outside the mask, SL_INDEX_SPECIFIED among them,
   // before the filesystem sees them, so the virtual listing ignores them too.
@@ -1120,20 +1170,48 @@ bool shouldVirtualize(const DirectoryQuery& query)
   // is not emulated.
   constexpr ULONG VIRTUALIZED_FLAGS = SL_RESTART_SCAN | SL_RETURN_SINGLE_ENTRY;
   if ((query.flags & SL_QUERY_DIRECTORY_MASK & ~VIRTUALIZED_FLAGS) != 0) {
-    return false;
+    return "the virtual listing does not serve the query flags";
   }
   const std::optional<DirectoryRecordLayout> layout =
       findDirectoryRecordLayout(query.informationClass);
   if (!layout) {
-    return false;
+    return "the information class carries no file names";
   }
   // ntdll rejects a buffer that cannot hold a record or is misaligned, so it is left
   // to: the internal reads into that buffer would fail too, and the virtual listing
   // would then report an empty directory instead of the error
-  return query.length >= layout->minimumLength &&
-         reinterpret_cast<uintptr_t>(query.buffer) %
-                 requiredBufferAlignment(query, *layout) ==
-             0;
+  if (query.length < layout->minimumLength) {
+    return "the buffer cannot hold a record";
+  }
+  if (reinterpret_cast<uintptr_t>(query.buffer) %
+          requiredBufferAlignment(query, *layout) !=
+      0) {
+    return "the buffer is misaligned";
+  }
+  return std::nullopt;
+}
+
+// Logs a query on a directory of the redirection tree that goes straight to ntdll, as
+// the caller then lists none of its virtual entries. Logged as debug, once per query,
+// since FindNextFile repeats the query flags of FindFirstFileEx on every query; only
+// looks the directory up when that level is logged, as the lookup takes the hook
+// context.
+void logForwardedQuery(const DirectoryQuery& query, std::string_view reason)
+{
+  if (!spdlog::get("hooks")->should_log(spdlog::level::debug)) {
+    return;
+  }
+  const UnicodeString virtualPath = ntdllHandleTracker.lookup(query.handle);
+  if (!isInRedirectionTree(virtualPath)) {
+    return;
+  }
+  ulog::CallLogger(hookNameOf(query))
+      .addParam("path", virtualPath)
+      .addParam("handle", query.handle)
+      .addParam("informationClass", query.informationClass)
+      .addParam("flags", query.flags, static_cast<uint8_t>(ulog::DisplayStyle::Hex))
+      .addParam("length", query.length)
+      .addParam("forwarded", reason);
 }
 
 // Writes the next entries of the scan: the regular ones first, so that "." and ".."
@@ -1145,6 +1223,14 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, DirectoryOutput& outpu
 {
   if (m_regular) {
     const NTSTATUS status = m_regular->fill(query, output);
+    // logged as debug, as the caller gets the error as ntdll reports it
+    if (status != STATUS_SUCCESS && status != STATUS_BUFFER_OVERFLOW &&
+        status != STATUS_NO_MORE_FILES) {
+      spdlog::get("hooks")->debug(
+          "failed to read the entries on disk for handle {0:#x}: {1:#x}",
+          reinterpret_cast<std::uintptr_t>(query.handle),
+          static_cast<uint32_t>(status));
+    }
     if (status != STATUS_NO_MORE_FILES) {
       return status;
     }
@@ -1160,7 +1246,7 @@ NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
     return queryNative(query);
   }
   std::lock_guard lock(m_mutex);
-  // shouldVirtualize lets through only the classes that have a layout
+  // queryDirectory forwards the classes that have no layout
   DirectoryOutput output(std::span(static_cast<std::byte*>(query.buffer), query.length),
                          findDirectoryRecordLayout(query.informationClass).value(),
                          {.isSingleEntry = query.isSingleEntry(),
@@ -1170,7 +1256,8 @@ NTSTATUS DirectoryScan::query(const DirectoryQuery& query)
 
 NTSTATUS queryDirectory(const DirectoryQuery& query)
 {
-  if (!shouldVirtualize(query)) {
+  if (const std::optional<std::string_view> reason = findForwardingReason(query)) {
+    logForwardedQuery(query, *reason);
     return queryNative(query);
   }
   return directoryScans.scanFor(query)->query(query);
