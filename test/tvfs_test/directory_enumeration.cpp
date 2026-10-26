@@ -1108,7 +1108,11 @@ ListedQuery queryOnce(NtQueryDirectoryFile_type query, HANDLE directory,
   if (listing.pattern) {
     fileName.emplace(listing.pattern->data(), listing.pattern->size());
   }
-  std::vector<std::byte> buffer(listing.length);
+  // the hook writes into the caller's buffer itself, where the kernel bounds what
+  // ntdll writes, so canaries past the end show a record or padding written beyond it
+  constexpr size_t CANARY_LENGTH = 32;
+  constexpr std::byte CANARY{0x5A};
+  std::vector<std::byte> buffer(listing.length + CANARY_LENGTH, CANARY);
   ListedQuery listed;
   listed.outcome.statusBlock.Status      = UNWRITTEN_STATUS;
   listed.outcome.statusBlock.Information = UNWRITTEN_INFORMATION;
@@ -1116,10 +1120,18 @@ ListedQuery queryOnce(NtQueryDirectoryFile_type query, HANDLE directory,
       directory, nullptr, nullptr, nullptr, &listed.outcome.statusBlock, buffer.data(),
       listing.length, listing.informationClass, listing.isSingleEntry,
       fileName ? static_cast<PUNICODE_STRING>(*fileName) : nullptr, listing.isRestart);
+
+  EXPECT_EQ(std::vector(CANARY_LENGTH, CANARY),
+            std::vector(buffer.begin() + listing.length, buffer.end()))
+      << "the query wrote past the end of the buffer";
+
   if (listed.outcome.result == STATUS_SUCCESS ||
       listed.outcome.result == STATUS_BUFFER_OVERFLOW) {
+    const ULONG_PTR reported = listed.outcome.statusBlock.Information;
+    EXPECT_LE(reported, listing.length)
+        << "the query reported more than the buffer holds";
     listed.data.assign(buffer.begin(),
-                       buffer.begin() + listed.outcome.statusBlock.Information);
+                       buffer.begin() + std::min<ULONG_PTR>(reported, listing.length));
   }
   return listed;
 }
