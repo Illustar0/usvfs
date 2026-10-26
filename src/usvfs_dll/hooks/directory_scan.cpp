@@ -588,6 +588,12 @@ void SourceDirectory::read(const DirectoryRecordLayout& layout,
     std::wstring fileName = record->fileName();
     if (m_fileNames.contains(fileName)) {
       keep(std::move(fileName), *record);
+      // Every file name has its record: the rest of the directory, which may be large,
+      // holds nothing the entries map. Returns rather than breaks, as the scan has not
+      // reached the end the status below reports.
+      if (m_recordPlaces.size() == m_fileNames.size()) {
+        return;
+      }
     }
   }
   if (reader.endStatus() != STATUS_NO_MORE_FILES) {
