@@ -94,22 +94,55 @@ private:
 // handles of the scan are neither rerouted nor tracked, and their opening and closing
 // takes no lock of the hook context. A count rather than a flag, so that a scope
 // nested in another one does not end it.
+//
+// The count is kept in a Win32 TLS slot rather than in a thread_local, as the
+// trampolines and the hook stack keep their state: the hooks run on every thread of
+// the process, and a slot lives in the TEB, which every thread has, whereas the
+// implicit TLS block of the DLL exists only on threads the loader initialized.
 class InternalIoScope
 {
 public:
-  InternalIoScope() { ++s_depth; }
-  ~InternalIoScope() { --s_depth; }
+  InternalIoScope()
+  {
+    // logged here rather than where the slot is allocated, as the DLL loads before
+    // the loggers are set up
+    if (s_slot == TLS_OUT_OF_INDEXES) {
+      std::call_once(s_isSlotFailureLogged, [] {
+        spdlog::get("hooks")->error("no TLS slot is left to mark the I/O of directory "
+                                    "scans, which therefore goes through the hooks");
+      });
+    }
+    setDepth(depth() + 1);
+  }
+
+  ~InternalIoScope() { setDepth(depth() - 1); }
 
   InternalIoScope(const InternalIoScope&)            = delete;
   InternalIoScope& operator=(const InternalIoScope&) = delete;
 
-  static bool isActive() { return s_depth > 0; }
+  static bool isActive() { return depth() > 0; }
 
 private:
-  static thread_local int s_depth;
+  static std::uintptr_t depth()
+  {
+    // TlsGetValue resets the last error, which the hooks leave as their caller set it
+    PreserveGetLastError tlsGetValueChangesGetLastError;
+    return reinterpret_cast<std::uintptr_t>(::TlsGetValue(s_slot));
+  }
+
+  static void setDepth(std::uintptr_t depth)
+  {
+    ::TlsSetValue(s_slot, reinterpret_cast<LPVOID>(depth));
+  }
+
+  static const DWORD s_slot;
+  static std::once_flag s_isSlotFailureLogged;
 };
 
-thread_local int InternalIoScope::s_depth = 0;
+// allocated as the DLL loads rather than on first use, as a function-local static
+// would guard its initialization through implicit TLS
+const DWORD InternalIoScope::s_slot = ::TlsAlloc();
+std::once_flag InternalIoScope::s_isSlotFailureLogged;
 
 bool isInternalDirectoryIo()
 {
