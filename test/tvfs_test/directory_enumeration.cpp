@@ -1831,20 +1831,58 @@ std::vector<std::wstring> recordNames(const DirectoryRecordLayout& layout,
   return names;
 }
 
+// Expects the records of a query that returned whole records to be packed as
+// FitsARecordThatEndsWithTheBuffer has the rule: each at the 8-byte boundary after the
+// one before it, the data ending with the last, and no room left for the record of the
+// entry the listing goes on with, if any. A single-entry query returns one record.
+void expectPackedRecords(const ListingQuery& listing, std::span<const std::byte> data,
+                         std::optional<std::wstring_view> nextName)
+{
+  const DirectoryRecordLayout layout =
+      findDirectoryRecordLayout(listing.informationClass).value();
+  const std::vector<size_t> offsets = recordOffsets(layout, data);
+  for (size_t index = 0; index + 1 < offsets.size(); ++index) {
+    const size_t size = DirectoryRecord(layout, data.subspan(offsets[index])).size();
+    EXPECT_EQ((size + 7) / 8 * 8, offsets[index + 1] - offsets[index])
+        << "record at " << offsets[index];
+  }
+  EXPECT_EQ(data.size(),
+            offsets.back() +
+                DirectoryRecord(layout, data.subspan(offsets.back())).size())
+      << "the data ends past the last record";
+
+  if (listing.isSingleEntry) {
+    EXPECT_EQ(1u, offsets.size());
+    return;
+  }
+  if (nextName) {
+    const size_t nextEnd = (data.size() + 7) / 8 * 8 + layout.fileNameOffset +
+                           nextName->size() * sizeof(WCHAR);
+    EXPECT_LT(listing.length, nextEnd)
+        << "the record of the next entry fits after " << offsets.size();
+  }
+}
+
 }  // namespace
 
 // ntdll is the reference for virtual entries that map files of several directories,
 // some of them with one file mapped, as it lists files of the virtual names: every
 // entry whose file exists, also when the mapping names it in another case, and none
 // twice or out of order, also when a query asks for another information class than
-// the one before it. A query returns as many as the buffer holds, the first that does
-// not fit starting the next query. The pattern leaves out "." and "..", so the regular
-// entries end before the first query writes any.
+// the one before it. ntdll is no reference for where a query ends: NTFS can stop short
+// of a record that fits, as it does for FileDirectoryInformation and a buffer that ends
+// where the fourth record starts on some systems, so the listings are compared as a
+// whole, and each query of the hook is held to the rule of
+// FitsARecordThatEndsWithTheBuffer instead: as many as the buffer holds, the first that
+// does not fit starting the next query. The pattern leaves out "." and "..", so the
+// regular entries end before the first query writes any.
 TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
 {
   constexpr int ENTRY_COUNT = 12;
   // the entries whose file exists, with the two that map the one file of a directory
-  constexpr size_t LISTED_COUNT       = ENTRY_COUNT - 1 + 2;
+  constexpr size_t LISTED_COUNT = ENTRY_COUNT - 1 + 2;
+  // a guard against a listing that does not end
+  constexpr size_t MAXIMUM_QUERIES    = 1000;
   constexpr std::wstring_view PATTERN = L"usvfs_entry_*";
   const std::filesystem::path root    = test::path_of_test_temp(L"several_sources");
   std::filesystem::remove_all(root);
@@ -1930,36 +1968,78 @@ TEST_F(USVFSTest, NtQueryDirectoryFileListsEntriesOfSeveralSourcesLikeNtdll)
       ASSERT_NE(INVALID_HANDLE_VALUE, namesakeHandle);
       ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
 
-      size_t classIndex =
+      const size_t firstClassIndex =
           std::ranges::find(DIRECTORY_INFORMATION_CLASSES, informationClass) -
           std::begin(DIRECTORY_INFORMATION_CLASSES);
-      for (size_t query = 0;; ++query) {
-        SCOPED_TRACE(query);
-        const FILE_INFORMATION_CLASS queryClass =
-            DIRECTORY_INFORMATION_CLASSES[classIndex];
-        const ListingQuery listing{queryClass, length, isSingleEntry, PATTERN};
-        const ListedQuery expected =
-            queryOnce(nativeQueryDirectoryFile(), namesakeHandle, listing);
-        const ListedQuery actual =
-            queryOnce(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, listing);
-
-        expectSameOutcome(expected.outcome, actual.outcome);
-        const DirectoryRecordLayout queryLayout =
-            findDirectoryRecordLayout(queryClass).value();
-        EXPECT_EQ(recordOffsets(queryLayout, expected.data),
-                  recordOffsets(queryLayout, actual.data));
-        EXPECT_EQ(recordNames(queryLayout, expected.data),
-                  recordNames(queryLayout, actual.data));
-        if (expected.outcome.result != STATUS_SUCCESS || query > LISTED_COUNT) {
-          break;
+      const auto listingOf = [&](size_t query) {
+        const size_t classIndex =
+            isClassChanging ? firstClassIndex + query : firstClassIndex;
+        return ListingQuery{
+            DIRECTORY_INFORMATION_CLASSES[classIndex %
+                                          std::size(DIRECTORY_INFORMATION_CLASSES)],
+            length, isSingleEntry, PATTERN};
+      };
+      // a class whose record does not fit the buffer gets a partial record, and the
+      // listing goes on with the class of the next query
+      const auto list = [&](NtQueryDirectoryFile_type query, HANDLE directory) {
+        std::vector<ListedQuery> queries;
+        NTSTATUS result;
+        do {
+          queries.push_back(queryOnce(query, directory, listingOf(queries.size())));
+          result = queries.back().outcome.result;
+        } while ((result == STATUS_SUCCESS || result == STATUS_BUFFER_OVERFLOW) &&
+                 queries.size() < MAXIMUM_QUERIES);
+        return queries;
+      };
+      const auto listedNames = [&](const std::vector<ListedQuery>& queries) {
+        std::vector<std::wstring> names;
+        for (size_t query = 0; query < queries.size(); ++query) {
+          if (queries[query].outcome.result != STATUS_SUCCESS) {
+            continue;
+          }
+          const DirectoryRecordLayout queryLayout =
+              findDirectoryRecordLayout(listingOf(query).informationClass).value();
+          std::ranges::move(recordNames(queryLayout, queries[query].data),
+                            std::back_inserter(names));
         }
-        if (isClassChanging) {
-          classIndex = (classIndex + 1) % std::size(DIRECTORY_INFORMATION_CLASSES);
-        }
-      }
-
+        return names;
+      };
+      const std::vector<ListedQuery> expected =
+          list(nativeQueryDirectoryFile(), namesakeHandle);
+      const std::vector<ListedQuery> actual =
+          list(&usvfs::hook_NtQueryDirectoryFile, hookedHandle);
       usvfs::hook_NtClose(namesakeHandle);
       usvfs::hook_NtClose(hookedHandle);
+
+      const std::vector<std::wstring> expectedNames = listedNames(expected);
+      ASSERT_EQ(LISTED_COUNT, expectedNames.size());
+      EXPECT_EQ(expectedNames, listedNames(actual));
+      expectSameOutcome(expected.back().outcome, actual.back().outcome);
+
+      size_t listedCount = 0;
+      for (size_t query = 0; query + 1 < actual.size(); ++query) {
+        SCOPED_TRACE(query);
+        const ListingQuery listing = listingOf(query);
+        const ListedQuery& listed  = actual[query];
+        const DirectoryRecordLayout queryLayout =
+            findDirectoryRecordLayout(listing.informationClass).value();
+        ASSERT_LT(listedCount, expectedNames.size());
+        if (listed.outcome.result == STATUS_BUFFER_OVERFLOW) {
+          EXPECT_LT(listing.length,
+                    queryLayout.fileNameOffset +
+                        expectedNames[listedCount].size() * sizeof(WCHAR))
+              << "a partial record of an entry that fits";
+          continue;
+        }
+        EXPECT_EQ(STATUS_SUCCESS, listed.outcome.statusBlock.Status);
+        ASSERT_FALSE(listed.data.empty());
+        listedCount += recordOffsets(queryLayout, listed.data).size();
+        const std::optional<std::wstring_view> nextName =
+            listedCount < expectedNames.size()
+                ? std::optional<std::wstring_view>(expectedNames[listedCount])
+                : std::nullopt;
+        expectPackedRecords(listing, listed.data, nextName);
+      }
     }
   }
 }
