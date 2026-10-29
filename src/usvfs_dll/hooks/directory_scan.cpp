@@ -368,6 +368,13 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
     if (result != STATUS_SUCCESS) {
       return result;
     }
+    // NTFS, ReFS and FAT cut a first record short on every query, but the contract of
+    // NtQueryDirectoryFile lets a later query that holds no whole record succeed with
+    // no bytes, for the caller to retry with a larger buffer; another read into this
+    // one would return the same, so the caller gets it as it came.
+    if (status.Information == 0) {
+      return STATUS_SUCCESS;
+    }
 
     appendListedRecords(layout, std::span(m_staging).first(status.Information), output);
     if (areDotsDone()) {
