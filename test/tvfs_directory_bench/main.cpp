@@ -2,6 +2,10 @@
 // against ntdll listing a directory that holds the same files on disk, and against the
 // hooks listing that directory.
 //
+// Also measures several threads at once listing the mapped directory and querying the
+// attributes of its files, so that the throughput shows how much the threads wait on
+// the lock of the hook context.
+//
 // The hooks are called directly, as tvfs_test calls them: they are not installed in
 // this process. The calls a listing makes to ntdll are counted by hooks on ntdll
 // itself, which the usvfs hooks call through its exports.
@@ -17,6 +21,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -123,13 +128,17 @@ struct Layout
   std::vector<std::filesystem::path> mods;
   // the files, and "." and ".."
   std::size_t entryCount;
+  // the names of the files mapped into data, in the order of the mods
+  std::vector<std::wstring> fileNames;
 };
 
 // Returns the layout of a number of mods with a number of files each, creating it on
-// the first call.
+// the first call. Safe to call from the threads of one benchmark.
 const Layout& layoutOf(std::size_t modCount, std::size_t fileCount)
 {
+  static std::mutex layoutsMutex;
   static std::map<std::pair<std::size_t, std::size_t>, Layout> layouts;
+  const std::lock_guard lock(layoutsMutex);
   const auto [entry, isNew] = layouts.try_emplace({modCount, fileCount});
   Layout& layout            = entry->second;
   if (!isNew) {
@@ -151,6 +160,7 @@ const Layout& layoutOf(std::size_t modCount, std::size_t fileCount)
       const std::wstring name = std::format(L"mod{}_file{}.txt", mod, file);
       std::ofstream(modPath / name);
       std::ofstream(layout.physical / name);
+      layout.fileNames.push_back(name);
     }
     layout.mods.push_back(modPath);
   }
@@ -186,8 +196,8 @@ NTSTATUS openDirectory(NtOpenFile_type open, const std::filesystem::path& path,
 std::size_t listDirectory(HANDLE directory, NtQueryDirectoryFile_type query)
 {
   // many records per query, so that the time goes to the entries rather than to the
-  // calls
-  alignas(8) static std::array<std::byte, 0x10000> buffer;
+  // calls; one per thread, as several threads may list at once
+  alignas(8) thread_local std::array<std::byte, 0x10000> buffer;
   std::size_t entryCount = 0;
   IO_STATUS_BLOCK statusBlock;
   while (query(directory, nullptr, nullptr, nullptr, &statusBlock, buffer.data(),
@@ -206,11 +216,34 @@ std::size_t listDirectory(HANDLE directory, NtQueryDirectoryFile_type query)
   return entryCount;
 }
 
+// Resets the counts of ntdll calls on the first thread of a benchmark. The other
+// threads wait for it at the start of their loop.
+void resetCallCounts(const benchmark::State& state)
+{
+  if (state.thread_index() == 0) {
+    openCount  = 0;
+    queryCount = 0;
+  }
+}
+
+// Reports the counts of ntdll calls, averaged per iteration of all the threads, from
+// the first thread, as the counters of every thread are summed and the counts are
+// shared.
+void reportCallCounts(benchmark::State& state)
+{
+  if (state.thread_index() != 0) {
+    return;
+  }
+  state.counters["opens"]   = benchmark::Counter(static_cast<double>(openCount),
+                                                 benchmark::Counter::kAvgIterations);
+  state.counters["queries"] = benchmark::Counter(static_cast<double>(queryCount),
+                                                 benchmark::Counter::kAvgIterations);
+}
+
 void measureListing(benchmark::State& state, const std::filesystem::path& directory,
                     const ListingFunctions& functions, std::size_t entryCount)
 {
-  openCount  = 0;
-  queryCount = 0;
+  resetCallCounts(state);
   for (auto _ : state) {
     HANDLE handle         = INVALID_HANDLE_VALUE;
     const NTSTATUS status = openDirectory(functions.open, directory, handle);
@@ -228,10 +261,7 @@ void measureListing(benchmark::State& state, const std::filesystem::path& direct
     }
   }
   // averaged per listing, the open and queries of the listing itself included
-  state.counters["opens"]   = benchmark::Counter(static_cast<double>(openCount),
-                                                 benchmark::Counter::kAvgIterations);
-  state.counters["queries"] = benchmark::Counter(static_cast<double>(queryCount),
-                                                 benchmark::Counter::kAvgIterations);
+  reportCallCounts(state);
   state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(entryCount));
 }
 
@@ -256,11 +286,20 @@ void mapMods(const Layout& layout)
   }
 }
 
+// Maps the mods of the layout on the first thread of a benchmark, which the other
+// threads wait for at the start of their loop.
+void mapModsOnce(const benchmark::State& state, const Layout& layout)
+{
+  if (state.thread_index() == 0) {
+    mapMods(layout);
+  }
+}
+
 void VirtualListing(benchmark::State& state)
 {
   const Layout& layout = layoutOf(static_cast<std::size_t>(state.range(0)),
                                   static_cast<std::size_t>(state.range(1)));
-  mapMods(layout);
+  mapModsOnce(state, layout);
   measureListing(state, layout.data, HOOKS, layout.entryCount);
 }
 
@@ -270,8 +309,65 @@ void UnmappedListing(benchmark::State& state)
 {
   const Layout& layout = layoutOf(static_cast<std::size_t>(state.range(0)),
                                   static_cast<std::size_t>(state.range(1)));
-  mapMods(layout);
+  mapModsOnce(state, layout);
   measureListing(state, layout.physical, HOOKS, layout.entryCount);
+}
+
+// Queries the attributes of the files of the layout in a directory, one file after
+// another, as a process does when it looks for files by name.
+void measureAttributesQuery(benchmark::State& state, const Layout& layout,
+                            const std::filesystem::path& directory,
+                            NtQueryAttributesFile_type query)
+{
+  // built before the loop, which then only queries
+  std::vector<usvfs::UnicodeString> paths;
+  paths.reserve(layout.fileNames.size());
+  for (const std::wstring& fileName : layout.fileNames) {
+    paths.emplace_back((L"\\??\\" + (directory / fileName).wstring()).c_str());
+  }
+
+  // each thread starts at another file, so that they do not query the same one in step
+  std::size_t next = static_cast<std::size_t>(state.thread_index()) * paths.size() /
+                     static_cast<std::size_t>(state.threads());
+  for (auto _ : state) {
+    OBJECT_ATTRIBUTES attributes{.Length        = sizeof(attributes),
+                                 .RootDirectory = nullptr,
+                                 .ObjectName =
+                                     static_cast<PUNICODE_STRING>(paths[next]),
+                                 .Attributes               = 0,
+                                 .SecurityDescriptor       = nullptr,
+                                 .SecurityQualityOfService = nullptr};
+    FILE_BASIC_INFORMATION information;
+    const NTSTATUS status = query(&attributes, &information);
+    if (status != STATUS_SUCCESS) {
+      state.SkipWithError(std::format("failed to query a file in {}: {:#010x}",
+                                      directory.string(), static_cast<ULONG>(status)));
+      return;
+    }
+    next = (next + 1) % paths.size();
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+
+// ntdll querying the files on disk, which bounds how far the hook can scale with the
+// threads.
+void NativeAttributesQuery(benchmark::State& state)
+{
+  const Layout& layout = layoutOf(static_cast<std::size_t>(state.range(0)),
+                                  static_cast<std::size_t>(state.range(1)));
+  measureAttributesQuery(state, layout, layout.physical, ::NtQueryAttributesFile);
+}
+
+// The hook querying the files mapped into the data directory. Each query takes the lock
+// of the hook context once, for a short lookup in the tree, so threads querying at once
+// mostly wait on that lock if it excludes them from each other.
+void VirtualAttributesQuery(benchmark::State& state)
+{
+  const Layout& layout = layoutOf(static_cast<std::size_t>(state.range(0)),
+                                  static_cast<std::size_t>(state.range(1)));
+  mapModsOnce(state, layout);
+  measureAttributesQuery(state, layout, layout.data,
+                         &usvfs::hook_NtQueryAttributesFile);
 }
 
 void layoutArguments(benchmark::Benchmark* benchmark)
@@ -281,9 +377,26 @@ void layoutArguments(benchmark::Benchmark* benchmark)
       ->Unit(benchmark::kMillisecond);
 }
 
+// Several threads at once over the largest layout. Measured in wall time, so that the
+// items per second are the throughput of all the threads together.
+void concurrentArguments(benchmark::Benchmark* benchmark)
+{
+  benchmark->ArgNames({"mods", "files"})
+      ->Args({8, 512})
+      ->ThreadRange(1, 8)
+      ->UseRealTime();
+}
+
 BENCHMARK(NativeListing)->Apply(layoutArguments);
 BENCHMARK(VirtualListing)->Apply(layoutArguments);
 BENCHMARK(UnmappedListing)->Apply(layoutArguments);
+BENCHMARK(VirtualListing)->Apply(concurrentArguments)->Unit(benchmark::kMillisecond);
+BENCHMARK(NativeAttributesQuery)
+    ->Apply(concurrentArguments)
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK(VirtualAttributesQuery)
+    ->Apply(concurrentArguments)
+    ->Unit(benchmark::kMicrosecond);
 
 }  // namespace
 
