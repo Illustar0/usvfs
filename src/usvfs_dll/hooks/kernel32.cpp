@@ -599,7 +599,7 @@ BOOL WINAPI usvfs::hook_DeleteFileW(LPCWSTR lpFileName)
   POST_REALCALL
 
   if (res) {
-    reroute.removeMapping(READ_CONTEXT());
+    reroute.removeMapping(WRITE_CONTEXT());
   }
 
   if (reroute.wasRerouted())
@@ -718,8 +718,8 @@ BOOL WINAPI usvfs::hook_MoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileN
 
     if (res) {
       readReroute.removeMapping(
-          READ_CONTEXT(), isDirectory);  // Updating the rerouteCreate to check deleted
-                                         // file entries should make this okay
+          WRITE_CONTEXT(), isDirectory);  // Updating the rerouteCreate to check deleted
+                                          // file entries should make this okay
 
       if (writeReroute.newReroute()) {
         if (isDirectory)
@@ -851,8 +851,8 @@ BOOL WINAPI usvfs::hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFil
 
     if (res) {
       readReroute.removeMapping(
-          READ_CONTEXT(), isDirectory);  // Updating the rerouteCreate to check deleted
-                                         // file entries should make this okay
+          WRITE_CONTEXT(), isDirectory);  // Updating the rerouteCreate to check deleted
+                                          // file entries should make this okay
 
       if (writeReroute.newReroute()) {
         if (isDirectory)
@@ -1002,7 +1002,7 @@ BOOL WINAPI usvfs::hook_MoveFileWithProgressW(LPCWSTR lpExistingFileName,
       // it, but deleteFile can't be disabled since we are relying on it in case of
       // MOVEFILE_REPLACE_EXISTING for the destination file.
       readReroute.removeMapping(
-          READ_CONTEXT(),
+          WRITE_CONTEXT(),
           isDirectory);  // Updating the rerouteCreate to check deleted file entries
                          // should make this okay (not related to comments above)
 
@@ -1267,7 +1267,7 @@ DLLEXPORT BOOL WINAPI usvfs::hook_RemoveDirectoryW(LPCWSTR lpPathName)
   POST_REALCALL
 
   if (res) {
-    reroute.removeMapping(READ_CONTEXT(), true);
+    reroute.removeMapping(WRITE_CONTEXT(), true);
   }
 
   if (reroute.wasRerouted())

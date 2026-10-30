@@ -164,7 +164,9 @@ public:
     }
   }
 
-  void removeMapping(const HookContext::ConstPtr& readContext, bool directory = false)
+  // takes write access, as removing m_FileNode changes the tree even though the node
+  // is reached without going through the context
+  void removeMapping(const HookContext::Ptr& context, bool directory = false)
   {
     bool addToDelete     = false;
     bool dontAddToDelete = false;
@@ -179,7 +181,7 @@ public:
           [&](const RedirectionTree::NodePtrT& node) {
             visitor(node);
           };
-      readContext->redirectionTable()->visitPath(m_RealPath, visitorWrapper);
+      context->redirectionTable()->visitPath(m_RealPath, visitorWrapper);
       if (visitor.target.get())
         found = true;
     }
