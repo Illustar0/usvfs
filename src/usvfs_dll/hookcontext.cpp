@@ -136,6 +136,10 @@ HookContext::ConstPtr HookContext::readAccess(const char*)
 
   // TODO: this should be a shared mutex!
   s_Instance->m_Mutex.wait(200);
+  // the const tables stay on the block they are on, so they are moved here, while the
+  // lock excludes every other reader
+  s_Instance->m_Tree.moveToCurrentBlock();
+  s_Instance->m_InverseTree.moveToCurrentBlock();
   return ConstPtr(s_Instance, unlockShared);
 }
 
