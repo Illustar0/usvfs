@@ -21,8 +21,8 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #pragma once
 
 #include "dllimport.h"
+#include "recursive_shared_lock.h"
 #include "redirectiontree.h"
-#include "semaphore.h"
 #include "tree_container.h"
 #include <directory_tree.h>
 #include <exceptionex.h>
@@ -178,8 +178,7 @@ private:
 
   HMODULE m_DLLModule;
 
-  //  mutable std::recursive_mutex m_Mutex;
-  mutable RecursiveBenaphore m_Mutex;
+  mutable RecursiveSharedLock m_Lock;
 };
 
 }  // namespace usvfs

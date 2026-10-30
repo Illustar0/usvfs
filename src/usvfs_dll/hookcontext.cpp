@@ -134,8 +134,8 @@ HookContext::ConstPtr HookContext::readAccess(const char*)
 {
   BOOST_ASSERT(s_Instance != nullptr);
 
-  // TODO: this should be a shared mutex!
-  s_Instance->m_Mutex.wait(200);
+  // TODO: readers should share the lock
+  s_Instance->m_Lock.lockExclusive();
   // the const tables stay on the block they are on, so they are moved here, while the
   // lock excludes every other reader
   s_Instance->m_Tree.moveToCurrentBlock();
@@ -147,7 +147,7 @@ HookContext::Ptr HookContext::writeAccess(const char*)
 {
   BOOST_ASSERT(s_Instance != nullptr);
 
-  s_Instance->m_Mutex.wait(200);
+  s_Instance->m_Lock.lockExclusive();
   return Ptr(s_Instance, unlock);
 }
 
@@ -317,12 +317,12 @@ std::vector<std::future<int>>& HookContext::delayed()
 
 void HookContext::unlock(HookContext* instance)
 {
-  instance->m_Mutex.signal();
+  instance->m_Lock.unlock();
 }
 
 void HookContext::unlockShared(const HookContext* instance)
 {
-  instance->m_Mutex.signal();
+  instance->m_Lock.unlock();
 }
 
 // deprecated
