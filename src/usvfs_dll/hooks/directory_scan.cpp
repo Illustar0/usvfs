@@ -921,9 +921,9 @@ bool isInRedirectionTree(const UnicodeString& dirName)
 }
 
 // Copies the children of a directory out of the redirection tree, or returns nothing if
-// the tree does not hold it. Only copies while holding the hook context, which
-// excludes every other hook of the process; converting and matching the names is left
-// to gatherVirtualEntries.
+// the tree does not hold it. Only copies while holding read access to the hook context,
+// which excludes the hooks that change the tree; converting and matching the names is
+// left to gatherVirtualEntries.
 std::optional<TreeDirectorySnapshot> snapshotTreeDirectory(const UnicodeString& dirName)
 {
   const auto treePath = treePathOf(dirName);
@@ -931,11 +931,6 @@ std::optional<TreeDirectorySnapshot> snapshotTreeDirectory(const UnicodeString& 
     return std::nullopt;
   }
 
-  // Read access, though for now it takes the same exclusive lock as write access
-  // (see HookContext::readAccess), so that only the shared side is taken once the two
-  // are split. The split has to keep TreeContainer::get() const in mind, which
-  // reassigns the container when another process moved the tree to a new block:
-  // readers sharing the lock must not do that concurrently.
   using usvfs::HookContext;
   const HookContext::ConstPtr context = READ_CONTEXT();
   const auto node = context->redirectionTable()->findNode(*treePath);

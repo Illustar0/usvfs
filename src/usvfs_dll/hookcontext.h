@@ -62,16 +62,19 @@ public:
   static void remove(const char* instance);
 
   /**
-   * @brief get read access to the context.
+   * @brief get read access to the context, which other readers share. A thread may
+   * take it again while it holds read or write access.
    * @return smart ptr to the context. mutex will automatically be released when
    * this leaves scope
    */
   static ConstPtr readAccess(const char* source);
 
   /**
-   * @brief get write access to the context.
+   * @brief get write access to the context. A thread may take it again while it holds
+   * write access, but not while it holds read access, as that would deadlock.
    * @return smart ptr to the context. mutex will automatically be released when
    * this leaves scope
+   * @throws std::logic_error if the calling thread holds read access
    */
   static Ptr writeAccess(const char* source);
 
