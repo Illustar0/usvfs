@@ -39,7 +39,8 @@ namespace usvfs::shared
 // over, but it did not deallocate the block because process B is still
 // pointing to it
 //
-// when process B tries to access the block, it checks `outdated` (see get());
+// when process B tries to access the block, it checks `outdated` (see
+// moveToCurrentBlock(), which the non-const get() calls);
 // if it's true, it means that it's pointing to an outdated shared memory block
 // and must find the new one that process A created
 //
@@ -120,25 +121,29 @@ public:
    */
   TreeT* get()
   {
-    if (m_TreeMeta->outdated) {
-      reassign();
-    }
-
+    moveToCurrentBlock();
     return m_TreeMeta->tree.get();
   }
 
   /**
-   * @return raw const pointer to the managed tree
+   * @brief moves the container to the block another process moved the tree to, if
+   * its block is outdated
    */
-  const TreeT* get() const
+  void moveToCurrentBlock()
   {
     if (m_TreeMeta->outdated) {
-      // safe const_cast, TreeContainer are never created const
-      const_cast<TreeContainer<TreeT>*>(this)->reassign();
+      reassign();
     }
-
-    return m_TreeMeta->tree.get();
   }
+
+  /**
+   * @return raw const pointer to the managed tree, on the block the container is on
+   * even if another process marked it outdated: several threads may read through a
+   * container at once, and moving to another block under them would unmap the tree
+   * they are reading. The old block stays mapped and valid, if stale, until
+   * moveToCurrentBlock() moves the container.
+   */
+  const TreeT* get() const { return m_TreeMeta->tree.get(); }
 
   const TreeT* operator->() const { return get(); }
 
