@@ -131,10 +131,15 @@ public:
    */
   void moveToCurrentBlock()
   {
-    if (m_TreeMeta->outdated) {
+    if (isOutdated()) {
       reassign();
     }
   }
+
+  /**
+   * @return whether another process moved the tree off the block the container is on
+   */
+  bool isOutdated() const { return m_TreeMeta->outdated; }
 
   /**
    * @return raw const pointer to the managed tree, on the block the container is on

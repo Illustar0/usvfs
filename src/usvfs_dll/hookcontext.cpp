@@ -134,13 +134,23 @@ HookContext::ConstPtr HookContext::readAccess(const char*)
 {
   BOOST_ASSERT(s_Instance != nullptr);
 
-  // TODO: readers should share the lock
-  s_Instance->m_Lock.lockExclusive();
-  // the const tables stay on the block they are on, so they are moved here, while the
-  // lock excludes every other reader
-  s_Instance->m_Tree.moveToCurrentBlock();
-  s_Instance->m_InverseTree.moveToCurrentBlock();
-  return ConstPtr(s_Instance, unlockShared);
+  HookContext& context         = *s_Instance;
+  const bool isOutermostAccess = !context.m_Lock.isHeldByCurrentThread();
+  context.m_Lock.lockShared();
+
+  // the const tables stay on the block they are on, as readers sharing the lock cannot
+  // move them, so the outermost access of a thread that finds a table outdated reads
+  // under the exclusive lock and moves the tables first; a nested access reads the
+  // block its thread is already reading, which stays valid
+  if (isOutermostAccess &&
+      (context.m_Tree.isOutdated() || context.m_InverseTree.isOutdated())) {
+    context.m_Lock.unlock();
+    context.m_Lock.lockExclusive();
+    context.m_Tree.moveToCurrentBlock();
+    context.m_InverseTree.moveToCurrentBlock();
+  }
+
+  return ConstPtr(&context, unlockShared);
 }
 
 HookContext::Ptr HookContext::writeAccess(const char*)
