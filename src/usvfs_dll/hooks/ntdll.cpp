@@ -892,34 +892,35 @@ NTSTATUS WINAPI usvfs::hook_NtTerminateProcess(HANDLE ProcessHandle,
   // this hook is normally called when terminating another process, in which
   // case there's nothing to do
   //
-  // if the current process exits normally, the ExitProcess() hook is called
-  // and disconnects from the vfs; if the current process crashes, this hook
-  // is not called, the process just dies
+  // when the current process ends, the vfs must be disconnected, but only once
+  // the calling thread is the last one left: disconnecting restores the hooked
+  // functions and frees the context while other threads may still be running
+  // them, which crashes the process on exit
   //
-  // but a process can also terminate itself, bypassing ExitProcess(), and
-  // ending up here, in which case the vfs should be disconnected
+  // a NULL handle ends every thread of the current process except the calling
+  // one; ExitProcess() does this before it detaches the DLLs and ends the
+  // process with -1, so the vfs is disconnected after the real call
   //
-  // NtTerminateProcess() can be called two different ways to terminate the
-  // current process:
-  //   - with a valid handle for the current process, or
-  //   - with -1, because that's what GetCurrentProcess() returns
-  //
-  // it's unclear what a NULL handle represents, the behaviour is not
-  // documented anywhere, but looking at ReactOS, it's also interpreted as the
-  // current process
+  // a process can also end itself directly, with -1 (what GetCurrentProcess()
+  // returns) or with its own handle, which ends all of its threads at once, so
+  // the other threads are ended first the way ExitProcess() does
 
   NTSTATUS res = STATUS_SUCCESS;
 
   HOOK_START
 
-  const bool isCurrentProcess = ProcessHandle == (HANDLE)-1 || ProcessHandle == 0 ||
-                                GetProcessId(ProcessHandle) == GetCurrentProcessId();
+  const bool endsCurrentProcess = ProcessHandle == nullptr ||
+                                  ProcessHandle == (HANDLE)-1 ||
+                                  GetProcessId(ProcessHandle) == GetCurrentProcessId();
 
-  if (isCurrentProcess) {
+  if (endsCurrentProcess) {
+    res = ::NtTerminateProcess(nullptr, ExitStatus);
     usvfsDisconnectVFS();
   }
 
-  res = ::NtTerminateProcess(ProcessHandle, ExitStatus);
+  if (ProcessHandle != nullptr) {
+    res = ::NtTerminateProcess(ProcessHandle, ExitStatus);
+  }
 
   HOOK_END
 

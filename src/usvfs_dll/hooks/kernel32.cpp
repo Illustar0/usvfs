@@ -1843,7 +1843,8 @@ VOID WINAPI usvfs::hook_ExitProcess(UINT exitCode)
   // nor does any pre/post call macro
   LOG_CALL().PARAM(exitCode);
 
-  usvfsDisconnectVFS();
+  // the vfs is disconnected by the NtTerminateProcess() hook, once ExitProcess()
+  // has ended the other threads that could still be running the hooks
 
   //  HookManager::instance().removeHook("ExitProcess");
   //  PRE_REALCALL
