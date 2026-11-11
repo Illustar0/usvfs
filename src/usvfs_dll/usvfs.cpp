@@ -24,6 +24,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "redirectiontree.h"
 #include "usvfs_version.h"
 #include "usvfsparametersprivate.h"
+#include <dos_path.h>
 #include <inject.h>
 #include <shmlogger.h>
 #include <spdlog/sinks/null_sink.h>
@@ -743,8 +744,7 @@ BOOL WINAPI usvfsVirtualLinkDirectoryStatic(LPCWSTR source, LPCWSTR destination,
       std::wstring sourceP(source);
       std::wstring sourceW      = sourceP + L"\\";
       std::wstring destinationW = std::wstring(destination) + L"\\";
-      if (sourceP.length() >= MAX_PATH && !ush::startswith(sourceP.c_str(), LR"(\\?\)"))
-        sourceP = LR"(\\?\)" + sourceP;
+      sourceP                   = ush::toWin32Path(sourceP);
 
       for (winapi::ex::wide::FileResult file :
            winapi::ex::wide::quickFindFiles(sourceP.c_str(), L"*")) {

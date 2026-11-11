@@ -81,6 +81,13 @@ private:
 
 CurrentDirectoryTracker k32CurrentDirectoryTracker;
 
+std::wstring usvfs::trackedCurrentDirectory(const wchar_t* path)
+{
+  std::wstring currentDirectory;
+  k32CurrentDirectoryTracker.get(currentDirectory, path);
+  return currentDirectory;
+}
+
 // attempts to copy source to destination and return the error code
 static inline DWORD copyFileDirect(LPCWSTR source, LPCWSTR destination, bool overwrite)
 {
@@ -147,7 +154,8 @@ HMODULE WINAPI usvfs::hook_LoadLibraryExW(LPCWSTR lpFileName, HANDLE hFile,
 
   RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, lpFileName);
   PRE_REALCALL
-  res = ::LoadLibraryExW(reroute.fileName(), hFile, dwFlags);
+  // the loader names the module after the path it takes, which the process sees
+  res = ::LoadLibraryExW(reroute.plainFileName(), hFile, dwFlags);
   POST_REALCALL
 
   if (reroute.wasRerouted()) {
@@ -294,9 +302,10 @@ BOOL WINAPI usvfs::hook_CreateProcessInternalW(
     callParameters = context->callParameters();
   }
 
+  // the process sees the paths it is started with, so they stay DOS paths
   std::wstring cmdline;
-  if (cend && cmdReroute.fileName()) {
-    auto fileName = cmdReroute.fileName();
+  if (cend && cmdReroute.plainFileName()) {
+    auto fileName = cmdReroute.plainFileName();
     cmdline.reserve(wcslen(fileName) + wcslen(cend) + 2);
     if (*fileName != '"')
       cmdline += L"\"";
@@ -307,7 +316,7 @@ BOOL WINAPI usvfs::hook_CreateProcessInternalW(
   }
 
   PRE_REALCALL
-  res = CreateProcessInternalW(token, applicationReroute.fileName(),
+  res = CreateProcessInternalW(token, applicationReroute.plainFileName(),
                                cmdline.empty() ? lpCommandLine : &cmdline[0],
                                lpProcessAttributes, lpThreadAttributes, bInheritHandles,
                                dwCreationFlags, lpEnvironment, lpCurrentDirectory,
@@ -317,8 +326,8 @@ BOOL WINAPI usvfs::hook_CreateProcessInternalW(
   BOOL blacklisted = FALSE;
   {  // limit scope of context
     auto context = READ_CONTEXT();
-    blacklisted  = context->executableBlacklisted(applicationReroute.fileName(),
-                                                  cmdReroute.fileName());
+    blacklisted  = context->executableBlacklisted(applicationReroute.plainFileName(),
+                                                  cmdReroute.plainFileName());
   }
 
   if (res) {
@@ -328,7 +337,7 @@ BOOL WINAPI usvfs::hook_CreateProcessInternalW(
       } catch (const std::exception& e) {
         spdlog::get("hooks")->error("failed to inject into {0}: {1}",
                                     lpApplicationName != nullptr
-                                        ? applicationReroute.fileName()
+                                        ? applicationReroute.plainFileName()
                                         : static_cast<LPCWSTR>(lpCommandLine),
                                     e.what());
       }
@@ -391,10 +400,12 @@ BOOL WINAPI usvfs::hook_GetFileAttributesExW(LPCWSTR lpFileName,
     return res;
   }
 
-  fs::path canonicalFile = RerouteW::canonizePath(RerouteW::absolutePath(lpFileName));
+  // the path resolved with the current directory the hooks track, which the process's
+  // own one may differ from
+  const auto filePath         = RerouteW::resolvePath(lpFileName);
+  const std::wstring fileName = filePath ? filePath->win32Path() : lpFileName;
 
-  RerouteW reroute =
-      RerouteW::create(READ_CONTEXT(), callContext, canonicalFile.c_str());
+  RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, fileName.c_str());
 
   PRE_REALCALL
   res = ::GetFileAttributesExW(reroute.fileName(), fInfoLevelId, lpFileInformation);
@@ -407,9 +418,10 @@ BOOL WINAPI usvfs::hook_GetFileAttributesExW(LPCWSTR lpFileName,
   // If the original target's parent folder doesn't actually exist it may exist in the
   // the virtualized sense, or if we rerouted the query the parent of the original path
   // might exist while the parent of the rerouted path might not:
-  if (!res && fixedError == ERROR_PATH_NOT_FOUND) {
+  if (!res && fixedError == ERROR_PATH_NOT_FOUND && filePath) {
     // first query original file parent (if we rerouted it):
-    fs::path originalParent = canonicalFile.parent_path();
+    const std::wstring originalParent =
+        ush::toWin32Path(fs::path(filePath->str()).parent_path().wstring());
     WIN32_FILE_ATTRIBUTE_DATA parentAttr;
     if (reroute.wasRerouted() &&
         ::GetFileAttributesExW(originalParent.c_str(), GetFileExInfoStandard,
@@ -487,10 +499,12 @@ DWORD WINAPI usvfs::hook_GetFileAttributesW(LPCWSTR lpFileName)
     return res;
   }
 
-  fs::path canonicalFile = RerouteW::canonizePath(RerouteW::absolutePath(lpFileName));
+  // the path resolved with the current directory the hooks track, which the process's
+  // own one may differ from
+  const auto filePath         = RerouteW::resolvePath(lpFileName);
+  const std::wstring fileName = filePath ? filePath->win32Path() : lpFileName;
 
-  RerouteW reroute =
-      RerouteW::create(READ_CONTEXT(), callContext, canonicalFile.c_str());
+  RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, fileName.c_str());
 
   if (reroute.wasRerouted())
     PRE_REALCALL
@@ -504,9 +518,11 @@ DWORD WINAPI usvfs::hook_GetFileAttributesW(LPCWSTR lpFileName)
   // If the original target's parent folder doesn't actually exist it may exist in the
   // the virtualized sense, or if we rerouted the query the parent of the original path
   // might exist while the parent of the rerouted path might not:
-  if (res == INVALID_FILE_ATTRIBUTES && fixedError == ERROR_PATH_NOT_FOUND) {
+  if (res == INVALID_FILE_ATTRIBUTES && fixedError == ERROR_PATH_NOT_FOUND &&
+      filePath) {
     // first query original file parent (if we rerouted it):
-    fs::path originalParent = canonicalFile.parent_path();
+    const std::wstring originalParent =
+        ush::toWin32Path(fs::path(filePath->str()).parent_path().wstring());
     DWORD attr;
     if (reroute.wasRerouted() &&
         (attr = ::GetFileAttributesW(originalParent.c_str())) !=
@@ -570,17 +586,16 @@ BOOL WINAPI usvfs::hook_DeleteFileW(LPCWSTR lpFileName)
   HOOK_START_GROUP(MutExHookGroup::DELETE_FILE)
   // Why is the usual if (!callContext.active()... check missing?
 
-  const std::wstring path =
-      RerouteW::canonizePath(RerouteW::absolutePath(lpFileName)).wstring();
+  // the path resolved with the current directory the hooks track, which the process's
+  // own one may differ from
+  const auto filePath     = RerouteW::resolvePath(lpFileName);
+  const std::wstring path = filePath ? filePath->win32Path() : std::wstring();
 
-  RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext, path.c_str());
+  RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext,
+                                      filePath ? path.c_str() : lpFileName);
 
   PRE_REALCALL
-  if (reroute.wasRerouted()) {
-    res = ::DeleteFileW(reroute.fileName());
-  } else {
-    res = ::DeleteFileW(path.c_str());
-  }
+  res = ::DeleteFileW(reroute.fileName());
   POST_REALCALL
 
   if (res) {
@@ -709,7 +724,7 @@ BOOL WINAPI usvfs::hook_MoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileN
       if (writeReroute.newReroute()) {
         if (isDirectory)
           RerouteW::addDirectoryMapping(WRITE_CONTEXT(), fs::path(lpNewFileName),
-                                        fs::path(writeReroute.fileName()));
+                                        fs::path(writeReroute.plainFileName()));
         else
           writeReroute.insertMapping(WRITE_CONTEXT());
       }
@@ -842,7 +857,7 @@ BOOL WINAPI usvfs::hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFil
       if (writeReroute.newReroute()) {
         if (isDirectory)
           RerouteW::addDirectoryMapping(WRITE_CONTEXT(), fs::path(lpNewFileName),
-                                        fs::path(writeReroute.fileName()));
+                                        fs::path(writeReroute.plainFileName()));
         else
           writeReroute.insertMapping(WRITE_CONTEXT());
       }
@@ -994,7 +1009,7 @@ BOOL WINAPI usvfs::hook_MoveFileWithProgressW(LPCWSTR lpExistingFileName,
       if (writeReroute.newReroute()) {
         if (isDirectory)
           RerouteW::addDirectoryMapping(WRITE_CONTEXT(), fs::path(lpNewFileName),
-                                        fs::path(writeReroute.fileName()));
+                                        fs::path(writeReroute.plainFileName()));
         else
           writeReroute.insertMapping(WRITE_CONTEXT());
       }
@@ -1139,12 +1154,19 @@ BOOL WINAPI usvfs::hook_SetCurrentDirectoryW(LPCWSTR lpPathName)
 
   HOOK_START
 
-  const fs::path& realPath = RerouteW::canonizePath(RerouteW::absolutePath(lpPathName));
-  const std::wstring& realPathStr = realPath.wstring();
+  // the path resolved with the current directory the hooks track, as the DOS path
+  // GetCurrentDirectoryW hands out
+  const auto resolvedPath        = RerouteW::resolvePath(lpPathName);
+  const std::wstring realPathStr = resolvedPath ? resolvedPath->str()
+                                   : lpPathName ? std::wstring(lpPathName)
+                                                : std::wstring();
+  const std::wstring fileFunctionPath =
+      resolvedPath ? resolvedPath->win32Path() : realPathStr;
+  const fs::path realPath(realPathStr);
   std::wstring finalRoute;
   BOOL found = FALSE;
 
-  if (fs::exists(realPath))
+  if (fs::exists(fs::path(fileFunctionPath)))
     finalRoute = realPathStr;
   else {
     WCHAR processDir[MAX_PATH];
@@ -1156,7 +1178,7 @@ BOOL WINAPI usvfs::hook_SetCurrentDirectoryW(LPCWSTR lpPathName)
       RerouteW rerouteTest =
           RerouteW::create(READ_CONTEXT(), callContext, routedName.wstring().c_str());
       if (rerouteTest.wasRerouted()) {
-        std::wstring reroutedPath = rerouteTest.fileName();
+        std::wstring reroutedPath = rerouteTest.plainFileName();
         if (routedName.wstring().find(processDir) != std::string::npos) {
           fs::path finalPath(reroutedPath);
           finalRoute = finalPath.parent_path().wstring();
@@ -1167,8 +1189,9 @@ BOOL WINAPI usvfs::hook_SetCurrentDirectoryW(LPCWSTR lpPathName)
 
     if (!found) {
       RerouteW reroute =
-          RerouteW::create(READ_CONTEXT(), callContext, realPathStr.c_str());
-      finalRoute = reroute.fileName();
+          RerouteW::create(READ_CONTEXT(), callContext, fileFunctionPath.c_str());
+      // the process's own current directory stays a DOS path too
+      finalRoute = reroute.plainFileName();
     }
   }
 
@@ -1368,14 +1391,14 @@ DWORD WINAPI usvfs::hook_GetModuleFileNameA(HMODULE hModule, LPSTR lpFilename,
         ush::string_cast<std::wstring>(buf.empty() ? lpFilename : buf.data()).c_str(),
         true);
     if (reroute.wasRerouted()) {
-      DWORD reroutedSize = static_cast<DWORD>(wcslen(reroute.fileName()));
+      DWORD reroutedSize = static_cast<DWORD>(wcslen(reroute.plainFileName()));
       if (reroutedSize >= nSize) {
         reroutedSize = nSize - 1;
         callContext.updateLastError(ERROR_INSUFFICIENT_BUFFER);
         res = nSize;
       } else
         res = reroutedSize;
-      memcpy(lpFilename, ush::string_cast<std::string>(reroute.fileName()).c_str(),
+      memcpy(lpFilename, ush::string_cast<std::string>(reroute.plainFileName()).c_str(),
              reroutedSize * sizeof(lpFilename[0]));
       lpFilename[reroutedSize] = 0;
 
@@ -1420,14 +1443,14 @@ DWORD WINAPI usvfs::hook_GetModuleFileNameW(HMODULE hModule, LPWSTR lpFilename,
     RerouteW reroute = RerouteW::create(READ_CONTEXT(), callContext,
                                         buf.empty() ? lpFilename : buf.data(), true);
     if (reroute.wasRerouted()) {
-      DWORD reroutedSize = static_cast<DWORD>(wcslen(reroute.fileName()));
+      DWORD reroutedSize = static_cast<DWORD>(wcslen(reroute.plainFileName()));
       if (reroutedSize >= nSize) {
         reroutedSize = nSize - 1;
         callContext.updateLastError(ERROR_INSUFFICIENT_BUFFER);
         res = nSize;
       } else
         res = reroutedSize;
-      memcpy(lpFilename, reroute.fileName(), reroutedSize * sizeof(lpFilename[0]));
+      memcpy(lpFilename, reroute.plainFileName(), reroutedSize * sizeof(lpFilename[0]));
       lpFilename[reroutedSize] = 0;
 
       LOG_CALL()
@@ -1441,6 +1464,30 @@ DWORD WINAPI usvfs::hook_GetModuleFileNameW(HMODULE hModule, LPWSTR lpFilename,
   HOOK_END
 
   return res;
+}
+
+// The search path FindFirstFileExW takes for `pattern`: its directory resolved with the
+// current directory the hooks track, in the form the file functions take at any length,
+// and its last component as the caller gave it, which the function matches with the DOS
+// wildcard rules rather than normalizing it as a path.
+static fs::path resolvedSearchPath(LPCWSTR pattern)
+{
+  if (pattern == nullptr) {
+    return fs::path();
+  }
+  const std::wstring_view text(pattern);
+  const size_t separator = text.find_last_of(LR"(\/)");
+  // "C:*.esp" matches in the current directory of the drive
+  const size_t nameStart = separator != std::wstring_view::npos  ? separator + 1
+                           : text.size() >= 2 && text[1] == L':' ? 2
+                                                                 : 0;
+  const std::wstring directory(text.substr(0, nameStart));
+  const auto resolved =
+      usvfs::RerouteW::resolvePath(directory.empty() ? L"." : directory.c_str());
+  if (!resolved) {
+    return fs::path(pattern);
+  }
+  return fs::path(resolved->win32Path()) / std::wstring(text.substr(nameStart));
 }
 
 HANDLE WINAPI usvfs::hook_FindFirstFileExW(
@@ -1479,7 +1526,7 @@ HANDLE WINAPI usvfs::hook_FindFirstFileExW(
   // We need to do some trickery here, since we only want to use the hooked
   // NtQueryDirectoryFile for rerouted locations we need to check if the Directory path
   // has been routed instead of the full path.
-  originalPath = RerouteW::canonizePath(RerouteW::absolutePath(lpFileName));
+  originalPath = resolvedSearchPath(lpFileName);
   PRE_REALCALL
   res = ::FindFirstFileExW(originalPath.c_str(), fInfoLevelId, lpFindFileData,
                            fSearchOp, lpSearchFilter, dwAdditionalFlags);

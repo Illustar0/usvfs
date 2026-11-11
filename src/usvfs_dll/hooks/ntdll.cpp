@@ -84,96 +84,42 @@ RedirectionInfo applyReroute(const usvfs::HookContext::ConstPtr& context,
                              const usvfs::HookCallContext& callContext,
                              const UnicodeString& inPath)
 {
-  RedirectionInfo result;
-  result.path       = inPath;
-  result.redirected = false;
+  RedirectionInfo result(inPath, false);
+  if (!callContext.active()) {
+    return result;
+  }
+  // a name relative to a directory handle the hooks do not track names no path the
+  // redirection tree holds
+  const auto path = ush::DosPath::fromNt(
+      std::wstring_view(static_cast<LPCWSTR>(inPath), inPath.size()));
+  if (!path) {
+    return result;
+  }
 
-  if (callContext.active()) {
-    // see if the file exists in the redirection tree
-    std::string lookupPath = ush::string_cast<std::string>(
-        static_cast<LPCWSTR>(result.path) + 4, ush::CodePage::UTF8);
-    auto node = context->redirectionTable()->findNode(lookupPath.c_str());
-    // if so, replace the file name with the path to the mapped file
-    if ((node.get() != nullptr) &&
-        (!node->data().linkTarget.empty() || node->isDirectory())) {
-      std::wstring reroutePath;
-
-      if (node->data().linkTarget.length() > 0) {
-        reroutePath = ush::string_cast<std::wstring>(node->data().linkTarget.c_str(),
-                                                     ush::CodePage::UTF8);
-      } else {
-        reroutePath =
-            ush::string_cast<std::wstring>(node->path().c_str(), ush::CodePage::UTF8);
-      }
-      if ((*reroutePath.rbegin() == L'\\') && (*lookupPath.rbegin() != '\\')) {
-        reroutePath.resize(reroutePath.size() - 1);
-      }
-      std::replace(reroutePath.begin(), reroutePath.end(), L'/', L'\\');
-      if (reroutePath[1] == L'\\')
-        reroutePath[1] = L'?';
-      result.path       = LR"(\??\)" + reroutePath;
-      result.redirected = true;
-    }
+  // if the path is in the redirection tree, replace it with the path to the mapped file
+  const auto node = context->redirectionTable()->findNode(bfs::path(path->str()));
+  if (node.get() == nullptr) {
+    return result;
+  }
+  std::optional<ush::DosPath> reroutedPath;
+  if (!node->data().linkTarget.empty()) {
+    reroutedPath = ush::DosPath::fromFullPath(ush::string_cast<std::wstring>(
+        node->data().linkTarget.c_str(), ush::CodePage::UTF8));
+  } else if (node->isDirectory()) {
+    reroutedPath = ush::DosPath::fromFullPath(node->path().wstring());
+  }
+  if (reroutedPath) {
+    result = RedirectionInfo(reroutedPath->ntPath(), true);
   }
   return result;
 }
 
-RedirectionInfo applyReroute(const usvfs::CreateRerouter& rerouter)
+RedirectionInfo applyReroute(const usvfs::CreateRerouter& rerouter,
+                             const UnicodeString& inPath)
 {
-  RedirectionInfo result;
-  result.path       = UnicodeString(rerouter.fileName());
-  result.redirected = rerouter.wasRerouted();
-
-  std::wstring reroutePath(static_cast<LPCWSTR>(result.path));
-  std::replace(reroutePath.begin(), reroutePath.end(), L'/', L'\\');
-  if (reroutePath[1] == L'\\')
-    reroutePath[1] = L'?';
-  if (!((reroutePath[0] == L'\\') && (reroutePath[1] == L'?') &&
-        (reroutePath[2] == L'?') && (reroutePath[3] == L'\\'))) {
-    result.path = LR"(\??\)" + reroutePath;
-  }
-
-  return result;
-}
-
-struct FindCreateTarget
-{
-  usvfs::RedirectionTree::NodePtrT target;
-  void operator()(usvfs::RedirectionTree::NodePtrT node)
-  {
-    if (node->hasFlag(usvfs::shared::FLAG_CREATETARGET)) {
-      target = node;
-    }
-  }
-};
-
-std::pair<UnicodeString, UnicodeString>
-findCreateTarget(const usvfs::HookContext::ConstPtr& context,
-                 const UnicodeString& inPath)
-{
-  std::pair<UnicodeString, UnicodeString> result;
-  result.first  = inPath;
-  result.second = UnicodeString();
-
-  std::string lookupPath = ush::string_cast<std::string>(
-      static_cast<LPCWSTR>(result.first) + 4, ush::CodePage::UTF8);
-  FindCreateTarget visitor;
-  usvfs::RedirectionTree::VisitorFunction visitorWrapper =
-      [&](const usvfs::RedirectionTree::NodePtrT& node) {
-        visitor(node);
-      };
-  context->redirectionTable()->visitPath(lookupPath, visitorWrapper);
-  if (visitor.target.get() != nullptr) {
-    bfs::path relativePath =
-        ush::make_relative(visitor.target->path(), bfs::path(lookupPath));
-
-    bfs::path target(visitor.target->data().linkTarget.c_str());
-    target /= relativePath;
-
-    result.second = UnicodeString(target.wstring().c_str());
-    winapi::ex::wide::createPath(target.parent_path());
-  }
-  return result;
+  const auto& reroutedPath = rerouter.reroutedPath();
+  return reroutedPath ? RedirectionInfo(reroutedPath->ntPath(), true)
+                      : RedirectionInfo(inPath, false);
 }
 
 RedirectionInfo applyReroute(const usvfs::HookContext::ConstPtr& context,
@@ -670,7 +616,10 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
                           CreateDisposition, CreateOptions, EaBuffer, EaLength);
   }
 
-  if (isDeviceFile(inPathW)) {
+  // only a path in the DOS device namespace may be one the redirection tree holds; the
+  // Win32 functions the rerouter calls would take any other, such as a device's
+  // "\Device\..." or a name relative to an untracked handle, for a path on the drive
+  if (!ush::DosPath::fromNt(std::wstring_view(inPathW, inPath.size()))) {
     return ::NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
                           AllocationSize, FileAttributes, ShareAccess,
                           CreateDisposition, CreateOptions, EaBuffer, EaLength);
@@ -735,7 +684,7 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
       break;
     }
 
-    RedirectionInfo redir = applyReroute(rerouter);
+    RedirectionInfo redir = applyReroute(rerouter, inPath);
 
     unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes =
         makeObjectAttributes(redir, ObjectAttributes);

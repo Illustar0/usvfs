@@ -360,6 +360,278 @@ TEST_F(USVFSTest, NtQueryObjectVirtualFile)
   usvfs::hook_NtClose(hdl);
 }
 
+namespace
+{
+
+std::wstring extendedLengthPath(const std::wstring& path)
+{
+  return LR"(\\?\)" + path;
+}
+
+void createDirectories(const std::wstring& path)
+{
+  for (size_t separator = path.find(L'\\', 3);;
+       separator        = path.find(L'\\', separator + 1)) {
+    ::CreateDirectoryW(extendedLengthPath(path.substr(0, separator)).c_str(), nullptr);
+    if (separator == std::wstring::npos) {
+      break;
+    }
+  }
+}
+
+void writeFile(const std::wstring& path, std::string_view content)
+{
+  HANDLE file = ::CreateFileW(extendedLengthPath(path).c_str(), GENERIC_WRITE, 0,
+                              nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  ASSERT_NE(INVALID_HANDLE_VALUE, file) << "last error=" << ::GetLastError();
+  DWORD written = 0;
+  ::WriteFile(file, content.data(), static_cast<DWORD>(content.size()), &written,
+              nullptr);
+  ::CloseHandle(file);
+}
+
+void removeTree(const std::wstring& path)
+{
+  WIN32_FIND_DATAW data;
+  HANDLE find = ::FindFirstFileW(extendedLengthPath(path + L"\\*").c_str(), &data);
+  if (find != INVALID_HANDLE_VALUE) {
+    do {
+      const std::wstring name = data.cFileName;
+      if (name == L"." || name == L"..") {
+        continue;
+      }
+      if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        removeTree(path + L"\\" + name);
+      } else {
+        ::DeleteFileW(extendedLengthPath(path + L"\\" + name).c_str());
+      }
+    } while (::FindNextFileW(find, &data));
+    ::FindClose(find);
+  }
+  ::RemoveDirectoryW(extendedLengthPath(path).c_str());
+}
+
+std::string toUtf8(const std::wstring& path)
+{
+  return ush::string_cast<std::string>(path, ush::CodePage::UTF8);
+}
+
+bool findsName(HANDLE find, WIN32_FIND_DATAW& data, std::wstring_view name)
+{
+  if (find == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  bool isFound = false;
+  do {
+    isFound = isFound || name == data.cFileName;
+  } while (::FindNextFileW(find, &data));
+  ::FindClose(find);
+  return isFound;
+}
+
+}  // namespace
+
+// Files whose paths exceed MAX_PATH, kept in C:\Users\Public rather than the temporary
+// directory, which a filter driver may sit in front of. This process is not long path
+// aware, so the file functions take such paths only in their \\?\ form, as they do in
+// most processes usvfs hooks.
+class USVFSLongPathTest : public testing::Test
+{
+public:
+  void SetUp() override
+  {
+    SHMLogger::create("usvfs");
+    usvfsInitLogging();
+    auto params = defaultUsvfsParams();
+    m_context.reset(usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+
+    m_root    = L"C:\\Users\\Public\\tvfs_long_path_" +
+                std::to_wstring(::GetCurrentProcessId());
+    m_longDir = m_root;
+    for (wchar_t letter = L'a'; letter < L'g'; ++letter) {
+      m_longDir += L'\\' + std::wstring(48, letter);
+    }
+    createDirectories(m_longDir);
+    createDirectories(dataDir());
+    writeFile(longFile(), "[section]\r\nkey=value\r\n");
+  }
+
+  void TearDown() override
+  {
+    removeTree(m_root);
+    m_context.reset();
+
+    std::array<char, 1024> buffer;
+    while (SHMLogger::instance().tryGet(buffer.data(), buffer.size())) {
+      std::cout << buffer.data() << std::endl;
+    }
+    SHMLogger::free();
+  }
+
+protected:
+  // a short directory, where the tests map the long files in
+  std::wstring dataDir() const { return m_root + L"\\data"; }
+  std::wstring longFile() const { return m_longDir + L"\\real.ini"; }
+
+  usvfs::RedirectionTreeContainer& tree() { return m_context->redirectionTable(); }
+
+  std::wstring m_root;
+  // more than MAX_PATH characters long
+  std::wstring m_longDir;
+
+private:
+  std::unique_ptr<usvfs::HookContext> m_context;
+};
+
+TEST_F(USVFSLongPathTest, GetFileAttributesHookTakesExtendedLengthPath)
+{
+  const std::wstring path = extendedLengthPath(longFile());
+  const DWORD expected    = ::GetFileAttributesW(path.c_str());
+  ASSERT_NE(INVALID_FILE_ATTRIBUTES, expected);
+
+  EXPECT_EQ(expected, usvfs::hook_GetFileAttributesW(path.c_str()));
+}
+
+TEST_F(USVFSLongPathTest, GetFileAttributesExHookTakesExtendedLengthPath)
+{
+  const std::wstring path = extendedLengthPath(longFile());
+  WIN32_FILE_ATTRIBUTE_DATA data{};
+
+  ASSERT_TRUE(
+      usvfs::hook_GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+      << "last error=" << ::GetLastError();
+  EXPECT_EQ(::GetFileAttributesW(path.c_str()), data.dwFileAttributes);
+}
+
+TEST_F(USVFSLongPathTest, FindFirstFileExHookTakesExtendedLengthPath)
+{
+  const std::wstring pattern = extendedLengthPath(m_longDir + L"\\*");
+  WIN32_FIND_DATAW data;
+
+  const HANDLE find = usvfs::hook_FindFirstFileExW(
+      pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
+
+  EXPECT_TRUE(findsName(find, data, L"real.ini")) << "last error=" << ::GetLastError();
+}
+
+TEST_F(USVFSLongPathTest, DeleteFileHookTakesExtendedLengthPath)
+{
+  const std::wstring path = extendedLengthPath(longFile());
+
+  ASSERT_TRUE(usvfs::hook_DeleteFileW(path.c_str()))
+      << "last error=" << ::GetLastError();
+  EXPECT_EQ(INVALID_FILE_ATTRIBUTES, ::GetFileAttributesW(path.c_str()));
+}
+
+TEST_F(USVFSLongPathTest, HooksTakeVolumeGuidPath)
+{
+  wchar_t volume[MAX_PATH];
+  ASSERT_TRUE(::GetVolumeNameForVolumeMountPointW(L"C:\\", volume, MAX_PATH));
+  // "\\?\Volume{GUID}\" followed by the path without its drive
+  const std::wstring path = volume + dataDir().substr(3);
+  const DWORD expected    = ::GetFileAttributesW(path.c_str());
+  ASSERT_NE(INVALID_FILE_ATTRIBUTES, expected);
+
+  EXPECT_EQ(expected, usvfs::hook_GetFileAttributesW(path.c_str()));
+  WIN32_FIND_DATAW data;
+  const HANDLE find =
+      usvfs::hook_FindFirstFileExW((path + L"\\*").c_str(), FindExInfoBasic, &data,
+                                   FindExSearchNameMatch, nullptr, 0);
+  EXPECT_TRUE(findsName(find, data, L".")) << "last error=" << ::GetLastError();
+}
+
+TEST_F(USVFSLongPathTest, GetFileAttributesHookFollowsLongReroute)
+{
+  const std::wstring virtualFile = dataDir() + L"\\virtual.ini";
+  tree().addFile(virtualFile, usvfs::RedirectionDataLocal(toUtf8(longFile())));
+
+  EXPECT_EQ(::GetFileAttributesW(extendedLengthPath(longFile()).c_str()),
+            usvfs::hook_GetFileAttributesW(virtualFile.c_str()));
+}
+
+TEST_F(USVFSLongPathTest, GetFileAttributesExHookFollowsLongReroute)
+{
+  const std::wstring virtualFile = dataDir() + L"\\virtual.ini";
+  tree().addFile(virtualFile, usvfs::RedirectionDataLocal(toUtf8(longFile())));
+  WIN32_FILE_ATTRIBUTE_DATA data{};
+
+  ASSERT_TRUE(usvfs::hook_GetFileAttributesExW(virtualFile.c_str(),
+                                               GetFileExInfoStandard, &data))
+      << "last error=" << ::GetLastError();
+  EXPECT_EQ(::GetFileAttributesW(extendedLengthPath(longFile()).c_str()),
+            data.dwFileAttributes);
+}
+
+TEST_F(USVFSLongPathTest, NtCreateFileHookOpensLongReroute)
+{
+  const std::wstring virtualFile = dataDir() + L"\\virtual.ini";
+  tree().addFile(virtualFile, usvfs::RedirectionDataLocal(toUtf8(longFile())));
+  usvfs::UnicodeString name(LR"(\??\)" + virtualFile);
+  OBJECT_ATTRIBUTES attributes{sizeof(OBJECT_ATTRIBUTES), nullptr,
+                               static_cast<PUNICODE_STRING>(name)};
+  IO_STATUS_BLOCK status;
+  HANDLE file = INVALID_HANDLE_VALUE;
+  // the FILE_OPEN disposition of winternl.h, which this test does not include
+  constexpr ULONG openDisposition = 0x00000001;
+
+  ASSERT_EQ(STATUS_SUCCESS,
+            usvfs::hook_NtCreateFile(
+                &file, FILE_GENERIC_READ, &attributes, &status, nullptr,
+                FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, openDisposition,
+                FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0));
+  usvfs::hook_NtClose(file);
+}
+
+TEST_F(USVFSLongPathTest, GetPrivateProfileStringHookFollowsLongReroute)
+{
+  const std::wstring virtualFile = dataDir() + L"\\virtual.ini";
+  tree().addFile(virtualFile, usvfs::RedirectionDataLocal(toUtf8(longFile())));
+  wchar_t value[16]{};
+
+  usvfs::hook_GetPrivateProfileStringW(L"section", L"key", L"", value, 16,
+                                       virtualFile.c_str());
+
+  EXPECT_STREQ(L"value", value);
+}
+
+TEST_F(USVFSLongPathTest, CopyFileExHookFollowsLongReroute)
+{
+  const std::wstring virtualFile = dataDir() + L"\\virtual.ini";
+  tree().addFile(virtualFile, usvfs::RedirectionDataLocal(toUtf8(longFile())));
+  const std::wstring copy = dataDir() + L"\\copy.ini";
+
+  ASSERT_TRUE(usvfs::hook_CopyFileExW(virtualFile.c_str(), copy.c_str(), nullptr,
+                                      nullptr, nullptr, 0))
+      << "last error=" << ::GetLastError();
+  wchar_t value[16]{};
+  ::GetPrivateProfileStringW(L"section", L"key", L"", value, 16, copy.c_str());
+  EXPECT_STREQ(L"value", value);
+}
+
+TEST_F(USVFSLongPathTest, DeleteFileHookFollowsLongReroute)
+{
+  const std::wstring virtualFile = dataDir() + L"\\deleted.ini";
+  tree().addFile(virtualFile, usvfs::RedirectionDataLocal(toUtf8(longFile())));
+
+  ASSERT_TRUE(usvfs::hook_DeleteFileW(virtualFile.c_str()))
+      << "last error=" << ::GetLastError();
+  EXPECT_EQ(INVALID_FILE_ATTRIBUTES,
+            ::GetFileAttributesW(extendedLengthPath(longFile()).c_str()));
+}
+
+TEST_F(USVFSLongPathTest, CreateDirectoryHookCreatesInLongCreateTarget)
+{
+  tree().addDirectory(dataDir(), usvfs::RedirectionDataLocal(toUtf8(m_longDir) + "\\"),
+                      usvfs::shared::FLAG_CREATETARGET);
+
+  ASSERT_TRUE(usvfs::hook_CreateDirectoryW((dataDir() + L"\\created").c_str(), nullptr))
+      << "last error=" << ::GetLastError();
+  const DWORD attributes =
+      ::GetFileAttributesW(extendedLengthPath(m_longDir + L"\\created").c_str());
+  ASSERT_NE(INVALID_FILE_ATTRIBUTES, attributes);
+  EXPECT_NE(0UL, attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 TEST_F(USVFSTestAuto, CannotCreateLinkToFileInNonexistantDirectory)
 {
   ASSERT_EQ(FALSE, usvfsVirtualLinkFile(

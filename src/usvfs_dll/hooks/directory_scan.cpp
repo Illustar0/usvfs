@@ -19,6 +19,7 @@
 
 #include <boost/filesystem.hpp>
 
+#include <dos_path.h>
 #include <loghelpers.h>
 #include <stringcast.h>
 #include <stringutils.h>
@@ -719,11 +720,7 @@ VirtualEntryReader::VirtualEntryReader(const std::vector<VirtualMatch>& matches)
     if (fullPath.filename().wstring() == L".") {
       fullPath = fullPath.parent_path();
     }
-    std::wstring sourcePath = fullPath.parent_path().wstring();
-    if (sourcePath.length() >= MAX_PATH &&
-        !ush::startswith(sourcePath.c_str(), LR"(\\?\)")) {
-      sourcePath = LR"(\\?\)" + sourcePath;
-    }
+    const std::wstring sourcePath = ush::toWin32Path(fullPath.parent_path().wstring());
     const auto [sourceIndex, isNew] =
         sourceIndexes.try_emplace(sourcePath, m_sources.size());
     if (isNew) {
@@ -899,26 +896,28 @@ struct TreeDirectorySnapshot
   std::vector<Child> children;
 };
 
-// Returns the path of a directory in the redirection tree, which leaves out the prefix
-// of the NT path the hooks track.
-bfs::path treePathOf(const UnicodeString& dirName)
+// Returns the path of a directory in the redirection tree for the NT path the hooks
+// track, or nothing for one that names no path the tree holds, such as a name relative
+// to a handle the hooks do not track.
+std::optional<bfs::path> treePathOf(const UnicodeString& dirName)
 {
-  LPCWSTR dirNameW = static_cast<LPCWSTR>(dirName);
   // fix directory name. I'd love to know why microsoft sometimes uses "\??\" vs
   // "\\?\"
-  if ((wcsncmp(dirNameW, LR"(\\?\)", 4) == 0) ||
-      (wcsncmp(dirNameW, LR"(\??\)", 4) == 0)) {
-    dirNameW += 4;
-  }
-  return bfs::path(dirNameW);
+  const std::wstring_view dirNameW(static_cast<LPCWSTR>(dirName), dirName.size());
+  const auto dirPath =
+      dirNameW.starts_with(LR"(\\?\)")
+          ? ush::DosPath::fromNt(LR"(\??\)" + std::wstring(dirNameW.substr(4)))
+          : ush::DosPath::fromNt(dirNameW);
+  return dirPath ? std::optional(bfs::path(dirPath->str())) : std::nullopt;
 }
 
 // Returns whether the redirection tree holds a directory, which takes the hook context.
 bool isInRedirectionTree(const UnicodeString& dirName)
 {
   using usvfs::HookContext;
-  return READ_CONTEXT()->redirectionTable()->findNode(treePathOf(dirName)).get() !=
-         nullptr;
+  const auto treePath = treePathOf(dirName);
+  return treePath &&
+         READ_CONTEXT()->redirectionTable()->findNode(*treePath).get() != nullptr;
 }
 
 // Copies the children of a directory out of the redirection tree, or returns nothing if
@@ -927,7 +926,10 @@ bool isInRedirectionTree(const UnicodeString& dirName)
 // to gatherVirtualEntries.
 std::optional<TreeDirectorySnapshot> snapshotTreeDirectory(const UnicodeString& dirName)
 {
-  const bfs::path treePath = treePathOf(dirName);
+  const auto treePath = treePathOf(dirName);
+  if (!treePath) {
+    return std::nullopt;
+  }
 
   // Read access, though for now it takes the same exclusive lock as write access
   // (see HookContext::readAccess), so that only the shared side is taken once the two
@@ -936,7 +938,7 @@ std::optional<TreeDirectorySnapshot> snapshotTreeDirectory(const UnicodeString& 
   // readers sharing the lock must not do that concurrently.
   using usvfs::HookContext;
   const HookContext::ConstPtr context = READ_CONTEXT();
-  const auto node                     = context->redirectionTable()->findNode(treePath);
+  const auto node = context->redirectionTable()->findNode(*treePath);
   if (node.get() == nullptr) {
     return std::nullopt;
   }

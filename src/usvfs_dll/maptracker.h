@@ -1,11 +1,16 @@
 #pragma once
 
+#include "dos_path.h"
 #include "hookcallcontext.h"
 #include "hookcontext.h"
 #include "stringcast.h"
 
 namespace usvfs
 {
+
+// The current directory the hooks track for the drive the relative `path` names, or for
+// the current drive; empty while they track none, as the process's own one is current.
+std::wstring trackedCurrentDirectory(const wchar_t* path);
 
 // returns true iff the path exists (checks only real paths)
 static inline bool pathExists(LPCWSTR fileName)
@@ -91,10 +96,14 @@ extern MapTracker k32FakeDirTracker;
 
 class RerouteW
 {
-  std::wstring m_Buffer{};
+  // the caller's path as the file functions resolve it, but with the current directory
+  // the hooks track: what the redirection tree and the trackers are keyed by
   std::wstring m_RealPath{};
-  bool m_Rerouted{false};
-  LPCWSTR m_FileName{nullptr};
+  // where the caller's path leads in the virtual file system, when that is elsewhere
+  std::optional<shared::DosPath> m_ReroutedPath{};
+  // what fileName() points to
+  std::wstring m_Buffer{};
+  bool m_HasFileName{false};
   bool m_PathCreated{false};
   bool m_NewReroute{false};
 
@@ -103,47 +112,39 @@ class RerouteW
 public:
   RerouteW() = default;
 
-  RerouteW(RerouteW&& reference)
-      : m_Buffer(std::move(reference.m_Buffer)),
-        m_RealPath(std::move(reference.m_RealPath)), m_Rerouted(reference.m_Rerouted),
-        m_PathCreated(reference.m_PathCreated), m_NewReroute(reference.m_NewReroute),
-        m_FileNode(std::move(reference.m_FileNode))
-  {
-    m_FileName           = reference.m_FileName != nullptr ? m_Buffer.c_str() : nullptr;
-    reference.m_FileName = nullptr;
-  }
-
-  RerouteW& operator=(RerouteW&& reference)
-  {
-    m_Buffer      = std::move(reference.m_Buffer);
-    m_RealPath    = std::move(reference.m_RealPath);
-    m_Rerouted    = reference.m_Rerouted;
-    m_PathCreated = reference.m_PathCreated;
-    m_NewReroute  = reference.m_NewReroute;
-    m_FileName    = reference.m_FileName != nullptr ? m_Buffer.c_str() : nullptr;
-    m_FileNode    = std::move(reference.m_FileNode);
-    return *this;
-  }
+  RerouteW(RerouteW&&)            = default;
+  RerouteW& operator=(RerouteW&&) = default;
 
   RerouteW(const RerouteW& reference)  = delete;
   RerouteW& operator=(const RerouteW&) = delete;
 
-  LPCWSTR fileName() const { return m_FileName; }
+  // The path to give the file functions, null for a null path: the rerouted path in the
+  // form they take at any length, or the caller's path as it is.
+  LPCWSTR fileName() const { return m_HasFileName ? m_Buffer.c_str() : nullptr; }
 
-  const std::wstring& buffer() const { return m_Buffer; }
+  // The path of fileName() as a DOS path, for what is not a file function: the caller
+  // it is handed back to, the loader or a process to start.
+  LPCWSTR plainFileName() const
+  {
+    return m_ReroutedPath ? m_ReroutedPath->str().c_str() : fileName();
+  }
 
-  bool wasRerouted() const { return m_Rerouted; }
+  // where the caller's path leads in the virtual file system, when that is elsewhere
+  const std::optional<shared::DosPath>& reroutedPath() const { return m_ReroutedPath; }
+
+  bool wasRerouted() const { return m_ReroutedPath.has_value(); }
 
   bool newReroute() const { return m_NewReroute; }
 
   void insertMapping(const HookContext::Ptr& context, bool directory = false)
   {
+    const std::wstring& reroutedPath = m_ReroutedPath->str();
     if (directory) {
-      addDirectoryMapping(context, m_RealPath, m_FileName);
+      addDirectoryMapping(context, m_RealPath, reroutedPath);
 
       // In case we have just created a "fake" directory, it is no longer fake and need
       // to remove it and all its parent folders from the fake map:
-      std::wstring dir = m_FileName;
+      std::wstring dir = reroutedPath;
       while (k32FakeDirTracker.erase(dir))
         dir = fs::path(dir).parent_path().wstring();
     } else {
@@ -154,10 +155,10 @@ public:
       spdlog::get("hooks")->info(
           "mapping file in vfs: {}, {}",
           shared::string_cast<std::string>(m_RealPath, shared::CodePage::UTF8),
-          shared::string_cast<std::string>(m_FileName, shared::CodePage::UTF8));
+          shared::string_cast<std::string>(reroutedPath, shared::CodePage::UTF8));
       m_FileNode = context->redirectionTable().addFile(
           m_RealPath, RedirectionDataLocal(shared::string_cast<std::string>(
-                          m_FileName, shared::CodePage::UTF8)));
+                          reroutedPath, shared::CodePage::UTF8)));
 
       k32DeleteTracker.erase(m_RealPath);
     }
@@ -190,17 +191,17 @@ public:
         m_FileNode->removeFromTree();
       else
         spdlog::get("usvfs")->warn("Node not removed: {}",
-                                   shared::string_cast<std::string>(m_FileName));
+                                   shared::string_cast<std::string>(plainFileName()));
 
       if (!directory) {
         // check if this file was the last file inside a "fake" directory then remove it
         // and possibly also its fake empty parent folders:
-        std::wstring parent = m_FileName;
+        std::wstring parent = m_ReroutedPath->str();
         while (true) {
           parent = fs::path(parent).parent_path().wstring();
           if (k32FakeDirTracker.contains(parent)) {
             dontAddToDelete = true;
-            if (RemoveDirectoryW(parent.c_str())) {
+            if (RemoveDirectoryW(shared::toWin32Path(parent).c_str())) {
               k32FakeDirTracker.erase(parent);
               spdlog::get("usvfs")->info("removed empty fake directory: {}",
                                          shared::string_cast<std::string>(parent));
@@ -217,7 +218,8 @@ public:
       }
     }
     if (addToDelete && !dontAddToDelete) {
-      k32DeleteTracker.insert(m_RealPath, m_FileName);
+      k32DeleteTracker.insert(m_RealPath,
+                              m_ReroutedPath ? m_ReroutedPath->str() : m_RealPath);
     }
   }
 
@@ -229,8 +231,9 @@ public:
           "createFakePath() refusing to create non-existing top level path: " +
           path.string());
 
-    DWORD attr = GetFileAttributesW(path.c_str());
-    DWORD err  = GetLastError();
+    const std::wstring fileFunctionPath = shared::toWin32Path(path.wstring());
+    DWORD attr                          = GetFileAttributesW(fileFunctionPath.c_str());
+    DWORD err                           = GetLastError();
     if (attr != INVALID_FILE_ATTRIBUTES) {
       if (attr & FILE_ATTRIBUTE_DIRECTORY)
         return false;  // if directory already exists all is good
@@ -248,7 +251,7 @@ public:
           path.parent_path(),
           securityAttributes);  // otherwise create parent directory (recursively)
 
-    BOOL res = CreateDirectoryW(path.c_str(), securityAttributes);
+    BOOL res = CreateDirectoryW(fileFunctionPath.c_str(), securityAttributes);
     if (res)
       k32FakeDirTracker.insert(path.wstring(), std::wstring());
     else {
@@ -306,12 +309,14 @@ public:
 
     fs::directory_iterator end_itr;
 
-    // cycle through the directory
-    for (fs::directory_iterator itr(reroutedPath); itr != end_itr; ++itr) {
+    // cycle through the directory; the tree names its entries after reroutedPath, not
+    // after the form the iterator takes it in
+    for (fs::directory_iterator itr(shared::toWin32Path(reroutedPath.wstring()));
+         itr != end_itr; ++itr) {
       // If it's not a directory, add it to the VFS, if it is recurse into it
       if (is_regular_file(itr->path())) {
         std::string fileReroutedU8 = shared::string_cast<std::string>(
-            itr->path().wstring(), shared::CodePage::UTF8);
+            (reroutedPath / itr->path().filename()).wstring(), shared::CodePage::UTF8);
         spdlog::get("hooks")->info(
             "mapping file in vfs: {}, {}",
             shared::string_cast<std::string>(
@@ -356,88 +361,53 @@ public:
     return interestingPathImpl(inPath);
   }
 
-  static fs::path absolutePath(const wchar_t* inPath)
+  // The caller's path as the file functions resolve it, but with the current directory
+  // the hooks track; nothing for a null path or one to no drive or share.
+  static std::optional<shared::DosPath> resolvePath(const wchar_t* inPath)
   {
-    if (shared::startswith(inPath, LR"(\\?\)") ||
-        shared::startswith(inPath, LR"(\??\)")) {
-      inPath += 4;
-      return inPath;
-    } else if ((shared::startswith(inPath, LR"(\\localhost\)") ||
-                shared::startswith(inPath, LR"(\\127.0.0.1\)")) &&
-               inPath[13] == L'$') {
-      std::wstring newPath;
-      newPath += towupper(inPath[12]);
-      newPath += L':';
-      newPath += &inPath[14];
-      return newPath;
-    } else if (inPath[0] == L'\0' || inPath[1] == L':') {
-      return inPath;
-    } else if (inPath[0] == L'\\' || inPath[0] == L'/') {
-      return fs::path(winapi::wide::getFullPathName(inPath).first);
+    if (inPath == nullptr) {
+      return std::nullopt;
     }
-    WCHAR currentDirectory[MAX_PATH];
-    ::GetCurrentDirectoryW(MAX_PATH, currentDirectory);
-    fs::path finalPath = fs::path(currentDirectory) / inPath;
-    return finalPath;
-    // winapi::wide::getFullPathName(inPath).first;
-  }
-
-  static fs::path canonizePath(const fs::path& inPath)
-  {
-    fs::path p = inPath.lexically_normal();
-    if (p.filename_is_dot())
-      p = p.remove_filename();
-    return p.make_preferred();
+    const auto path =
+        shared::DosPath::fromWin32(inPath, trackedCurrentDirectory(inPath));
+    return path ? localDrivePath(*path) : path;
   }
 
   static RerouteW create(const HookContext::ConstPtr& context,
                          const HookCallContext& callContext, const wchar_t* inPath,
                          bool inverse = false)
   {
-    RerouteW result;
+    RerouteW result(inPath);
+    if (!interestingPath(inPath) || !callContext.active()) {
+      return result;
+    }
+    const auto path = resolvePath(inPath);
+    if (!path) {
+      return result;
+    }
+    result.m_RealPath = path->str();
 
-    if (interestingPath(inPath) && callContext.active()) {
-      const auto& lookupPath = canonizePath(absolutePath(inPath));
-      result.m_RealPath      = lookupPath.wstring();
+    std::wstring target = k32DeleteTracker.lookup(result.m_RealPath);
+    if (!target.empty()) {
+      spdlog::get("hooks")->info("Rerouting file open to location of deleted file: {}",
+                                 shared::string_cast<std::string>(target));
+      result.rerouteTo(target);
+      result.m_NewReroute = result.wasRerouted();
+      return result;
+    }
 
-      result.m_Buffer = k32DeleteTracker.lookup(result.m_RealPath);
-      bool found      = !result.m_Buffer.empty();
-      if (found) {
-        spdlog::get("hooks")->info(
-            "Rerouting file open to location of deleted file: {}",
-            shared::string_cast<std::string>(result.m_Buffer));
-        result.m_NewReroute = true;
-      } else {
-        const RedirectionTreeContainer& table =
-            inverse ? context->inverseTable() : context->redirectionTable();
-        result.m_FileNode = table->findNode(lookupPath);
-
-        if (result.m_FileNode.get() && (!result.m_FileNode->data().linkTarget.empty() ||
-                                        result.m_FileNode->isDirectory())) {
-          if (!result.m_FileNode->data().linkTarget.empty()) {
-            result.m_Buffer = shared::string_cast<std::wstring>(
-                result.m_FileNode->data().linkTarget.c_str(), shared::CodePage::UTF8);
-          } else {
-            result.m_Buffer = result.m_FileNode->path().wstring();
-          }
-          found = true;
-        }
-      }
-      if (found) {
-        result.m_Rerouted = true;
-
-        wchar_t inIt                 = inPath[wcslen(inPath) - 1];
-        std::wstring::iterator outIt = result.m_Buffer.end() - 1;
-        if ((*outIt == L'\\' || *outIt == L'/') && !(inIt == L'\\' || inIt == L'/'))
-          result.m_Buffer.erase(outIt);
-        std::replace(result.m_Buffer.begin(), result.m_Buffer.end(), L'/', L'\\');
-      } else
-        result.m_Buffer = inPath;
-    } else if (inPath)
-      result.m_Buffer = inPath;
-
-    if (inPath)
-      result.m_FileName = result.m_Buffer.c_str();
+    const RedirectionTreeContainer& table =
+        inverse ? context->inverseTable() : context->redirectionTable();
+    result.m_FileNode = table->findNode(fs::path(result.m_RealPath));
+    if (!result.m_FileNode.get()) {
+      return result;
+    }
+    if (!result.m_FileNode->data().linkTarget.empty()) {
+      result.rerouteTo(shared::string_cast<std::wstring>(
+          result.m_FileNode->data().linkTarget.c_str(), shared::CodePage::UTF8));
+    } else if (result.m_FileNode->isDirectory()) {
+      result.rerouteTo(result.m_FileNode->path().wstring());
+    }
     return result;
   }
 
@@ -446,64 +416,54 @@ public:
                             bool createPath                          = true,
                             LPSECURITY_ATTRIBUTES securityAttributes = nullptr)
   {
-    RerouteW result;
+    RerouteW result(inPath);
+    if (!interestingPath(inPath) || !callContext.active()) {
+      return result;
+    }
+    const auto path = resolvePath(inPath);
+    if (!path) {
+      return result;
+    }
+    result.m_RealPath = path->str();
 
-    if (interestingPath(inPath) && callContext.active()) {
-      const auto& lookupPath = canonizePath(absolutePath(inPath));
-      result.m_RealPath      = lookupPath.wstring();
-
-      result.m_Buffer = k32DeleteTracker.lookup(result.m_RealPath);
-      bool found      = !result.m_Buffer.empty();
-      if (found)
-        spdlog::get("hooks")->info(
-            "Rerouting file creation to original location of deleted file: {}",
-            shared::string_cast<std::string>(result.m_Buffer));
-      else {
-        FindCreateTarget visitor;
-        RedirectionTree::VisitorFunction visitorWrapper =
-            [&](const RedirectionTree::NodePtrT& node) {
-              visitor(node);
-            };
-        context->redirectionTable()->visitPath(lookupPath, visitorWrapper);
-        if (visitor.target.get()) {
-          // the visitor has found the last (deepest in the directory hierarchy)
-          // create-target
-          fs::path relativePath =
-              shared::make_relative(visitor.target->path(), lookupPath);
-          result.m_Buffer =
-              (fs::path(visitor.target->data().linkTarget.c_str()) / relativePath)
-                  .wstring();
-          found = true;
-        }
+    std::wstring target = k32DeleteTracker.lookup(result.m_RealPath);
+    if (!target.empty()) {
+      spdlog::get("hooks")->info(
+          "Rerouting file creation to original location of deleted file: {}",
+          shared::string_cast<std::string>(target));
+    } else {
+      FindCreateTarget visitor;
+      RedirectionTree::VisitorFunction visitorWrapper =
+          [&](const RedirectionTree::NodePtrT& node) {
+            visitor(node);
+          };
+      const fs::path lookupPath(result.m_RealPath);
+      context->redirectionTable()->visitPath(lookupPath, visitorWrapper);
+      if (!visitor.target.get()) {
+        return result;
       }
+      // the visitor has found the last (deepest in the directory hierarchy)
+      // create-target
+      fs::path relativePath = shared::make_relative(visitor.target->path(), lookupPath);
+      target = (fs::path(visitor.target->data().linkTarget.c_str()) / relativePath)
+                   .wstring();
+    }
 
-      if (found) {
-        if (createPath) {
-          try {
-            FunctionGroupLock lock(MutExHookGroup::ALL_GROUPS);
-            result.m_PathCreated = createFakePath(
-                fs::path(result.m_Buffer).parent_path(), securityAttributes);
-          } catch (const std::exception& e) {
-            spdlog::get("hooks")->error(
-                "failed to create {}: {}",
-                shared::string_cast<std::string>(result.m_Buffer), e.what());
-          }
-        }
-
-        wchar_t inIt                 = inPath[wcslen(inPath) - 1];
-        std::wstring::iterator outIt = result.m_Buffer.end() - 1;
-        if ((*outIt == L'\\' || *outIt == L'/') && !(inIt == L'\\' || inIt == L'/'))
-          result.m_Buffer.erase(outIt);
-        std::replace(result.m_Buffer.begin(), result.m_Buffer.end(), L'/', L'\\');
-        result.m_Rerouted   = true;
-        result.m_NewReroute = true;
-      } else
-        result.m_Buffer = inPath;
-    } else if (inPath)
-      result.m_Buffer = inPath;
-
-    if (inPath)
-      result.m_FileName = result.m_Buffer.c_str();
+    result.rerouteTo(target);
+    if (!result.wasRerouted()) {
+      return result;
+    }
+    if (createPath) {
+      try {
+        FunctionGroupLock lock(MutExHookGroup::ALL_GROUPS);
+        result.m_PathCreated = createFakePath(
+            fs::path(result.m_ReroutedPath->str()).parent_path(), securityAttributes);
+      } catch (const std::exception& e) {
+        spdlog::get("hooks")->error("failed to create {}: {}",
+                                    shared::string_cast<std::string>(target), e.what());
+      }
+    }
+    result.m_NewReroute = true;
     return result;
   }
 
@@ -528,11 +488,53 @@ public:
       result.m_Buffer = inPath;
     if (inPath && inPath[0] && !shared::startswith(inPath, L"hid#"))
       std::replace(result.m_Buffer.begin(), result.m_Buffer.end(), L'/', L'\\');
-    result.m_FileName = result.m_Buffer.c_str();
+    result.m_HasFileName = true;
     return result;
   }
 
 private:
+  // the caller's path as it is, for fileName() to take until it is rerouted
+  explicit RerouteW(const wchar_t* inPath)
+      : m_Buffer(inPath != nullptr ? inPath : L""), m_HasFileName(inPath != nullptr)
+  {}
+
+  // An administrative share of this machine, "\\localhost\C$\dir", names the path on
+  // the drive the redirection tree keys it by.
+  static shared::DosPath localDrivePath(const shared::DosPath& path)
+  {
+    const std::wstring_view text = path.str();
+    for (const std::wstring_view host : {LR"(\\localhost\)", LR"(\\127.0.0.1\)"}) {
+      if (text.size() < host.size() ||
+          _wcsnicmp(text.data(), host.data(), host.size()) != 0) {
+        continue;
+      }
+      // "C$" followed by nothing or the path on the drive
+      const std::wstring_view share = text.substr(host.size());
+      if (share.size() < 2 || share[1] != L'$' ||
+          (share.size() > 2 && share[2] != L'\\')) {
+        continue;
+      }
+      const std::wstring drivePath =
+          std::wstring{share[0], L':', L'\\'} +
+          std::wstring(share.substr(std::min<size_t>(share.size(), 3)));
+      return shared::DosPath::fromFullPath(drivePath).value_or(path);
+    }
+    return path;
+  }
+
+  // reroutes to `target`, a path usvfs holds itself
+  void rerouteTo(const std::wstring& target)
+  {
+    m_ReroutedPath = shared::DosPath::fromFullPath(target);
+    if (!m_ReroutedPath) {
+      spdlog::get("hooks")->warn("not rerouting to a path to no drive or share: {}",
+                                 shared::string_cast<std::string>(target));
+      return;
+    }
+    m_Buffer      = m_ReroutedPath->win32Path();
+    m_HasFileName = true;
+  }
+
   struct FindCreateTarget
   {
     RedirectionTree::NodePtrT target;
@@ -674,6 +676,11 @@ public:
   bool newReroute() const { return m_reroute.newReroute(); }
   bool wasRerouted() const { return m_reroute.wasRerouted(); }
   LPCWSTR fileName() const { return m_reroute.fileName(); }
+  LPCWSTR plainFileName() const { return m_reroute.plainFileName(); }
+  const std::optional<shared::DosPath>& reroutedPath() const
+  {
+    return m_reroute.reroutedPath();
+  }
 
   void insertMapping(const HookContext::Ptr& context, bool directory = false)
   {
