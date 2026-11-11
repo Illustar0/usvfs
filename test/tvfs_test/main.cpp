@@ -384,6 +384,53 @@ TEST_F(USVFSTest, NtQueryObjectVirtualFile)
 namespace
 {
 
+std::wstring objectNameOf(HANDLE handle, NtQueryObject_type queryObject)
+{
+  // room for the longest name a UNICODE_STRING holds and its terminator
+  std::vector<char> buffer(sizeof(OBJECT_NAME_INFORMATION) + 65536);
+  EXPECT_EQ(STATUS_SUCCESS, queryObject(handle, ObjectNameInformation, buffer.data(),
+                                        static_cast<ULONG>(buffer.size()), nullptr));
+  const auto* information =
+      reinterpret_cast<const OBJECT_NAME_INFORMATION*>(buffer.data());
+  return std::wstring(information->Name.Buffer,
+                      information->Name.Length / sizeof(wchar_t));
+}
+
+}  // namespace
+
+TEST_F(USVFSTest, NtQueryObjectVirtualFileBelowVirtualDirectory)
+{
+  // the closest existing ancestor is a directory, which the system names without the
+  // trailing separator it gives the root of a drive
+  const std::wstring existingDirectory = LR"(C:\Users\Public)";
+  const HANDLE directory =
+      ::CreateFileW(existingDirectory.c_str(), FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  ASSERT_NE(INVALID_HANDLE_VALUE, directory) << "last error=" << ::GetLastError();
+  const std::wstring directoryName = objectNameOf(directory, ::NtQueryObject);
+  ::CloseHandle(directory);
+
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> context(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const std::wstring virtualFile =
+      existingDirectory + LR"(\tvfs_virtual_dir\virtual.ini)";
+  context->redirectionTable().addFile(virtualFile,
+                                      usvfs::RedirectionDataLocal(REAL_FILEA));
+  const HANDLE file =
+      hooked_NtOpenFile(virtualFile.c_str(), FILE_GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_NON_DIRECTORY_FILE);
+  ASSERT_NE(INVALID_HANDLE_VALUE, file) << "last error=" << ::GetLastError();
+
+  EXPECT_EQ(directoryName + LR"(\tvfs_virtual_dir\virtual.ini)",
+            objectNameOf(file, usvfs::hook_NtQueryObject));
+  usvfs::hook_NtClose(file);
+}
+
+namespace
+{
+
 std::wstring extendedLengthPath(const std::wstring& path)
 {
   return LR"(\\?\)" + path;
