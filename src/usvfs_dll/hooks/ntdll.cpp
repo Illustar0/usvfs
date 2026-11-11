@@ -829,11 +829,61 @@ NTSTATUS WINAPI usvfs::hook_NtQueryDirectoryFileEx(
   return res;
 }
 
-bool isWine()
+// The name the system gives the file or directory at `path`, an NT path, when it
+// exists.
+static std::optional<std::wstring> existingObjectNameOf(std::wstring_view path)
 {
-  static const bool result =
-      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
-  return result;
+  UnicodeString name(path.data(), path.size());
+  OBJECT_ATTRIBUTES attributes{
+      sizeof(OBJECT_ATTRIBUTES), nullptr, static_cast<PUNICODE_STRING>(name),
+      OBJ_CASE_INSENSITIVE,      nullptr, nullptr};
+  IO_STATUS_BLOCK status;
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  // opened natively, as the hooks would reroute a path the redirection tree holds
+  usvfs::FunctionGroupLock lock(usvfs::MutExHookGroup::ALL_GROUPS);
+  if (::NtOpenFile(&handle, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attributes, &status,
+                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                   FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT) < 0) {
+    return std::nullopt;
+  }
+  std::vector<char> buffer(sizeof(OBJECT_NAME_INFORMATION) +
+                           std::numeric_limits<USHORT>::max() + 1);
+  const NTSTATUS queried = ::NtQueryObject(handle, ObjectNameInformation, buffer.data(),
+                                           static_cast<ULONG>(buffer.size()), nullptr);
+  ::NtClose(handle);
+  if (queried < 0) {
+    return std::nullopt;
+  }
+  const auto* information =
+      reinterpret_cast<const OBJECT_NAME_INFORMATION*>(buffer.data());
+  return std::wstring(information->Name.Buffer,
+                      information->Name.Length / sizeof(wchar_t));
+}
+
+// The name NtQueryObject gives a file at `path`, the NT path the hooks track for it:
+// the name the system gives its deepest ancestor that exists, followed by the rest of
+// the path, or `path` itself where none exists. Only the system knows that name, which
+// depends on what the path crosses, such as a subst drive, a mount point or a junction,
+// and on the system itself: Windows names files \Device\HarddiskVolume1\..., Wine
+// \??\C:\....
+static std::wstring objectNameOf(std::wstring_view path)
+{
+  for (size_t prefixLength = path.size(); prefixLength > 1;) {
+    if (auto name = existingObjectNameOf(path.substr(0, prefixLength))) {
+      const std::wstring_view rest = path.substr(prefixLength);
+      if (!rest.empty() && !name->ends_with(L'\\')) {
+        name->push_back(L'\\');
+      }
+      return name->append(rest);
+    }
+    // the parent with its separator, which keeps a drive's root "\??\C:\"
+    const size_t separator = path.find_last_of(L'\\', prefixLength - 2);
+    if (separator == std::wstring_view::npos) {
+      break;
+    }
+    prefixLength = separator + 1;
+  }
+  return std::wstring(path);
 }
 
 DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryObject(
@@ -870,24 +920,8 @@ DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryObject(
         reinterpret_cast<OBJECT_NAME_INFORMATION*>(ObjectInformation);
 
     if (redir.redirected) {
-      // Wine names files \??\X:\..., as the tracked path already is, and its
-      // GetFinalPathNameByHandleW rejects \Device\ names with ERROR_GEN_FAILURE
-      std::wstring buffer(static_cast<LPCWSTR>(trackerInfo));
-      if (!isWine()) {
-        // https://learn.microsoft.com/en-us/windows/win32/fileio/displaying-volume-paths
-        //
-
-        // TODO: is that always true?
-        // path should start with \??\X: - we need to replace this by device name
-        //
-        WCHAR deviceName[MAX_PATH];
-        buffer[6] = L'\0';
-
-        QueryDosDeviceW(buffer.data() + 4, deviceName, ARRAYSIZE(deviceName));
-
-        buffer = std::wstring(deviceName) + L'\\' +
-                 std::wstring(buffer.data() + 7, buffer.size() - 7);
-      }
+      const std::wstring buffer = objectNameOf(
+          std::wstring_view(static_cast<LPCWSTR>(trackerInfo), trackerInfo.size()));
 
       // the name is put in the buffer AFTER the struct, so the required size if
       // sizeof(OBJECT_NAME_INFORMATION) + the number of bytes for the name + 2 bytes
