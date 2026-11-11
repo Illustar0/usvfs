@@ -1134,9 +1134,10 @@ DWORD WINAPI usvfs::hook_GetCurrentDirectoryW(DWORD nBufferLength, LPWSTR lpBuff
     }
   }
 
+  // a buffer too small holds no directory, and res then counts more than it holds
   if (nBufferLength)
     LOG_CALL()
-        .PARAM(std::wstring(lpBuffer, res))
+        .PARAM(res < nBufferLength ? std::wstring(lpBuffer, res) : std::wstring())
         .PARAM(nBufferLength)
         .PARAM(actualCWD.size())
         .PARAM(res)
