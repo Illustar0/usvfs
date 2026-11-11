@@ -40,6 +40,9 @@ RtlDoesFileExists_U_type RtlDoesFileExists_U;
 RtlDosPathNameToRelativeNtPathName_U_WithStatus_type
     RtlDosPathNameToRelativeNtPathName_U_WithStatus;
 RtlReleaseRelativeName_type RtlReleaseRelativeName;
+RtlDosPathNameToNtPathName_U_WithStatus_type RtlDosPathNameToNtPathName_U_WithStatus;
+RtlGetFullPathName_U_type RtlGetFullPathName_U;
+RtlDetermineDosPathNameType_U_type RtlDetermineDosPathNameType_U;
 RtlGetVersion_type RtlGetVersion;
 RtlIsNameInExpression_type RtlIsNameInExpression;
 RtlUpcaseUnicodeString_type RtlUpcaseUnicodeString;
@@ -66,6 +69,9 @@ void ntdll_declarations_init()
     LOAD_EXT(ntDLLMod, RtlDoesFileExists_U);
     LOAD_EXT(ntDLLMod, RtlDosPathNameToRelativeNtPathName_U_WithStatus);
     LOAD_EXT(ntDLLMod, RtlReleaseRelativeName);
+    LOAD_EXT(ntDLLMod, RtlDosPathNameToNtPathName_U_WithStatus);
+    LOAD_EXT(ntDLLMod, RtlGetFullPathName_U);
+    LOAD_EXT(ntDLLMod, RtlDetermineDosPathNameType_U);
     LOAD_EXT(ntDLLMod, RtlGetVersion);
     // Wine's ntdll does not export it
     RtlIsNameInExpression = reinterpret_cast<RtlIsNameInExpression_type>(

@@ -513,6 +513,18 @@ typedef struct _PUBLIC_OBJECT_BASIC_INFORMATION
   ULONG Reserved[10];
 } PUBLIC_OBJECT_BASIC_INFORMATION, *PPUBLIC_OBJECT_BASIC_INFORMATION;
 
+typedef enum _RTL_PATH_TYPE
+{
+  RtlPathTypeUnknown,
+  RtlPathTypeUncAbsolute,
+  RtlPathTypeDriveAbsolute,
+  RtlPathTypeDriveRelative,
+  RtlPathTypeRooted,
+  RtlPathTypeRelative,
+  RtlPathTypeLocalDevice,
+  RtlPathTypeRootLocalDevice
+} RTL_PATH_TYPE;
+
 typedef struct _RTL_RELATIVE_NAME
 {
   UNICODE_STRING RelativeName;
@@ -603,11 +615,17 @@ using RtlDosPathNameToRelativeNtPathName_U_WithStatus_type =
     NTSTATUS(NTAPI*)(PCWSTR DosFileName, PUNICODE_STRING NtFileName, PWSTR* FilePath,
                      PRTL_RELATIVE_NAME RelativeName);
 using RtlReleaseRelativeName_type = void(NTAPI*)(PRTL_RELATIVE_NAME RelativeName);
-using RtlGetVersion_type          = NTSTATUS(NTAPI*)(PRTL_OSVERSIONINFOW);
-using RtlIsNameInExpression_type  = BOOLEAN(NTAPI*)(PUNICODE_STRING Expression,
-                                                    PUNICODE_STRING Name,
-                                                    BOOLEAN IgnoreCase,
-                                                    PWCH UpcaseTable);
+using RtlDosPathNameToNtPathName_U_WithStatus_type =
+    NTSTATUS(NTAPI*)(PCWSTR DosFileName, PUNICODE_STRING NtFileName, PWSTR* FilePart,
+                     PRTL_RELATIVE_NAME RelativeName);
+using RtlGetFullPathName_U_type = ULONG(NTAPI*)(PCWSTR FileName, ULONG BufferLength,
+                                                PWSTR Buffer, PWSTR* FilePart);
+using RtlDetermineDosPathNameType_U_type = RTL_PATH_TYPE(NTAPI*)(PCWSTR Path);
+using RtlGetVersion_type                 = NTSTATUS(NTAPI*)(PRTL_OSVERSIONINFOW);
+using RtlIsNameInExpression_type         = BOOLEAN(NTAPI*)(PUNICODE_STRING Expression,
+                                                           PUNICODE_STRING Name,
+                                                           BOOLEAN IgnoreCase,
+                                                           PWCH UpcaseTable);
 using RtlUpcaseUnicodeString_type = NTSTATUS(NTAPI*)(PUNICODE_STRING DestinationString,
                                                      PCUNICODE_STRING SourceString,
                                                      BOOLEAN AllocateDestinationString);
@@ -628,6 +646,10 @@ extern RtlDoesFileExists_U_type RtlDoesFileExists_U;
 extern RtlDosPathNameToRelativeNtPathName_U_WithStatus_type
     RtlDosPathNameToRelativeNtPathName_U_WithStatus;
 extern RtlReleaseRelativeName_type RtlReleaseRelativeName;
+extern RtlDosPathNameToNtPathName_U_WithStatus_type
+    RtlDosPathNameToNtPathName_U_WithStatus;
+extern RtlGetFullPathName_U_type RtlGetFullPathName_U;
+extern RtlDetermineDosPathNameType_U_type RtlDetermineDosPathNameType_U;
 extern RtlGetVersion_type RtlGetVersion;
 extern RtlIsNameInExpression_type RtlIsNameInExpression;
 extern RtlUpcaseUnicodeString_type RtlUpcaseUnicodeString;
