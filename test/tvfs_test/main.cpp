@@ -211,6 +211,27 @@ TEST_F(USVFSTest, GetFileAttributesHookRedirectsFile)
   ASSERT_EQ(::GetFileAttributesW(REAL_FILEW),
             usvfs::hook_GetFileAttributesW(VIRTUAL_FILEW));
 }
+
+TEST_F(USVFSTest, GetCurrentDirectoryAHookReportsRequiredSize)
+{
+  const DWORD expected = ::GetCurrentDirectoryA(0, nullptr);
+  ASSERT_NE(0UL, expected);
+  char tooSmall[1];
+
+  EXPECT_EQ(expected, usvfs::hook_GetCurrentDirectoryA(0, nullptr));
+  EXPECT_EQ(expected, usvfs::hook_GetCurrentDirectoryA(1, tooSmall));
+}
+
+TEST_F(USVFSTest, GetCurrentDirectoryAHookCopiesDirectory)
+{
+  char expected[MAX_PATH];
+  const DWORD expectedLength = ::GetCurrentDirectoryA(MAX_PATH, expected);
+  ASSERT_NE(0UL, expectedLength);
+  char actual[MAX_PATH];
+
+  EXPECT_EQ(expectedLength, usvfs::hook_GetCurrentDirectoryA(MAX_PATH, actual));
+  EXPECT_STREQ(expected, actual);
+}
 /*
 TEST_F(USVFSTest, GetFullPathNameOnRegularCurrentDirectory)
 {

@@ -1089,16 +1089,20 @@ DWORD WINAPI usvfs::hook_GetCurrentDirectoryA(DWORD nBufferLength, LPSTR lpBuffe
 
   HOOK_START
 
-  std::wstring buffer;
-  buffer.resize(nBufferLength);
-
   PRE_REALCALL
-  res = GetCurrentDirectoryW(nBufferLength, &buffer[0]);
+  const std::wstring currentDirectory = winapi::wide::getCurrentDirectory();
   POST_REALCALL
 
-  if (res > 0) {
-    res = WideCharToMultiByte(CP_ACP, 0, buffer.c_str(), res + 1, lpBuffer,
-                              nBufferLength, nullptr, nullptr);
+  // in bytes and with the terminating null, as GetCurrentDirectoryA reports the size of
+  // a buffer too small; the length it returns otherwise leaves the null out
+  const int size = WideCharToMultiByte(CP_ACP, 0, currentDirectory.c_str(), -1, nullptr,
+                                       0, nullptr, nullptr);
+  if (size > 0 && static_cast<DWORD>(size) > nBufferLength) {
+    res = static_cast<DWORD>(size);
+  } else if (size > 0) {
+    res = WideCharToMultiByte(CP_ACP, 0, currentDirectory.c_str(), -1, lpBuffer,
+                              static_cast<int>(nBufferLength), nullptr, nullptr) -
+          1;
   }
 
   HOOK_END
