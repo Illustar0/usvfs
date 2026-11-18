@@ -47,7 +47,6 @@ RtlGetVersion_type RtlGetVersion;
 RtlIsNameInExpression_type RtlIsNameInExpression;
 RtlUpcaseUnicodeString_type RtlUpcaseUnicodeString;
 RtlUpcaseUnicodeChar_type RtlUpcaseUnicodeChar;
-NtTerminateProcess_type NtTerminateProcess;
 
 static bool ntdll_initialized;
 
@@ -81,7 +80,6 @@ void ntdll_declarations_init()
     }
     LOAD_EXT(ntDLLMod, RtlUpcaseUnicodeString);
     LOAD_EXT(ntDLLMod, RtlUpcaseUnicodeChar);
-    LOAD_EXT(ntDLLMod, NtTerminateProcess);
 
     ntdll_initialized = true;
   }

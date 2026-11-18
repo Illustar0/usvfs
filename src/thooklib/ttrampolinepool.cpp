@@ -43,6 +43,11 @@ TrampolinePool* TrampolinePool::s_Instance = nullptr;
 namespace
 {
 
+  using ShutdownInProgressFn = BOOLEAN(NTAPI*)();
+  /// Null when ntdll does not export RtlDllShutdownInProgress.
+  const auto dllShutdownInProgress = reinterpret_cast<ShutdownInProgressFn>(
+      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "RtlDllShutdownInProgress"));
+
   /// The hook callbacks running on one thread. While `activeCallbacks` is non-zero,
   /// the thread holds `m_ActiveCallbacksLock` shared once, however deeply they nest.
   struct ThreadGuards
@@ -118,6 +123,11 @@ void TrampolinePool::initialize()
 {
   if (!s_Instance)
     s_Instance = new TrampolinePool();
+}
+
+bool TrampolinePool::processShutdownInProgress() noexcept
+{
+  return dllShutdownInProgress && dllShutdownInProgress();
 }
 
 void TrampolinePool::setBlock(bool block)
@@ -636,7 +646,10 @@ LPVOID TrampolinePool::release(LPVOID function)
 
 LPVOID TrampolinePool::barrierInt(LPVOID func)
 {
-  if (m_FullBlock.load(std::memory_order_acquire)) {
+  // Once the loader shuts down, threads that Windows ended may have died inside a hook
+  // still holding its locks, and detach callbacks may reach a patched API after our C++
+  // globals were destroyed. Go to the original before touching the guards or the VFS.
+  if (m_FullBlock.load(std::memory_order_acquire) || processShutdownInProgress()) {
     return nullptr;
   }
 

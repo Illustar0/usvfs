@@ -157,10 +157,6 @@ public:
 
   void updateParameters() const;
 
-  void registerDelayed(std::future<int> delayed);
-
-  std::vector<std::future<int>>& delayed();
-
 private:
   static void unlock(HookContext* instance);
   static void unlockShared(const HookContext* instance);
@@ -175,8 +171,6 @@ private:
   SharedParameters* m_Parameters{nullptr};
   RedirectionTreeContainer m_Tree;
   RedirectionTreeContainer m_InverseTree;
-
-  std::vector<std::future<int>> m_Futures;
 
   mutable std::map<DataIDT, boost::any> m_CustomData;
 

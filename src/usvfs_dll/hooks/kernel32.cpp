@@ -1871,37 +1871,3 @@ BOOL WINAPI usvfs::hook_WritePrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lp
 
   return res;
 }
-
-VOID WINAPI usvfs::hook_ExitProcess(UINT exitCode)
-{
-  HOOK_START
-
-  {
-    HookContext::Ptr context = WRITE_CONTEXT();
-
-    std::vector<std::future<int>>& delayed = context->delayed();
-
-    if (!delayed.empty()) {
-      // ensure all delayed tasks are completed before we exit the process
-      for (std::future<int>& delayedOp : delayed) {
-        delayedOp.get();
-      }
-      delayed.clear();
-    }
-  }
-
-  // exitprocess doesn't return so logging the call after the real call doesn't
-  // make much sense.
-  // nor does any pre/post call macro
-  LOG_CALL().PARAM(exitCode);
-
-  // the vfs is disconnected by the NtTerminateProcess() hook, once ExitProcess()
-  // has ended the other threads that could still be running the hooks
-
-  //  HookManager::instance().removeHook("ExitProcess");
-  //  PRE_REALCALL
-  ::ExitProcess(exitCode);
-  //  POST_REALCALL
-
-  HOOK_END
-}

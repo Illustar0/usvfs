@@ -605,9 +605,6 @@ using NtCreateFile_type = NTSTATUS(WINAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIB
 
 using NtClose_type = NTSTATUS(WINAPI*)(HANDLE);
 
-using NtTerminateProcess_type = NTSTATUS(WINAPI*)(HANDLE ProcessHandle,
-                                                  NTSTATUS ExitStatus);
-
 // Rtl
 
 using RtlDoesFileExists_U_type = NTSYSAPI BOOLEAN(NTAPI*)(PCWSTR);
@@ -641,7 +638,6 @@ extern NtQueryInformationByName_type NtQueryInformationByName;
 extern NtOpenFile_type NtOpenFile;
 extern NtCreateFile_type NtCreateFile;
 extern NtClose_type NtClose;
-extern NtTerminateProcess_type NtTerminateProcess;
 extern RtlDoesFileExists_U_type RtlDoesFileExists_U;
 extern RtlDosPathNameToRelativeNtPathName_U_WithStatus_type
     RtlDosPathNameToRelativeNtPathName_U_WithStatus;

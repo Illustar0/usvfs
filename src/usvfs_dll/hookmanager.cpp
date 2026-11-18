@@ -235,8 +235,6 @@ void HookManager::initHooks()
   installHook(kbaseMod, k32Mod, "SetCurrentDirectoryA", hook_SetCurrentDirectoryA);
   installHook(kbaseMod, k32Mod, "SetCurrentDirectoryW", hook_SetCurrentDirectoryW);
 
-  installHook(kbaseMod, k32Mod, "ExitProcess", hook_ExitProcess);
-
   installHook(kbaseMod, k32Mod, "CreateProcessInternalW", hook_CreateProcessInternalW,
               reinterpret_cast<LPVOID*>(&CreateProcessInternalW));
 
@@ -285,7 +283,6 @@ void HookManager::initHooks()
   installHook(ntdllMod, nullptr, "NtOpenFile", hook_NtOpenFile);
   installHook(ntdllMod, nullptr, "NtCreateFile", hook_NtCreateFile);
   installHook(ntdllMod, nullptr, "NtClose", hook_NtClose);
-  installHook(ntdllMod, nullptr, "NtTerminateProcess", hook_NtTerminateProcess);
 
   installHook(kbaseMod, k32Mod, "LoadLibraryExA", hook_LoadLibraryExA);
   installHook(kbaseMod, k32Mod, "LoadLibraryExW", hook_LoadLibraryExW);

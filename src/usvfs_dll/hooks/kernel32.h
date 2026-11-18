@@ -111,6 +111,4 @@ DLLEXPORT BOOL WINAPI hook_WritePrivateProfileStringW(LPCWSTR lpAppName,
                                                       LPCWSTR lpString,
                                                       LPCWSTR lpFileName);
 
-DLLEXPORT VOID WINAPI hook_ExitProcess(UINT exitCode);
-
 }  // namespace usvfs

@@ -51,6 +51,10 @@ public:
   /// Call initialize before you use the TrampolinePool
   static void initialize();
 
+  /// Reports whether the loader has begun running process detach callbacks. Safe to
+  /// call at any time, including from those callbacks.
+  static bool processShutdownInProgress() noexcept;
+
   static TrampolinePool& instance()
   {
     // This is a very very sensitive place so we want to keep this function as simple as

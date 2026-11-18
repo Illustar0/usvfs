@@ -333,7 +333,8 @@ LONG WINAPI VEHandler(PEXCEPTION_POINTERS exceptionPtrs)
   // NOTICE: don't use logger in VEHandler as it can cause another fault causing
   // VEHandler to be called again and so on.
 
-  if ((exceptionPtrs->ExceptionRecord->ExceptionCode < 0x80000000)  // non-critical
+  if (HookLib::TrampolinePool::processShutdownInProgress() ||
+      (exceptionPtrs->ExceptionRecord->ExceptionCode < 0x80000000)  // non-critical
       ||
       (exceptionPtrs->ExceptionRecord->ExceptionCode == 0xe06d7363)) {  // cpp exception
     // don't report non-critical exceptions
@@ -471,6 +472,13 @@ BOOL WINAPI usvfsConnectVFS(const usvfsParameters* params)
 
 void WINAPI usvfsDisconnectVFS()
 {
+  // Guards external callers, such as a DllMain detach handler, since usvfs itself never
+  // disconnects during process shutdown. Windows may already have ended threads that
+  // hold hook locks, so waiting for the running hooks could never finish.
+  if (HookLib::TrampolinePool::processShutdownInProgress()) {
+    return;
+  }
+
   if (spdlog::get("usvfs").get() == nullptr) {
     // create temporary logger so we don't get null-pointer exceptions
     spdlog::create<spdlog::sinks::null_sink_mt>("usvfs");
@@ -913,14 +921,17 @@ const char* WINAPI usvfsVersionString()
 // DllMain
 //
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reasonForCall, LPVOID)
+BOOL APIENTRY DllMain(HMODULE module, DWORD reasonForCall, LPVOID reserved)
 {
   switch (reasonForCall) {
   case DLL_PROCESS_ATTACH: {
     dllModule = module;
   } break;
   case DLL_PROCESS_DETACH: {
-    if (exceptionHandler)
+    // A null `reserved` means the DLL is unloaded, or failed to load, while the process
+    // keeps handling exceptions, so the handler must not outlive the code it points to.
+    // A terminating process takes the handler with it.
+    if (reserved == nullptr && exceptionHandler)
       ::RemoveVectoredExceptionHandler(exceptionHandler);
   } break;
   case DLL_THREAD_ATTACH: {

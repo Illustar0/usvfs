@@ -101,6 +101,8 @@ extern "C"
   /**
    * Disconnects from a virtual filesystem and removes hooks if necessary.
    * A call from inside a hook leaves the connection active and sets ERROR_BUSY.
+   * A call during process shutdown does nothing; the hooks and the connection end
+   * with the process.
    */
   DLLEXPORT void WINAPI usvfsDisconnectVFS();
 

@@ -306,16 +306,6 @@ HookContext::librariesToForceLoad(const std::wstring& processName)
   return wv;
 }
 
-void HookContext::registerDelayed(std::future<int> delayed)
-{
-  m_Futures.push_back(std::move(delayed));
-}
-
-std::vector<std::future<int>>& HookContext::delayed()
-{
-  return m_Futures;
-}
-
 void HookContext::unlock(HookContext* instance)
 {
   instance->m_Lock.unlock();

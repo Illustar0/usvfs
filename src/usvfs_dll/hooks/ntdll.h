@@ -51,7 +51,4 @@ DLLEXPORT NTSTATUS WINAPI hook_NtCreateFile(
 
 DLLEXPORT NTSTATUS WINAPI hook_NtClose(HANDLE Handle);
 
-DLLEXPORT NTSTATUS WINAPI hook_NtTerminateProcess(HANDLE ProcessHandle,
-                                                  NTSTATUS ExitStatus);
-
 }  // namespace usvfs
