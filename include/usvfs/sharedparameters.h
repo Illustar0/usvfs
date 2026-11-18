@@ -2,6 +2,7 @@
 
 #include "dllimport.h"
 #include "usvfsparameters.h"
+#include <boost/container/flat_map.hpp>
 #include <shared_memory.h>
 
 namespace usvfs
@@ -43,9 +44,13 @@ public:
                           std::chrono::milliseconds delayProcess);
 
   std::size_t registeredProcessCount() const;
+  /// Returns the registered processes, including any that exited since the last
+  /// removeExitedProcesses().
   std::vector<DWORD> registeredProcesses() const;
   void registerProcess(DWORD pid);
   void unregisterProcess(DWORD pid);
+  /// Removes the processes that have exited, including those that never unregistered.
+  void removeExitedProcesses();
 
   void blacklistExecutable(const std::string& name);
   void clearExecutableBlacklist();
@@ -66,7 +71,8 @@ public:
 private:
   using StringAllocatorT = shared::VoidAllocatorT::rebind<shared::StringT>::other;
 
-  using DWORDAllocatorT = shared::VoidAllocatorT::rebind<DWORD>::other;
+  using ProcessAllocatorT =
+      shared::VoidAllocatorT::rebind<std::pair<DWORD, FILETIME>>::other;
 
   using ForcedLibraryAllocatorT = shared::VoidAllocatorT::rebind<ForcedLibrary>::other;
 
@@ -75,7 +81,7 @@ private:
                                  StringAllocatorT>;
 
   using ProcessList =
-      boost::container::flat_set<DWORD, std::less<DWORD>, DWORDAllocatorT>;
+      boost::container::flat_map<DWORD, FILETIME, std::less<DWORD>, ProcessAllocatorT>;
 
   using FileSuffixSkipList =
       boost::container::flat_set<shared::StringT, std::less<shared::StringT>,

@@ -1,9 +1,43 @@
+#include <exceptionex.h>
 #include <logging.h>
 #include <sharedparameters.h>
 #include <usvfsparametersprivate.h>
 
 namespace usvfs
 {
+
+namespace
+{
+
+  /// Reads the creation time used to distinguish different owners of the same PID.
+  bool readCreationTime(HANDLE process, FILETIME& creation)
+  {
+    FILETIME exit, kernel, user;
+    return ::GetProcessTimes(process, &creation, &exit, &kernel, &user);
+  }
+
+  /// Returns whether the process registered as `pid` at `registeredCreation` is gone:
+  /// no process has the PID, its process object is signaled, or the PID now belongs to
+  /// a newer process.
+  bool hasExited(DWORD pid, const FILETIME& registeredCreation)
+  {
+    HANDLE process =
+        ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr) {
+      // An access failure alone is not proof that the process has ended.
+      return ::GetLastError() == ERROR_INVALID_PARAMETER;
+    }
+    ON_BLOCK_EXIT([process]() {
+      ::CloseHandle(process);
+    });
+
+    FILETIME creation;
+    return ::WaitForSingleObject(process, 0) == WAIT_OBJECT_0 ||
+           (readCreationTime(process, creation) &&
+            ::CompareFileTime(&creation, &registeredCreation) != 0);
+  }
+
+}  // namespace
 
 ForcedLibrary::ForcedLibrary(const std::string& process, const std::string& path,
                              const shared::VoidAllocatorT& alloc)
@@ -92,13 +126,37 @@ std::size_t SharedParameters::registeredProcessCount() const
 std::vector<DWORD> SharedParameters::registeredProcesses() const
 {
   bi::scoped_lock lock(m_mutex);
-  return {m_processList.begin(), m_processList.end()};
+  std::vector<DWORD> pids;
+  pids.reserve(m_processList.size());
+  for (const auto& [pid, creation] : m_processList) {
+    pids.push_back(pid);
+  }
+  return pids;
 }
 
 void SharedParameters::registerProcess(DWORD pid)
 {
+  const bool isCurrent = pid == ::GetCurrentProcessId();
+  HANDLE process = isCurrent
+                       ? ::GetCurrentProcess()
+                       : ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (process == nullptr) {
+    return;
+  }
+  ON_BLOCK_EXIT([=]() {
+    if (!isCurrent)
+      ::CloseHandle(process);
+  });
+
+  FILETIME creation;
+  if (!readCreationTime(process, creation)) {
+    spdlog::get("usvfs")->error("cannot read creation time of process {}", pid);
+    return;
+  }
+
+  removeExitedProcesses();
   bi::scoped_lock lock(m_mutex);
-  m_processList.insert(pid);
+  m_processList.insert_or_assign(pid, creation);
 }
 
 void SharedParameters::unregisterProcess(DWORD pid)
@@ -115,6 +173,30 @@ void SharedParameters::unregisterProcess(DWORD pid)
   }
 
   spdlog::get("usvfs")->error("cannot unregister process {}, not in list", pid);
+}
+
+void SharedParameters::removeExitedProcesses()
+{
+  std::vector<std::pair<DWORD, FILETIME>> snapshot;
+  {
+    bi::scoped_lock lock(m_mutex);
+    snapshot.assign(m_processList.begin(), m_processList.end());
+  }
+
+  for (const auto& [pid, creation] : snapshot) {
+    if (!hasExited(pid, creation)) {
+      continue;
+    }
+
+    // The check ran without the lock, so a new process may have registered the PID
+    // since; remove the entry only if it is still the one that was checked.
+    bi::scoped_lock lock(m_mutex);
+    auto current = m_processList.find(pid);
+    if (current != m_processList.end() &&
+        ::CompareFileTime(&current->second, &creation) == 0) {
+      m_processList.erase(current);
+    }
+  }
 }
 
 void SharedParameters::blacklistExecutable(const std::string& name)

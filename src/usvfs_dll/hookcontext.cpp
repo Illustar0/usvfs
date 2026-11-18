@@ -190,8 +190,9 @@ void HookContext::unregisterCurrentProcess()
   m_Parameters->unregisterProcess(::GetCurrentProcessId());
 }
 
-std::vector<DWORD> HookContext::registeredProcesses() const
+std::vector<DWORD> HookContext::runningProcesses()
 {
+  m_Parameters->removeExitedProcesses();
   return m_Parameters->registeredProcesses();
 }
 

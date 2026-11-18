@@ -131,7 +131,8 @@ public:
 
   void registerProcess(DWORD pid);
   void unregisterCurrentProcess();
-  std::vector<DWORD> registeredProcesses() const;
+  /// Removes the registered processes that have exited and returns the others.
+  std::vector<DWORD> runningProcesses();
 
   void blacklistExecutable(const std::wstring& executableName);
   void clearExecutableBlacklist();

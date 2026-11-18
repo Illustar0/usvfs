@@ -491,29 +491,6 @@ void WINAPI usvfsDisconnectVFS()
   }
 }
 
-bool processStillActive(DWORD pid)
-{
-  HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-
-  if (proc == nullptr) {
-    return false;
-  }
-
-  ON_BLOCK_EXIT([&]() {
-    if (proc != INVALID_HANDLE_VALUE)
-      ::CloseHandle(proc);
-  });
-
-  DWORD exitCode;
-  if (!GetExitCodeProcess(proc, &exitCode)) {
-    spdlog::get("usvfs")->warn("failed to query exit code on process {}: {}", pid,
-                               ::GetLastError());
-    return false;
-  } else {
-    return exitCode == STILL_ACTIVE;
-  }
-}
-
 BOOL WINAPI usvfsGetVFSProcessList(size_t* count, LPDWORD processIDs)
 {
   if (count == nullptr) {
@@ -521,22 +498,11 @@ BOOL WINAPI usvfsGetVFSProcessList(size_t* count, LPDWORD processIDs)
     return FALSE;
   }
 
-  if (context == nullptr) {
-    *count = 0;
-  } else {
-    std::vector<DWORD> pids = context->registeredProcesses();
-    size_t realCount        = 0;
-    for (DWORD pid : pids) {
-      if (processStillActive(pid)) {
-        if ((realCount < *count) && (processIDs != nullptr)) {
-          processIDs[realCount] = pid;
-        }
-
-        ++realCount;
-      }  // else the process has already ended
-    }
-    *count = realCount;
+  const auto pids = context ? context->runningProcesses() : std::vector<DWORD>{};
+  if (processIDs != nullptr) {
+    std::copy_n(pids.begin(), std::min(*count, pids.size()), processIDs);
   }
+  *count = pids.size();
   return TRUE;
 }
 
@@ -550,21 +516,20 @@ BOOL WINAPI usvfsGetVFSProcessList2(size_t* count, DWORD** buffer)
   *count  = 0;
   *buffer = nullptr;
 
-  std::vector<DWORD> pids = context->registeredProcesses();
-  auto last               = std::remove_if(pids.begin(), pids.end(), [](DWORD id) {
-    return !processStillActive(id);
-  });
-
-  pids.erase(last, pids.end());
+  const auto pids = context ? context->runningProcesses() : std::vector<DWORD>{};
 
   if (pids.empty()) {
     return TRUE;
   }
 
+  auto* result = static_cast<DWORD*>(std::calloc(pids.size(), sizeof(DWORD)));
+  if (result == nullptr) {
+    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+    return FALSE;
+  }
+  std::copy(pids.begin(), pids.end(), result);
   *count  = pids.size();
-  *buffer = static_cast<DWORD*>(std::calloc(pids.size(), sizeof(DWORD)));
-
-  std::copy(pids.begin(), pids.end(), *buffer);
+  *buffer = result;
 
   return TRUE;
 }
