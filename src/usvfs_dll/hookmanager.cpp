@@ -75,6 +75,7 @@ HookManager::~HookManager()
   spdlog::get("hooks")->debug("end hook of process {}", GetCurrentProcessId());
   removeHooks();
   m_Context.unregisterCurrentProcess();
+  s_Instance = nullptr;
 }
 
 HookManager& HookManager::instance()
