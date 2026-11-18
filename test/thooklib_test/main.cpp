@@ -300,16 +300,25 @@ TEST_F(HookingTest, ReleasedThreadCallsOriginalFunction)
   EXPECT_EQ(INVALID_HANDLE_VALUE, afterRelease);
 }
 
+TEST_F(HookingTest, CannotWaitForCallbacksFromInsideOne)
+{
+  auto& pool = TrampolinePool::instance();
+  int runningHook;
+  ASSERT_NE(nullptr, pool.barrier(&runningHook));
+  EXPECT_FALSE(TrampolinePool::canBlockAndWait());
+  pool.release(&runningHook);
+  EXPECT_TRUE(TrampolinePool::canBlockAndWait());
+}
+
 TEST_F(HookingTest, DisconnectWaitsForAdmittedCallbacks)
 {
   auto& pool = TrampolinePool::instance();
   int runningHook;
   int nextHook;
   ASSERT_NE(nullptr, pool.barrier(&runningHook));
-  EXPECT_FALSE(pool.blockAndWait());
 
   auto disconnect = std::async(std::launch::async, [&pool] {
-    return pool.blockAndWait();
+    pool.blockAndWait();
   });
   // The other thread closes admission at an unknown moment, so retry until a callback
   // is refused, releasing each one admitted before that.
@@ -326,7 +335,7 @@ TEST_F(HookingTest, DisconnectWaitsForAdmittedCallbacks)
   EXPECT_TRUE(blocked);
   EXPECT_EQ(disconnect.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
   pool.release(&runningHook);
-  EXPECT_TRUE(disconnect.get());
+  disconnect.get();
   pool.setBlock(false);
 }
 

@@ -135,17 +135,17 @@ void TrampolinePool::setBlock(bool block)
   m_FullBlock.store(block, std::memory_order_release);
 }
 
-bool TrampolinePool::blockAndWait()
+bool TrampolinePool::canBlockAndWait() noexcept
 {
   const auto* guards = findThreadGuards();
-  if (guards && guards->activeCallbacks != 0) {
-    return false;
-  }
+  return guards == nullptr || guards->activeCallbacks == 0;
+}
 
+void TrampolinePool::blockAndWait()
+{
   setBlock(true);
   ::AcquireSRWLockExclusive(&m_ActiveCallbacksLock);
   ::ReleaseSRWLockExclusive(&m_ActiveCallbacksLock);
-  return true;
 }
 
 #if BOOST_ARCH_X86_64

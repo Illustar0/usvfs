@@ -36,6 +36,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 // note that there's a mix of boost and std filesystem stuff in this file and
 // that they're not completely compatible
 #include <filesystem>
+#include <mutex>
 
 namespace bfs = boost::filesystem;
 namespace ush = usvfs::shared;
@@ -50,6 +51,33 @@ HMODULE dllModule              = nullptr;
 PVOID exceptionHandler         = nullptr;
 CrashDumpsType usvfs_dump_type = CrashDumpsType::None;
 std::wstring usvfs_dump_path;
+
+namespace
+{
+
+/// Serializes the calls that create and destroy `manager` and `context`. It wraps an
+/// SRW lock, which needs no constructor or destructor, for use with std::unique_lock.
+struct ConnectionMutex
+{
+  SRWLOCK srwLock = SRWLOCK_INIT;
+
+  void lock() { ::AcquireSRWLockExclusive(&srwLock); }
+  bool try_lock() { return ::TryAcquireSRWLockExclusive(&srwLock) != 0; }
+  void unlock() { ::ReleaseSRWLockExclusive(&srwLock); }
+} connectionMutex;
+
+/// Takes `connectionMutex`. A thread that cannot wait for running hooks only tries to,
+/// since the holder may be waiting for those hooks, and gets an unowned lock if another
+/// thread holds it.
+std::unique_lock<ConnectionMutex> lockConnection(bool canWaitForHooks)
+{
+  if (canWaitForHooks) {
+    return std::unique_lock(connectionMutex);
+  }
+  return std::unique_lock(connectionMutex, std::try_to_lock);
+}
+
+}  // namespace
 
 // this is called for every single file, so it's a bit long winded, but it's
 // as fast as it gets, probably
@@ -414,11 +442,15 @@ void __cdecl InitHooks(LPVOID parameters, size_t)
       static_cast<int>(params->crashDumpsType), params->crashDumpsPath);
 
   try {
-    manager = new usvfs::HookManager(*params, dllModule);
+    std::vector<std::wstring> libraries;
+    {
+      // Released before loading the libraries, whose DllMain may connect or disconnect.
+      std::unique_lock lock(connectionMutex);
+      manager = new usvfs::HookManager(*params, dllModule);
 
-    auto context   = manager->context();
-    auto exePath   = boost::dll::program_location();
-    auto libraries = context->librariesToForceLoad(exePath.filename().c_str());
+      auto exePath = boost::dll::program_location();
+      libraries = manager->context()->librariesToForceLoad(exePath.filename().c_str());
+    }
     for (auto library : libraries) {
       if (std::filesystem::exists(library)) {
         const auto ret = LoadLibraryExW(library.c_str(), NULL, 0);
@@ -452,6 +484,35 @@ BOOL WINAPI usvfsCreateVFS(const usvfsParameters* p)
   return usvfsConnectVFS(p);
 }
 
+/// Removes the hooks and frees the context, with `connectionMutex` held. Returns false,
+/// leaving the VFS connected, when hooks are installed and the calling thread cannot
+/// wait for them to return.
+static bool disconnectLocked(bool canWaitForHooks)
+{
+  if (spdlog::get("usvfs").get() == nullptr) {
+    // create temporary logger so we don't get null-pointer exceptions
+    spdlog::create<spdlog::sinks::null_sink_mt>("usvfs");
+  }
+
+  spdlog::get("usvfs")->debug("remove from process {}", GetCurrentProcessId());
+
+  if (manager != nullptr) {
+    if (!canWaitForHooks) {
+      return false;
+    }
+    HookLib::TrampolinePool::instance().blockAndWait();
+    delete manager;
+    manager = nullptr;
+  }
+
+  if (context != nullptr) {
+    delete context;
+    context = nullptr;
+    spdlog::get("usvfs")->debug("vfs unloaded");
+  }
+  return true;
+}
+
 BOOL WINAPI usvfsConnectVFS(const usvfsParameters* params)
 {
   if (spdlog::get("usvfs").get() == nullptr) {
@@ -460,7 +521,12 @@ BOOL WINAPI usvfsConnectVFS(const usvfsParameters* params)
   }
 
   try {
-    usvfsDisconnectVFS();
+    const bool canWaitForHooks = HookLib::TrampolinePool::canBlockAndWait();
+    const auto lock            = lockConnection(canWaitForHooks);
+    if (!lock.owns_lock() || !disconnectLocked(canWaitForHooks)) {
+      SetLastError(ERROR_BUSY);
+      return FALSE;
+    }
     context = new usvfs::HookContext(*params, dllModule);
 
     return TRUE;
@@ -479,26 +545,10 @@ void WINAPI usvfsDisconnectVFS()
     return;
   }
 
-  if (spdlog::get("usvfs").get() == nullptr) {
-    // create temporary logger so we don't get null-pointer exceptions
-    spdlog::create<spdlog::sinks::null_sink_mt>("usvfs");
-  }
-
-  spdlog::get("usvfs")->debug("remove from process {}", GetCurrentProcessId());
-
-  if (manager != nullptr) {
-    if (!HookLib::TrampolinePool::instance().blockAndWait()) {
-      SetLastError(ERROR_BUSY);
-      return;
-    }
-    delete manager;
-    manager = nullptr;
-  }
-
-  if (context != nullptr) {
-    delete context;
-    context = nullptr;
-    spdlog::get("usvfs")->debug("vfs unloaded");
+  const bool canWaitForHooks = HookLib::TrampolinePool::canBlockAndWait();
+  const auto lock            = lockConnection(canWaitForHooks);
+  if (!lock.owns_lock() || !disconnectLocked(canWaitForHooks)) {
+    SetLastError(ERROR_BUSY);
   }
 }
 

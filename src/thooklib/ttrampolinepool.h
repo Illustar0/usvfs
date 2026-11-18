@@ -64,10 +64,13 @@ public:
 
   void setBlock(bool block);
 
-  /// Stops admitting hook callbacks and waits for the running ones to return. Returns
-  /// false, changing nothing, when called from a callback, since it would wait for
-  /// itself.
-  bool blockAndWait();
+  /// Reports whether the calling thread may wait for running hook callbacks. It may not
+  /// from inside a callback, which would wait for itself.
+  static bool canBlockAndWait() noexcept;
+
+  /// Stops admitting hook callbacks and waits for the running ones to return. Call it
+  /// only where canBlockAndWait() holds, since it would never return otherwise.
+  void blockAndWait();
 
   ///
   /// store a stub without moving code from the original function. This is used in cases
