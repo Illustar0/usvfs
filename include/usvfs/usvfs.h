@@ -99,7 +99,8 @@ extern "C"
   DLLEXPORT BOOL WINAPI usvfsCreateVFS(const usvfsParameters* p);
 
   /**
-   * disconnect from a virtual filesystem. This removes hooks if necessary
+   * Disconnects from a virtual filesystem and removes hooks if necessary.
+   * A call from inside a hook leaves the connection active and sets ERROR_BUSY.
    */
   DLLEXPORT void WINAPI usvfsDisconnectVFS();
 

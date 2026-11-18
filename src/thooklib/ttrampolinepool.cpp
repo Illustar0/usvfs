@@ -43,32 +43,46 @@ TrampolinePool* TrampolinePool::s_Instance = nullptr;
 namespace
 {
 
-  // the barrier of each hook running on a thread, with the return address of its caller
-  typedef std::map<void*, void*> ThreadGuards;
+  /// The hook callbacks running on one thread. While `activeCallbacks` is non-zero,
+  /// the thread holds `m_ActiveCallbacksLock` shared once, however deeply they nest.
+  struct ThreadGuards
+  {
+    /// The caller's return address for each running callback, null for the others.
+    std::map<void*, void*> returnAddresses;
+    size_t activeCallbacks = 0;
+  };
 
-  // Holds the guards of each thread, reached without implicit TLS, which the loader
-  // does not set up on every thread a hook may run on.
+  /// Holds the guards of each thread, reached without implicit TLS, which the loader
+  /// does not set up on every thread a hook may run on.
   const DWORD threadGuardsSlot = ::TlsAlloc();
 
-  // left in the slot of a thread that released its guards on exit
+  /// Left in the slot of a thread that released its guards on exit.
   ThreadGuards* const RELEASED_GUARDS = reinterpret_cast<ThreadGuards*>(UINTPTR_MAX);
 
-  // Returns the guards of the calling thread, made on first use; nullptr once the
-  // thread released them on exit, or if no TLS slot was left.
-  ThreadGuards* threadGuards()
+  /// Returns the calling thread's guards, or null if it has none yet, released them on
+  /// exit, or no TLS slot was left.
+  ThreadGuards* findThreadGuards()
   {
     if (threadGuardsSlot == TLS_OUT_OF_INDEXES) {
       return nullptr;
     }
     auto* guards = static_cast<ThreadGuards*>(::TlsGetValue(threadGuardsSlot));
-    if (guards == RELEASED_GUARDS) {
+    return guards == RELEASED_GUARDS ? nullptr : guards;
+  }
+
+  /// Returns the calling thread's guards, creating them on first use. Returns null once
+  /// the thread released them on exit, or if no TLS slot was left.
+  ThreadGuards* findOrCreateThreadGuards()
+  {
+    if (threadGuardsSlot == TLS_OUT_OF_INDEXES) {
       return nullptr;
     }
+    auto* guards = static_cast<ThreadGuards*>(::TlsGetValue(threadGuardsSlot));
     if (guards == nullptr) {
       guards = new ThreadGuards();
       ::TlsSetValue(threadGuardsSlot, guards);
     }
-    return guards;
+    return guards == RELEASED_GUARDS ? nullptr : guards;
   }
 
 }  // namespace
@@ -108,7 +122,20 @@ void TrampolinePool::initialize()
 
 void TrampolinePool::setBlock(bool block)
 {
-  m_FullBlock = block;
+  m_FullBlock.store(block, std::memory_order_release);
+}
+
+bool TrampolinePool::blockAndWait()
+{
+  const auto* guards = findThreadGuards();
+  if (guards && guards->activeCallbacks != 0) {
+    return false;
+  }
+
+  setBlock(true);
+  ::AcquireSRWLockExclusive(&m_ActiveCallbacksLock);
+  ::ReleaseSRWLockExclusive(&m_ActiveCallbacksLock);
+  return true;
 }
 
 #if BOOST_ARCH_X86_64
@@ -521,15 +548,6 @@ LPVOID TrampolinePool::currentBufferAddress(LPVOID addressNear)
   return res;
 }
 
-void TrampolinePool::forceUnlockBarrier()
-{
-  if (ThreadGuards* guards = threadGuards()) {
-    for (auto& guard : *guards) {
-      guard.second = nullptr;
-    }
-  }
-}
-
 void TrampolinePool::releaseThreadState()
 {
   if (threadGuardsSlot == TLS_OUT_OF_INDEXES) {
@@ -538,7 +556,14 @@ void TrampolinePool::releaseThreadState()
   const DWORD lastError = ::GetLastError();
   auto* guards          = static_cast<ThreadGuards*>(::TlsGetValue(threadGuardsSlot));
   ::TlsSetValue(threadGuardsSlot, RELEASED_GUARDS);
-  if (guards != RELEASED_GUARDS) {
+  if (guards != nullptr && guards != RELEASED_GUARDS) {
+    // A thread can end inside a callback, for example when the progress routine that
+    // hook_CopyFileExW passes on calls ExitThread. The callback never returns to
+    // release the lock, so release it for the thread. TerminateThread sends no
+    // notification.
+    if (guards->activeCallbacks != 0) {
+      ::ReleaseSRWLockShared(&instance().m_ActiveCallbacksLock);
+    }
     delete guards;
   }
   ::SetLastError(lastError);
@@ -611,39 +636,52 @@ LPVOID TrampolinePool::release(LPVOID function)
 
 LPVOID TrampolinePool::barrierInt(LPVOID func)
 {
-  if (m_FullBlock) {
+  if (m_FullBlock.load(std::memory_order_acquire)) {
     return nullptr;
   }
 
-  ThreadGuards* guards = threadGuards();
+  ThreadGuards* guards = findOrCreateThreadGuards();
   if (guards == nullptr) {
     return nullptr;
   }
 
-  auto iter = guards->find(func);
-  if ((iter == guards->end()) || (iter->second == nullptr)) {
-    (*guards)[func] = reinterpret_cast<LPVOID>(1);
-    return &(*guards)[func];
-  } else {
+  auto& returnAddress =
+      guards->returnAddresses.try_emplace(func, nullptr).first->second;
+  if (returnAddress != nullptr) {
     return nullptr;
   }
+
+  if (guards->activeCallbacks == 0) {
+    if (!::TryAcquireSRWLockShared(&m_ActiveCallbacksLock)) {
+      return nullptr;
+    }
+    // A disconnect may have closed admission between the first check and the lock.
+    if (m_FullBlock.load(std::memory_order_acquire)) {
+      ::ReleaseSRWLockShared(&m_ActiveCallbacksLock);
+      return nullptr;
+    }
+  }
+  ++guards->activeCallbacks;
+  // Marks the callback as running until the trampoline stores the return address.
+  returnAddress = reinterpret_cast<LPVOID>(1);
+  return &returnAddress;
 }
 
 LPVOID TrampolinePool::releaseInt(LPVOID func)
 {
-  DWORD lastError      = GetLastError();
-  ThreadGuards* guards = threadGuards();
-  if (guards == nullptr || guards->find(func) == guards->end()) {
-    spdlog::get("hooks")->error("failed to release barrier for func {}", func);
-    ::SetLastError(lastError);
-    return nullptr;
+  if (auto* guards = findThreadGuards()) {
+    auto entry = guards->returnAddresses.find(func);
+    if (entry != guards->returnAddresses.end()) {
+      auto returnAddress = std::exchange(entry->second, nullptr);
+      if (--guards->activeCallbacks == 0) {
+        ::ReleaseSRWLockShared(&m_ActiveCallbacksLock);
+      }
+      return returnAddress;
+    }
   }
 
-  LPVOID res      = (*guards)[func];
-  (*guards)[func] = nullptr;
-
-  ::SetLastError(lastError);
-  return res;
+  spdlog::get("hooks")->error("failed to release barrier for func {}", func);
+  return nullptr;
 }
 
 }  // namespace HookLib

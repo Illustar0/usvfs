@@ -359,7 +359,6 @@ LONG WINAPI VEHandler(PEXCEPTION_POINTERS exceptionPtrs)
   HookLib::TrampolinePool& trampPool = HookLib::TrampolinePool::instance();
   if (&trampPool) {  // need to test this in case of crash before TrampolinePool
                      // initialized
-    trampPool.forceUnlockBarrier();
     trampPool.setBlock(true);
   }
 
@@ -480,6 +479,10 @@ void WINAPI usvfsDisconnectVFS()
   spdlog::get("usvfs")->debug("remove from process {}", GetCurrentProcessId());
 
   if (manager != nullptr) {
+    if (!HookLib::TrampolinePool::instance().blockAndWait()) {
+      SetLastError(ERROR_BUSY);
+      return;
+    }
     delete manager;
     manager = nullptr;
   }

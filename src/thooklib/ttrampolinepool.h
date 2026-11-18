@@ -21,6 +21,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #pragma once
 
 #include "asmjit_sane.h"
+#include <atomic>
 #include <logging.h>
 #include <map>
 #include <vector>
@@ -58,6 +59,11 @@ public:
   }
 
   void setBlock(bool block);
+
+  /// Stops admitting hook callbacks and waits for the running ones to return. Returns
+  /// false, changing nothing, when called from a callback, since it would wait for
+  /// itself.
+  bool blockAndWait();
 
   ///
   /// store a stub without moving code from the original function. This is used in cases
@@ -119,11 +125,6 @@ public:
   /// \return retrieve address of current trampoline buffer
   ///
   LPVOID currentBufferAddress(LPVOID addressNear);
-
-  ///
-  /// \brief forces the barrier(s) for the current thread to be released
-  ///
-  void forceUnlockBarrier();
 
   ///
   /// \brief releases the barrier state of the calling thread, which is exiting; call
@@ -208,7 +209,11 @@ private:
 
   static TrampolinePool* s_Instance;
 
-  bool m_FullBlock{false};
+  std::atomic_bool m_FullBlock{false};
+  /// Held shared by each thread with a running hook callback, once however deeply its
+  /// callbacks nest. blockAndWait() first closes admission, then takes it exclusively
+  /// to wait for them to return.
+  SRWLOCK m_ActiveCallbacksLock = SRWLOCK_INIT;
 
   BufferMap m_Buffers;
 
