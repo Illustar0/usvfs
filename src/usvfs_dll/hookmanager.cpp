@@ -96,23 +96,6 @@ LPVOID HookManager::detour(const char* functionName)
   }
 }
 
-void HookManager::removeHook(const std::string& functionName)
-{
-  auto iter = m_Hooks.find(functionName);
-  if (iter != m_Hooks.end()) {
-    try {
-      RemoveHook(iter->second);
-      m_Hooks.erase(iter);
-      spdlog::get("usvfs")->info("removed hook for {}", functionName);
-    } catch (const std::exception& e) {
-      spdlog::get("usvfs")->critical("failed to remove hook of {}: {}", functionName,
-                                     e.what());
-    }
-  } else {
-    spdlog::get("usvfs")->info("{} wasn't hooked", functionName);
-  }
-}
-
 void HookManager::logStubInt(LPVOID address)
 {
   if (m_Stubs.find(address) != m_Stubs.end()) {

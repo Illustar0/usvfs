@@ -48,16 +48,6 @@ public:
   ///
   LPVOID detour(const char* functionName);
 
-  ///
-  /// \brief remove the hook on the specified function.
-  /// \param functionName name of the function to unhook
-  /// \note This function is only exposed to allow a workaround for ExitProcess and may
-  /// be
-  ///       removed if a better solution is found there. If you have another legit use
-  ///       case, please let me know!
-  ///
-  void removeHook(const std::string& functionName);
-
 private:
   void logStubInt(LPVOID address);
   static void logStub(LPVOID address);
