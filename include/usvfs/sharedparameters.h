@@ -42,10 +42,6 @@ public:
                           const std::string& dumpPath,
                           std::chrono::milliseconds delayProcess);
 
-  std::size_t userConnected();
-  std::size_t userDisconnected();
-  std::size_t userCount();
-
   std::size_t registeredProcessCount() const;
   std::vector<DWORD> registeredProcesses() const;
   void registerProcess(DWORD pid);
@@ -101,7 +97,6 @@ private:
   CrashDumpsType m_crashDumpsType;
   shared::StringT m_crashDumpsPath;
   std::chrono::milliseconds m_delayProcess;
-  uint32_t m_userCount;
   ProcessBlacklist m_processBlacklist;
   ProcessList m_processList;
   FileSuffixSkipList m_fileSuffixSkipList;

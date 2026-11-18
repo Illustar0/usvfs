@@ -29,10 +29,9 @@ SharedParameters::SharedParameters(const usvfsParameters& reference,
       m_debugMode(reference.debugMode), m_logLevel(reference.logLevel),
       m_crashDumpsType(reference.crashDumpsType),
       m_crashDumpsPath(reference.crashDumpsPath, allocator),
-      m_delayProcess(reference.delayProcessMs), m_userCount(1),
-      m_processBlacklist(allocator), m_processList(allocator),
-      m_fileSuffixSkipList(allocator), m_directorySkipList(allocator),
-      m_forcedLibraries(allocator)
+      m_delayProcess(reference.delayProcessMs), m_processBlacklist(allocator),
+      m_processList(allocator), m_fileSuffixSkipList(allocator),
+      m_directorySkipList(allocator), m_forcedLibraries(allocator)
 {}
 
 usvfsParameters SharedParameters::makeLocal() const
@@ -82,24 +81,6 @@ void SharedParameters::setDebugParameters(LogLevel level, CrashDumpsType dumpTyp
   m_crashDumpsType = dumpType;
   m_crashDumpsPath.assign(dumpPath.begin(), dumpPath.end());
   m_delayProcess = delayProcess;
-}
-
-std::size_t SharedParameters::userConnected()
-{
-  bi::scoped_lock lock(m_mutex);
-  return ++m_userCount;
-}
-
-std::size_t SharedParameters::userDisconnected()
-{
-  bi::scoped_lock lock(m_mutex);
-  return --m_userCount;
-}
-
-std::size_t SharedParameters::userCount()
-{
-  bi::scoped_lock lock(m_mutex);
-  return m_userCount;
 }
 
 std::size_t SharedParameters::registeredProcessCount() const

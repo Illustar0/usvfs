@@ -72,10 +72,8 @@ HookContext::HookContext(const usvfsParameters& params, HMODULE module)
     throw std::runtime_error("singleton duplicate instantiation (HookContext)");
   }
 
-  const auto userCount = m_Parameters->userConnected();
-
-  spdlog::get("usvfs")->debug("context current shm: {0} (now {1} connections)",
-                              m_Parameters->currentSHMName(), userCount);
+  spdlog::get("usvfs")->debug("context current shm: {}",
+                              m_Parameters->currentSHMName());
 
   s_Instance = this;
   ++s_Generation;
@@ -95,15 +93,7 @@ HookContext::~HookContext()
 {
   spdlog::get("usvfs")->info("releasing hook context");
 
-  s_Instance           = nullptr;
-  const auto userCount = m_Parameters->userDisconnected();
-
-  if (userCount == 0) {
-    spdlog::get("usvfs")->info("removing tree {}", m_Parameters->instanceName());
-    bi::shared_memory_object::remove(m_Parameters->instanceName().c_str());
-  } else {
-    spdlog::get("usvfs")->info("{} users left", userCount);
-  }
+  s_Instance = nullptr;
 }
 
 SharedParameters* HookContext::retrieveParameters(const usvfsParameters& params)
