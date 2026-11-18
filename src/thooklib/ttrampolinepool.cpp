@@ -48,6 +48,25 @@ namespace
   const auto dllShutdownInProgress = reinterpret_cast<ShutdownInProgressFn>(
       ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "RtlDllShutdownInProgress"));
 
+  /// Reports whether the calling thread holds the loader lock, as it does in DllMain.
+  /// No API reports this, so read the lock from the PEB, at the offsets that Windows
+  /// and Wine keep stable for each architecture.
+  bool isLoaderLockHeldByCurrentThread() noexcept
+  {
+#if BOOST_ARCH_X86_64
+    constexpr size_t pebOffsetInTeb = 0x60, loaderLockOffsetInPeb = 0x110;
+#elif BOOST_ARCH_X86_32
+    constexpr size_t pebOffsetInTeb = 0x30, loaderLockOffsetInPeb = 0xa0;
+#endif
+    const auto* teb = reinterpret_cast<const BYTE*>(::NtCurrentTeb());
+    const auto* peb = *reinterpret_cast<const BYTE* const*>(teb + pebOffsetInTeb);
+    const auto* loaderLock = *reinterpret_cast<const RTL_CRITICAL_SECTION* const*>(
+        peb + loaderLockOffsetInPeb);
+    // A thread stores its ID here once it owns the lock and clears it before leaving,
+    // so even a racy read names this thread only while it holds the lock.
+    return HandleToULong(loaderLock->OwningThread) == ::GetCurrentThreadId();
+  }
+
   /// The hook callbacks running on one thread. While `activeCallbacks` is non-zero,
   /// the thread holds `m_ActiveCallbacksLock` shared once, however deeply they nest.
   struct ThreadGuards
@@ -138,7 +157,10 @@ void TrampolinePool::setBlock(bool block)
 bool TrampolinePool::canBlockAndWait() noexcept
 {
   const auto* guards = findThreadGuards();
-  return guards == nullptr || guards->activeCallbacks == 0;
+  if (guards != nullptr && guards->activeCallbacks != 0) {
+    return false;
+  }
+  return !isLoaderLockHeldByCurrentThread();
 }
 
 void TrampolinePool::blockAndWait()

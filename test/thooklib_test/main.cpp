@@ -310,6 +310,28 @@ TEST_F(HookingTest, CannotWaitForCallbacksFromInsideOne)
   EXPECT_TRUE(TrampolinePool::canBlockAndWait());
 }
 
+TEST_F(HookingTest, CannotWaitForCallbacksUnderLoaderLock)
+{
+  using LdrLockLoaderLockFn   = LONG(NTAPI*)(ULONG, ULONG*, void**);
+  using LdrUnlockLoaderLockFn = LONG(NTAPI*)(ULONG, void*);
+  HMODULE ntdll               = GetModuleHandleW(L"ntdll.dll");
+  const auto lockLoaderLock =
+      reinterpret_cast<LdrLockLoaderLockFn>(GetProcAddress(ntdll, "LdrLockLoaderLock"));
+  const auto unlockLoaderLock = reinterpret_cast<LdrUnlockLoaderLockFn>(
+      GetProcAddress(ntdll, "LdrUnlockLoaderLock"));
+  ASSERT_NE(nullptr, lockLoaderLock);
+  ASSERT_NE(nullptr, unlockLoaderLock);
+
+  ULONG disposition = 0;
+  void* cookie      = nullptr;
+  ASSERT_EQ(0, lockLoaderLock(0, &disposition, &cookie));
+  const bool canWaitUnderLock = TrampolinePool::canBlockAndWait();
+  ASSERT_EQ(0, unlockLoaderLock(0, cookie));
+
+  EXPECT_FALSE(canWaitUnderLock);
+  EXPECT_TRUE(TrampolinePool::canBlockAndWait());
+}
+
 TEST_F(HookingTest, DisconnectWaitsForAdmittedCallbacks)
 {
   auto& pool = TrampolinePool::instance();

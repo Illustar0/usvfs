@@ -65,7 +65,8 @@ public:
   void setBlock(bool block);
 
   /// Reports whether the calling thread may wait for running hook callbacks. It may not
-  /// from inside a callback, which would wait for itself.
+  /// from inside a callback, which would wait for itself, nor while it holds the loader
+  /// lock, which a callback may be waiting for, for example in LoadLibraryExW.
   static bool canBlockAndWait() noexcept;
 
   /// Stops admitting hook callbacks and waits for the running ones to return. Call it

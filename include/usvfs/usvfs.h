@@ -102,9 +102,9 @@ extern "C"
   /**
    * Disconnects from a virtual filesystem and removes hooks if necessary.
    * Connecting and disconnecting are safe to call from several threads at once.
-   * A call from inside a hook cannot wait for the running hooks. It leaves the
-   * connection active and sets ERROR_BUSY if hooks are installed, or if another thread
-   * is connecting or disconnecting.
+   * A call from inside a hook, or one holding the loader lock as DllMain does, cannot
+   * wait for the running hooks. It leaves the connection active and sets ERROR_BUSY if
+   * hooks are installed, or if another thread is connecting or disconnecting.
    * A call during process shutdown does nothing; the hooks and the connection end
    * with the process.
    */
