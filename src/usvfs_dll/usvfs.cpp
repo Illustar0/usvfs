@@ -152,6 +152,26 @@ bool shouldAddToInverseTree(std::string_view name)
 // Logging
 //
 
+namespace
+{
+
+/// Registers a logger under `name` that discards every message, unless one is
+/// registered already, so that code can log through spdlog::get(name) before
+/// usvfsInitLogging() sets up the real one. Threads may call it at once.
+void ensureLogger(const char* name)
+{
+  if (spdlog::get(name)) {
+    return;
+  }
+  try {
+    spdlog::create<spdlog::sinks::null_sink_mt>(name);
+  } catch (const spdlog::spdlog_ex&) {
+    // another thread registered one between the lookup and the registration
+  }
+}
+
+}  // namespace
+
 void InitLoggingInternal(bool toConsole, bool connectExistingSHM)
 {
   try {
@@ -186,12 +206,8 @@ void InitLoggingInternal(bool toConsole, bool connectExistingSHM)
     // TODO should really report this
     // OutputDebugStringA((boost::format("init exception: %1%\n") %
     // e.what()).str().c_str());
-    if (spdlog::get("usvfs").get() == nullptr) {
-      spdlog::create<spdlog::sinks::null_sink_mt>("usvfs");
-    }
-    if (spdlog::get("hooks").get() == nullptr) {
-      spdlog::create<spdlog::sinks::null_sink_mt>("hooks");
-    }
+    ensureLogger("usvfs");
+    ensureLogger("hooks");
   }
 
   spdlog::get("usvfs")->info("usvfs dll {} initialized in process {}",
@@ -489,11 +505,7 @@ BOOL WINAPI usvfsCreateVFS(const usvfsParameters* p)
 /// wait for them to return.
 static bool disconnectLocked(bool canWaitForHooks)
 {
-  if (spdlog::get("usvfs").get() == nullptr) {
-    // create temporary logger so we don't get null-pointer exceptions
-    spdlog::create<spdlog::sinks::null_sink_mt>("usvfs");
-  }
-
+  ensureLogger("usvfs");
   spdlog::get("usvfs")->debug("remove from process {}", GetCurrentProcessId());
 
   if (manager != nullptr) {
@@ -515,11 +527,8 @@ static bool disconnectLocked(bool canWaitForHooks)
 
 BOOL WINAPI usvfsConnectVFS(const usvfsParameters* params)
 {
-  if (spdlog::get("usvfs").get() == nullptr) {
-    // create temporary logger so we don't get null-pointer exceptions
-    spdlog::create<spdlog::sinks::null_sink_mt>("usvfs");
-  }
-
+  // before the try, as its handler logs
+  ensureLogger("usvfs");
   try {
     const bool canWaitForHooks = HookLib::TrampolinePool::canBlockAndWait();
     const auto lock            = lockConnection(canWaitForHooks);

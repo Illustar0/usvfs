@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <format>
 #include <gtest/gtest.h>
 #include <latch>
@@ -8,7 +9,12 @@
 #include <usvfs.h>
 #include <vector>
 
-TEST(Connection, ThreadsConnectAndDisconnectConcurrently)
+namespace
+{
+
+// Connects to and disconnects from the instance from several threads at once, and
+// returns how many of the connects failed.
+int connectAndDisconnectFromThreads()
 {
   auto params = std::unique_ptr<usvfsParameters, decltype(&usvfsFreeParameters)>(
       usvfsCreateParameters(), &usvfsFreeParameters);
@@ -16,7 +22,6 @@ TEST(Connection, ThreadsConnectAndDisconnectConcurrently)
       std::format("usvfs_connection_{}_instance", ::GetCurrentProcessId());
   usvfsSetInstanceName(params.get(), instance.c_str());
   usvfsSetLogLevel(params.get(), LogLevel::Warning);
-  usvfsInitLogging(false);
 
   constexpr int threadCount = 8;
   constexpr int roundCount  = 25;
@@ -36,6 +41,16 @@ TEST(Connection, ThreadsConnectAndDisconnectConcurrently)
       });
     }
   }
+  return failedConnects;
+}
 
-  EXPECT_EQ(failedConnects, 0);
+}  // namespace
+
+// Runs in a process of its own, the way a death test does, rather than to check that
+// the process dies: there the connects are the first calls into the DLL, so they also
+// race to register the fallback logger. The exit code is how many of them failed.
+TEST(ConnectionDeathTest, ThreadsConnectAndDisconnectConcurrently)
+{
+  EXPECT_EXIT(std::exit(connectAndDisconnectFromThreads()), testing::ExitedWithCode(0),
+              "");
 }
