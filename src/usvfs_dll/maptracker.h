@@ -107,8 +107,6 @@ class RerouteW
   bool m_PathCreated{false};
   bool m_NewReroute{false};
 
-  RedirectionTree::NodePtrT m_FileNode;
-
 public:
   RerouteW() = default;
 
@@ -156,7 +154,7 @@ public:
           "mapping file in vfs: {}, {}",
           shared::string_cast<std::string>(m_RealPath, shared::CodePage::UTF8),
           shared::string_cast<std::string>(reroutedPath, shared::CodePage::UTF8));
-      m_FileNode = context->redirectionTable().addFile(
+      context->redirectionTable().addFile(
           m_RealPath, RedirectionDataLocal(shared::string_cast<std::string>(
                           reroutedPath, shared::CodePage::UTF8)));
 
@@ -164,8 +162,9 @@ public:
     }
   }
 
-  // takes write access, as removing m_FileNode changes the tree even though the node
-  // is reached without going through the context
+  // Looks the mapping up again under write access rather than keeping the node create()
+  // found: the node lies in the block the tree was on then, which another thread may
+  // since have moved the tree off and unmapped.
   void removeMapping(const HookContext::Ptr& context, bool directory = false)
   {
     bool addToDelete     = false;
@@ -189,8 +188,13 @@ public:
       addToDelete = true;
 
     if (wasRerouted()) {
-      if (m_FileNode.get())
-        m_FileNode->removeFromTree();
+      // only the mapping this reroute followed, not one another thread put in its place
+      const auto node   = context->redirectionTable()->findNode(fs::path(m_RealPath));
+      const auto target = mappedTargetOf(node);
+      const auto mappedPath =
+          target ? shared::DosPath::fromFullPath(*target) : std::nullopt;
+      if (mappedPath && mappedPath->str() == m_ReroutedPath->str())
+        node->removeFromTree();
       else
         spdlog::get("usvfs")->warn("Node not removed: {}",
                                    shared::string_cast<std::string>(plainFileName()));
@@ -400,15 +404,9 @@ public:
 
     const RedirectionTreeContainer& table =
         inverse ? context->inverseTable() : context->redirectionTable();
-    result.m_FileNode = table->findNode(fs::path(result.m_RealPath));
-    if (!result.m_FileNode.get()) {
-      return result;
-    }
-    if (!result.m_FileNode->data().linkTarget.empty()) {
-      result.rerouteTo(shared::string_cast<std::wstring>(
-          result.m_FileNode->data().linkTarget.c_str(), shared::CodePage::UTF8));
-    } else if (result.m_FileNode->isDirectory()) {
-      result.rerouteTo(result.m_FileNode->path().wstring());
+    if (const auto mappedTarget =
+            mappedTargetOf(table->findNode(fs::path(result.m_RealPath)))) {
+      result.rerouteTo(*mappedTarget);
     }
     return result;
   }
@@ -522,6 +520,24 @@ private:
       return shared::DosPath::fromFullPath(drivePath).value_or(path);
     }
     return path;
+  }
+
+  // Where a node of a redirection tree leads: its link target, or the node itself for a
+  // directory without one. Nothing for a missing node or one that maps nothing.
+  static std::optional<std::wstring>
+  mappedTargetOf(const RedirectionTree::NodePtrT& node)
+  {
+    if (!node.get()) {
+      return std::nullopt;
+    }
+    if (!node->data().linkTarget.empty()) {
+      return shared::string_cast<std::wstring>(node->data().linkTarget.c_str(),
+                                               shared::CodePage::UTF8);
+    }
+    if (node->isDirectory()) {
+      return node->path().wstring();
+    }
+    return std::nullopt;
   }
 
   // reroutes to `target`, a path usvfs holds itself
