@@ -132,15 +132,20 @@ HookContext::ConstPtr HookContext::readAccess(const char*)
   // move them, so the outermost access of a thread that finds a table outdated reads
   // under the exclusive lock and moves the tables first; a nested access reads the
   // block its thread is already reading, which stays valid
-  if (isOutermostAccess &&
-      (context.m_Tree.isOutdated() || context.m_InverseTree.isOutdated())) {
+  const bool isMovingTables = isOutermostAccess && (context.m_Tree.isOutdated() ||
+                                                    context.m_InverseTree.isOutdated());
+  if (isMovingTables) {
     context.m_Lock.unlock();
     context.m_Lock.lockExclusive();
+  }
+
+  // owns the lock before the tables move, so that a move that throws releases it
+  ConstPtr access(&context, unlockShared);
+  if (isMovingTables) {
     context.m_Tree.moveToCurrentBlock();
     context.m_InverseTree.moveToCurrentBlock();
   }
-
-  return ConstPtr(&context, unlockShared);
+  return access;
 }
 
 HookContext::Ptr HookContext::writeAccess(const char*)
