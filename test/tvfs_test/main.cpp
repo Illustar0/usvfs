@@ -630,6 +630,21 @@ TEST_F(USVFSLongPathTest, FindFirstFileExHookMatchesTrailingDotOfPlainPathAsDos)
   EXPECT_FALSE(findsName(withExtension, data, L"extension.ini"));
 }
 
+TEST_F(USVFSLongPathTest, FindFirstFileExHookFindsNoFileLeftOutOfTree)
+{
+  // the directory maps the long one, whose file the redirection tree leaves out, as the
+  // skip lists of usvfsVirtualLinkDirectoryStatic do
+  tree().addDirectory(dataDir(), usvfs::RedirectionDataLocal(toUtf8(m_longDir) + "\\"),
+                      usvfs::shared::FLAG_DIRECTORY);
+  WIN32_FIND_DATAW data;
+
+  const HANDLE find =
+      usvfs::hook_FindFirstFileExW((dataDir() + L"\\real.ini").c_str(), FindExInfoBasic,
+                                   &data, FindExSearchNameMatch, nullptr, 0);
+
+  EXPECT_FALSE(findsName(find, data, L"real.ini"));
+}
+
 TEST_F(USVFSLongPathTest, DeleteFileHookTakesExtendedLengthPath)
 {
   const std::wstring path = extendedLengthPath(longFile());
