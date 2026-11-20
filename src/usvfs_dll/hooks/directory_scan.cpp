@@ -432,17 +432,29 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, HANDLE source,
   m_staging.resize(query.length);
 
   while (output.isEmpty()) {
+    // Read through the entry point of the query, so that a read fails as the query
+    // would.
     // The handle completes synchronously and the caller's notifications belong to
     // the caller's query, so this read asks for none. A restart is passed on, as the
     // native scan of the caller's handle would go on from where it was otherwise.
     // The pattern of the scan is passed on every read: the first read of a handle
     // latches it, which a reopened source needs, and ntdll ignores it otherwise.
     IO_STATUS_BLOCK status;
-    const NTSTATUS result = NtQueryDirectoryFile(
-        source, nullptr, nullptr, nullptr, &status, m_staging.data(), query.length,
-        query.informationClass, query.isSingleEntry(),
-        m_pattern ? static_cast<PUNICODE_STRING>(*m_pattern) : nullptr,
-        std::exchange(m_isRestartPending, false));
+    const ULONG flags =
+        (query.isSingleEntry() ? SL_RETURN_SINGLE_ENTRY : 0) |
+        (std::exchange(m_isRestartPending, false) ? SL_RESTART_SCAN : 0);
+    const NTSTATUS result = queryNative(
+        {.handle           = source,
+         .event            = nullptr,
+         .apcRoutine       = nullptr,
+         .apcContext       = nullptr,
+         .statusBlock      = &status,
+         .buffer           = m_staging.data(),
+         .length           = query.length,
+         .informationClass = query.informationClass,
+         .fileName = m_pattern ? static_cast<PUNICODE_STRING>(*m_pattern) : nullptr,
+         .flags    = flags,
+         .isEx     = query.isEx});
     // ntdll cuts a first record that does not fit short, and returns it again on
     // every query until a buffer holds it, so the regular entries do not end here.
     // Its name may be cut short too, which leaves no telling whether a virtual entry
