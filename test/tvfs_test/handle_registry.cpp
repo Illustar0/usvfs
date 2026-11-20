@@ -155,6 +155,26 @@ TEST(HandleRegistryTest, DestroysAnErasedValueOnlyInDestroyErased)
   EXPECT_EQ(destroyedCount, 1);
 }
 
+TEST(HandleRegistryTest, ReleasesTheValueItErases)
+{
+  int destroyedCount = 0;
+  Registry registry;
+  const auto value = std::make_shared<Counted>(destroyedCount);
+  registry.insert(handleOf(0x1230), value);
+  const Counted* released = nullptr;
+  int releaseCount        = 0;
+  const auto release      = [&](Counted& erased) noexcept {
+    released = &erased;
+    ++releaseCount;
+  };
+
+  EXPECT_TRUE(registry.erase(handleOf(0x1230), release));
+  EXPECT_FALSE(registry.erase(handleOf(0x1230), release));
+
+  EXPECT_EQ(released, value.get());
+  EXPECT_EQ(releaseCount, 1);
+}
+
 TEST(HandleRegistryTest, DestroysErasedValuesOnTheNextInsert)
 {
   int destroyedCount = 0;

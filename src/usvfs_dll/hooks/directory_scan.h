@@ -35,11 +35,11 @@ bool isInternalDirectoryIo();
 // Releases the scan of a closed handle, or of a handle value just opened again, as a
 // handle closed where the hooks do not see it leaves its scan behind:
 // DuplicateHandle with DUPLICATE_CLOSE_SOURCE into another process closes it in the
-// kernel. Returns whether the handle had a scan. Wait-free, for NtClose: the scan is
-// destroyed by the next query or by destroyErasedDirectoryScans.
+// kernel. Returns whether the handle had a scan. Wait-free, for NtClose: it closes the
+// directory the scan opened at once, or as the query reading through it returns, and
+// leaves destroying the scan to the next query or to destroyErasedDirectoryScans.
 bool eraseDirectoryScan(HANDLE handle) noexcept;
 
-// Destroys the scans that eraseDirectoryScan released, closing the handles they hold,
-// unless another thread holds the lock of the scans. Not for NtClose, as destroying a
-// scan closes handles and frees memory.
+// Destroys the scans that eraseDirectoryScan released, unless another thread holds the
+// lock of the scans. Not for NtClose, as destroying a scan frees memory.
 void destroyErasedDirectoryScans();

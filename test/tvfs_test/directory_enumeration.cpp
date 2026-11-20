@@ -2915,6 +2915,47 @@ RenamedListing listRenamingAfterTheFirstQuery(NtQueryDirectoryFile_type query,
   return result;
 }
 
+// What others may do with a directory once a listing of it closed after its first
+// query, as FindFirstFile and FindClose close a search for a name.
+struct ClosedListingAftermath
+{
+  DWORD exclusiveOpenError;
+  DWORD parentRenameError;
+};
+
+// Lists a directory through a handle of the NtOpenFile hook for one query and closes
+// the handle, then opens the directory sharing nothing and renames its parent, which
+// it names back afterwards.
+ClosedListingAftermath closeAfterTheFirstQuery(NtQueryDirectoryFile_type query,
+                                               const std::filesystem::path& path)
+{
+  const HANDLE handle = openThroughOpenHook(path);
+  EXPECT_NE(INVALID_HANDLE_VALUE, handle);
+  queryOnce(query, handle, {FileDirectoryInformation, 0x1000, true, L"*"});
+  usvfs::hook_NtClose(handle);
+
+  ClosedListingAftermath result{};
+  const HANDLE exclusive =
+      ::CreateFileW(path.c_str(), FILE_LIST_DIRECTORY, 0, nullptr, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  result.exclusiveOpenError = exclusive != INVALID_HANDLE_VALUE
+                                  ? static_cast<DWORD>(ERROR_SUCCESS)
+                                  : ::GetLastError();
+  if (exclusive != INVALID_HANDLE_VALUE) {
+    ::CloseHandle(exclusive);
+  }
+  const std::filesystem::path parent = path.parent_path();
+  std::filesystem::path renamed      = parent;
+  renamed += L"_renamed";
+  result.parentRenameError = ::MoveFileExW(parent.c_str(), renamed.c_str(), 0)
+                                 ? static_cast<DWORD>(ERROR_SUCCESS)
+                                 : ::GetLastError();
+  if (result.parentRenameError == ERROR_SUCCESS) {
+    EXPECT_TRUE(::MoveFileExW(renamed.c_str(), parent.c_str(), 0)) << ::GetLastError();
+  }
+  return result;
+}
+
 // Denies the current user listing a directory while it lives. The DACL is set through
 // a handle, as SetNamedSecurityInfoW and SetSecurityInfo pass the inheritable entries
 // on to the children, which takes listing the directory.
@@ -2991,6 +3032,29 @@ TEST_F(USVFSTest, NtQueryDirectoryFileLetsAListedDirectoryBeRenamedLikeNtdll)
   ASSERT_EQ(ERROR_SUCCESS, expected.renameError);
   EXPECT_EQ(expected.renameError, actual.renameError);
   EXPECT_EQ(expected.names, actual.names);
+}
+
+// ntdll is the reference for a listing closed before its end: no handle of it stays
+// open, so others may open the directory sharing nothing and rename a parent. The hook
+// holds the physical directory open to read the regular entries from, until NtClose.
+TEST_F(USVFSTest, NtCloseReleasesTheDirectoryOfAnUnfinishedListingLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  const ModdedDirectory modded = mapModsWithSkippedEntries(
+      ctx->redirectionTable(), test::path_of_test_temp(L"physical_closed"));
+  putSubOnDisk(modded);
+
+  const ClosedListingAftermath expected =
+      closeAfterTheFirstQuery(nativeQueryDirectoryFile(), modded.namesakes / L"sub");
+  const ClosedListingAftermath actual =
+      closeAfterTheFirstQuery(&usvfs::hook_NtQueryDirectoryFile, modded.data / L"sub");
+
+  ASSERT_EQ(ERROR_SUCCESS, expected.exclusiveOpenError);
+  ASSERT_EQ(ERROR_SUCCESS, expected.parentRenameError);
+  EXPECT_EQ(expected.exclusiveOpenError, actual.exclusiveOpenError);
+  EXPECT_EQ(expected.parentRenameError, actual.parentRenameError);
 }
 
 // ntdll is the reference for a physical directory that a handle with DELETE access

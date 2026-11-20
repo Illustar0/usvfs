@@ -789,9 +789,9 @@ NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
   // Runs wherever NtClose is called: under the lock of the process heap, inside ntdll,
   // or while a library installing hooks holds every other thread suspended. So it takes
   // no lock, allocates nothing and logs nothing, and calls nothing that could wait for
-  // another thread; erasing from the registries is wait-free (see HandleRegistry). Not
-  // in a hook call context either, as making one allocates on the first hook a thread
-  // calls.
+  // another thread; erasing from the registries is wait-free (see HandleRegistry), and
+  // so is closing the directory a scan opened, a system call. Not in a hook call
+  // context either, as making one allocates on the first hook a thread calls.
   eraseDirectoryScan(Handle);
   ntdllHandleTracker.erase(Handle);
   return ::NtClose(Handle);

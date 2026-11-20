@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cwchar>
@@ -150,8 +151,7 @@ bool isInternalDirectoryIo()
   return InternalIoScope::isActive();
 }
 
-// A handle the scan opened itself. Move-only; closes the handle when destroyed, so
-// that a scan replaced by a restart or dropped by NtClose does not leak it.
+// A handle the scan opened itself. Move-only; closes the handle when destroyed.
 class OwnedHandle
 {
 public:
@@ -176,6 +176,9 @@ public:
   HANDLE get() const { return m_handle; }
   bool isValid() const { return isValidHandle(m_handle); }
 
+  // Gives the handle up without closing it.
+  HANDLE release() { return std::exchange(m_handle, INVALID_HANDLE_VALUE); }
+
   // Closes the handle, if there is one.
   void reset()
   {
@@ -191,6 +194,100 @@ public:
 
 private:
   HANDLE m_handle = INVALID_HANDLE_VALUE;
+};
+
+// The directory a scan reads its regular entries through, held across the queries of
+// the scan when the scan opened it itself. Closing the caller's handle closes it too,
+// as natively no handle of a closed search stays open that would keep others from
+// opening the directory or renaming a parent: NtClose closes it at once, without
+// waiting, unless a query reads through it, which then closes it as it returns. A
+// query reads through it only while a Reader of it lives.
+class SharedScanHandle
+{
+public:
+  // A query reading through the handle, for as long as it lives.
+  class Reader
+  {
+  public:
+    explicit Reader(SharedScanHandle& shared) noexcept
+        : m_shared(shared), m_isOpen(shared.acquire())
+    {}
+
+    ~Reader()
+    {
+      if (m_isOpen) {
+        m_shared.release();
+      }
+    }
+
+    Reader(const Reader&)            = delete;
+    Reader& operator=(const Reader&) = delete;
+
+    // whether the handle may be read through, which it may not once closed
+    bool isOpen() const { return m_isOpen; }
+
+    // the handle the scan opened, or the caller's where the scan opened none
+    HANDLE handleOr(HANDLE callerHandle) const
+    {
+      const HANDLE handle = m_shared.m_handle.load();
+      return isValidHandle(handle) ? handle : callerHandle;
+    }
+
+  private:
+    SharedScanHandle& m_shared;
+    const bool m_isOpen;
+  };
+
+  SharedScanHandle() = default;
+  ~SharedScanHandle() { closeOnce(); }
+
+  SharedScanHandle(const SharedScanHandle&)            = delete;
+  SharedScanHandle& operator=(const SharedScanHandle&) = delete;
+
+  // Takes over the directory the scan opened, before the scan is shared.
+  void adopt(OwnedHandle handle) { m_handle.store(handle.release()); }
+
+  // Closes the handle, or leaves that to the reader that returns last. Wait-free.
+  void close() noexcept
+  {
+    if (m_state.fetch_or(ClosedFlag) == 0) {
+      closeOnce();
+    }
+  }
+
+private:
+  // Returns whether the handle may be read through, counting the caller as a reader
+  // if so.
+  bool acquire() noexcept
+  {
+    if ((m_state.fetch_add(1) & ClosedFlag) == 0) {
+      return true;
+    }
+    release();
+    return false;
+  }
+
+  void release() noexcept
+  {
+    if (m_state.fetch_sub(1) == (ClosedFlag | 1)) {
+      closeOnce();
+    }
+  }
+
+  // Closes the handle, if no one did yet. NtClose, the system call, rather than
+  // CloseHandle and a log line on failure, which both may wait for the process heap.
+  void closeOnce() noexcept
+  {
+    const HANDLE handle = m_handle.exchange(INVALID_HANDLE_VALUE);
+    if (isValidHandle(handle)) {
+      ::NtClose(handle);
+    }
+  }
+
+  // the number of readers, and ClosedFlag once the handle is closed or to be closed
+  static constexpr std::uint32_t ClosedFlag = std::uint32_t{1} << 31;
+  std::atomic<std::uint32_t> m_state{0};
+  std::atomic<HANDLE> m_handle{INVALID_HANDLE_VALUE};
 };
 
 // A directory the scan opened, or why it could not.
@@ -273,26 +370,26 @@ public:
   // ".." comes, as a directory that holds nothing else on disk needs none. A source of
   // the dots only ends the entries with the dots. A reader for a restarted scan
   // restarts the native scan with its first read.
-  RegularEntryReader(RegularSource source, std::optional<std::wstring_view> pattern,
+  RegularEntryReader(bool isDotsOnly, std::optional<std::wstring_view> pattern,
                      std::function<CaseInsensitiveNameSet()> gatherShadowedNames,
                      bool isRestart)
-      : m_source(std::move(source.handle)),
-        m_gatherShadowedNames(std::move(gatherShadowedNames)),
+      : m_gatherShadowedNames(std::move(gatherShadowedNames)),
         m_isRestartPending(isRestart)
   {
     if (pattern) {
       m_pattern.emplace(pattern->data(), pattern->size());
     }
-    if (source.isDotsOnly) {
+    if (isDotsOnly) {
       m_pendingDots = DOT_ENTRIES;
     }
   }
 
-  // Writes the entries of the next reads, reading only while the output is empty.
-  // Returns STATUS_SUCCESS once it wrote some, STATUS_BUFFER_OVERFLOW once it wrote
-  // the partial record of a read, STATUS_NO_MORE_FILES once the entries are done, and
-  // the error of a read that fails otherwise.
-  NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
+  // Writes the entries of the next reads from the source, the same handle on every
+  // query, reading only while the output is empty. Returns STATUS_SUCCESS once it
+  // wrote some, STATUS_BUFFER_OVERFLOW once it wrote the partial record of a read,
+  // STATUS_NO_MORE_FILES once the entries are done, and the error of a read that fails
+  // otherwise.
+  NTSTATUS fill(const DirectoryQuery& query, HANDLE source, DirectoryOutput& output);
 
 private:
   void appendListedRecords(const DirectoryRecordLayout& layout,
@@ -301,7 +398,6 @@ private:
   bool isNextDot(const DirectoryRecord& record) const;
   bool areDotsDone() const { return m_pendingDots && m_pendingDots->empty(); }
 
-  OwnedHandle m_source;
   std::optional<UnicodeString> m_pattern;
   std::function<CaseInsensitiveNameSet()> m_gatherShadowedNames;
   // Only these are left out: ntdll lists every entry once, and names that differ in
@@ -316,7 +412,8 @@ private:
   std::vector<std::byte> m_staging;
 };
 
-NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& output)
+NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, HANDLE source,
+                                  DirectoryOutput& output)
 {
   // what follows the dots belongs to the mapping source, not to the directory
   if (areDotsDone()) {
@@ -325,7 +422,6 @@ NTSTATUS RegularEntryReader::fill(const DirectoryQuery& query, DirectoryOutput& 
   // queryDirectory forwards the classes that have no layout
   const DirectoryRecordLayout layout =
       findDirectoryRecordLayout(query.informationClass).value();
-  const HANDLE source = m_source.isValid() ? m_source.get() : query.handle;
   // As large as the buffer of the query, so that a read returns what a read into that
   // buffer would, and every record it returns fits there too. Reading ahead in larger
   // reads would save system calls on small queries (FindNextFile asks for 4 KB), but
@@ -811,6 +907,10 @@ public:
     return m_contextGeneration == usvfs::HookContext::generation();
   }
 
+  // Closes the directory the scan opened itself, at once or as the query reading
+  // through it returns. Wait-free, as NtClose of the caller's handle calls it.
+  void closeOwnHandles() noexcept { m_regularSource.close(); }
+
 private:
   NTSTATUS fill(const DirectoryQuery& query, DirectoryOutput& output);
 
@@ -823,6 +923,10 @@ private:
   // the pattern the scan lists with, std::nullopt for every entry (see latchPattern);
   // fixed at construction, so the restart replacing the scan reads it unlocked
   const std::optional<std::wstring> m_pattern;
+
+  // the directory the regular entries are read through, which NtClose closes without
+  // taking the mutex below
+  SharedScanHandle m_regularSource;
 
   // Guards the state below. Taken after the registry lock is released; nested
   // directory queries made while holding it go straight to ntdll, so it is never
@@ -879,7 +983,12 @@ public:
   }
 
   // Wait-free, as NtClose calls it (see HandleRegistry).
-  bool erase(HANDLE handle) noexcept { return m_scans.erase(handle); }
+  bool erase(HANDLE handle) noexcept
+  {
+    return m_scans.erase(handle, [](DirectoryScan& scan) noexcept {
+      scan.closeOwnHandles();
+    });
+  }
 
   void destroyErased() { m_scans.destroyErased(); }
 
@@ -1133,10 +1242,11 @@ DirectoryScan::DirectoryScan(const DirectoryQuery& query, const DirectoryScan* r
                                                         : L"<queried handle>"))
       .addParam("numVirtualFiles", matches.size());
 
+  m_regularSource.adopt(std::move(regularSource.handle));
   // called during a query, by when m_virtual is set, and under m_mutex like every
   // other use of it
   m_regular.emplace(
-      std::move(regularSource), m_pattern,
+      regularSource.isDotsOnly, m_pattern,
       [this] {
         return m_virtual.names();
       },
@@ -1252,7 +1362,13 @@ void logForwardedQuery(const DirectoryQuery& query, std::string_view reason)
 NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, DirectoryOutput& output)
 {
   if (m_regular) {
-    const NTSTATUS status = m_regular->fill(query, output);
+    const SharedScanHandle::Reader source(m_regularSource);
+    // the caller's handle is closed, and the directory the scan opened with it
+    if (!source.isOpen()) {
+      return STATUS_INVALID_HANDLE;
+    }
+    const NTSTATUS status =
+        m_regular->fill(query, source.handleOr(query.handle), output);
     // logged as debug, as the caller gets the error as ntdll reports it
     if (status != STATUS_SUCCESS && status != STATUS_BUFFER_OVERFLOW &&
         status != STATUS_NO_MORE_FILES) {
@@ -1264,8 +1380,10 @@ NTSTATUS DirectoryScan::fill(const DirectoryQuery& query, DirectoryOutput& outpu
     if (status != STATUS_NO_MORE_FILES) {
       return status;
     }
-    // the regular entries are done, and the reader's handle and staging area with them
+    // the regular entries are done, and the reader's staging area and handle with them,
+    // which closes as this query stops reading through it
     m_regular.reset();
+    m_regularSource.close();
   }
   return m_virtual.fill(query, output);
 }

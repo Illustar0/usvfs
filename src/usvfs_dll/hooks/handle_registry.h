@@ -103,6 +103,15 @@ public:
   // is destroyed later (see HandleRegistry).
   bool erase(HANDLE handle) noexcept
   {
+    return erase(handle, [](T&) noexcept {});
+  }
+
+  // Erases the value of a handle as erase(handle) does, calling `release` on the value
+  // first, for what the value holds that must not wait for its destruction. Wait-free
+  // as long as `release` is.
+  template <class Release>
+  bool erase(HANDLE handle, Release release) noexcept
+  {
     std::atomic<Entry*>* slot = existingSlotOf(handle);
     if (!slot) {
       return false;
@@ -110,6 +119,10 @@ public:
     Entry* entry = slot->exchange(nullptr);
     if (!entry) {
       return false;
+    }
+    // no other thread destroys the entry before it joins the list of erased entries
+    if (entry->value) {
+      release(*entry->value);
     }
     ::InterlockedPushEntrySList(&m_erased, &entry->link);
     return true;
