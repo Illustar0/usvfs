@@ -152,7 +152,9 @@ jobs:
   test:
     name: Test USVFS
     needs: merge-artifacts-for-tests
-    runs-on: windows-2022
+    # Windows Server 2022 rejects the directory information classes 78 to 81 the tests
+    # list with, which Windows Server 2025 supports
+    runs-on: windows-2025
     strategy:
       matrix:
         config: [Debug, Release]
