@@ -492,6 +492,14 @@ std::optional<DirectoryRecord> NativeDirectoryReader::next()
       m_endStatus = result;
       return std::nullopt;
     }
+    // The contract of NtQueryDirectoryFile lets a read that holds no whole record
+    // succeed with no bytes, for the caller to retry with a larger buffer. This buffer
+    // holds the longest record already, so another read would return the same, and
+    // the scan ends with an error rather than with a record made of no bytes.
+    if (status.Information == 0) {
+      m_endStatus = STATUS_UNEXPECTED_IO_ERROR;
+      return std::nullopt;
+    }
     m_records = std::span(m_buffer).first(status.Information);
   }
   const DirectoryRecord record(m_layout, m_records);
