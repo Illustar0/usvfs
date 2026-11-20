@@ -57,6 +57,13 @@ public:
     ::TlsSetValue(s_slot, reinterpret_cast<LPVOID>(activeGroups() & ~bitOf(group)));
   }
 
+  // Returns whether the group is active on the calling thread, which none is when no
+  // TLS slot was left.
+  static bool isGroupActive(MutExHookGroup group)
+  {
+    return s_slot != TLS_OUT_OF_INDEXES && (activeGroups() & bitOf(group)) != 0;
+  }
+
 private:
   static_assert(static_cast<size_t>(MutExHookGroup::LAST) <=
                     sizeof(uintptr_t) * CHAR_BIT,
@@ -78,7 +85,11 @@ private:
 
 const DWORD HookStack::s_slot = ::TlsAlloc();
 
-HookCallContext::HookCallContext() : m_Active(true), m_Group(MutExHookGroup::NO_GROUP)
+// A hook outside the groups becomes active inside any other hook, but not under
+// ALL_GROUPS, which usvfs takes to call the file functions on paths it rerouted already
+HookCallContext::HookCallContext()
+    : m_Active(!HookStack::isGroupActive(MutExHookGroup::ALL_GROUPS)),
+      m_Group(MutExHookGroup::NO_GROUP)
 {
   updateLastError();
 }
