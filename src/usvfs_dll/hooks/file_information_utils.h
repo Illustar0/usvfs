@@ -77,11 +77,13 @@ struct FileInformationClassUtilsImpl
       // doesn't need to be 0-terminated
       memcpy(info->FileName, fileName.c_str(), info->FileNameLength);
 
+      // The record now stands in a virtual directory, but its 8.3 alias was made unique
+      // in the directory it comes from, so the alias may name another entry here, or
+      // one that usvfs cannot resolve. Without an alias, GetShortPathNameW keeps the
+      // long name, as on a volume without 8.3 names.
       if constexpr (HasFieldShortName<FileInformationClass>()) {
-        if (info->ShortNameLength > 0) {
-          info->ShortNameLength = static_cast<CCHAR>(
-              GetShortPathNameW(fileName.c_str(), info->ShortName, 8));
-        }
+        info->ShortNameLength = 0;
+        memset(info->ShortName, 0, sizeof(info->ShortName));
       }
     }
   }

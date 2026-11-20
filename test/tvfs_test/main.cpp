@@ -539,6 +539,77 @@ TEST_F(USVFSTest, NtQueryObjectVirtualFile)
   usvfs::hook_NtClose(hdl);
 }
 
+// a real directory with an 8.3 alias on most volumes; the tests that need an alias
+// skip where it has none
+static LPCWSTR ALIASED_DIRW = L"C:\\Program Files";
+
+// the 8.3 form of a real path, which is the path itself without aliases
+static std::wstring shortPathOf(LPCWSTR path)
+{
+  std::array<wchar_t, MAX_PATH> buffer{};
+  const DWORD length =
+      ::GetShortPathNameW(path, buffer.data(), static_cast<DWORD>(buffer.size()));
+  return length > 0 && length < buffer.size() ? std::wstring(buffer.data(), length)
+                                              : std::wstring(path);
+}
+
+// makes a directory the current one for its lifetime
+class CurrentDirectoryScope
+{
+public:
+  explicit CurrentDirectoryScope(LPCWSTR directory)
+  {
+    m_previous.resize(::GetCurrentDirectoryW(0, nullptr));
+    m_previous.resize(::GetCurrentDirectoryW(static_cast<DWORD>(m_previous.size()),
+                                             m_previous.data()));
+    ::SetCurrentDirectoryW(directory);
+  }
+
+  ~CurrentDirectoryScope() { ::SetCurrentDirectoryW(m_previous.c_str()); }
+
+private:
+  std::wstring m_previous;
+};
+
+TEST_F(USVFSTest, NtQueryDirectoryFileGivesVirtualEntryNoShortName)
+{
+  if (shortPathOf(ALIASED_DIRW) == ALIASED_DIRW) {
+    GTEST_SKIP() << ALIASED_DIRW << " has no 8.3 alias";
+  }
+
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  // the record of the virtual entry comes from the listing of C:\, where its alias
+  // belongs
+  ctx->redirectionTable().addDirectory(L"C:\\Windows\\Program Files",
+                                       usvfs::RedirectionDataLocal("C:\\Program Files"),
+                                       ush::FLAG_DIRECTORY);
+
+  // from here, the name alone also leads to the real entry and its alias
+  const CurrentDirectoryScope currentDirectory(L"C:\\");
+
+  HANDLE hdl = hooked_NtOpenFile(L"C:\\Windows", FILE_GENERIC_READ,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hdl);
+
+  IO_STATUS_BLOCK status;
+  char buffer[1024];
+  usvfs::UnicodeString fileName(L"Program Files");
+  ASSERT_EQ(STATUS_SUCCESS, usvfs::hook_NtQueryDirectoryFile(
+                                hdl, nullptr, nullptr, nullptr, &status, buffer,
+                                sizeof(buffer), FileBothDirectoryInformation, TRUE,
+                                static_cast<PUNICODE_STRING>(fileName), TRUE));
+
+  const auto* info = reinterpret_cast<FILE_BOTH_DIR_INFORMATION*>(buffer);
+  ASSERT_EQ(L"Program Files",
+            std::wstring(info->FileName, info->FileNameLength / sizeof(WCHAR)));
+  ASSERT_EQ(0, info->ShortNameLength);
+
+  usvfs::hook_NtClose(hdl);
+}
+
 TEST_F(USVFSTestAuto, CannotCreateLinkToFileInNonexistantDirectory)
 {
   ASSERT_EQ(FALSE, usvfsVirtualLinkFile(
