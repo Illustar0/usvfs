@@ -108,6 +108,50 @@ jobs:
           name: usvfs_${{ matrix.config }}
           pattern: usvfs_${{ matrix.config }}_*
 
+  # flat archives of the x86 and x64 Release binaries, the layout Mod Organizer users unpack
+  package:
+    name: Package USVFS
+    needs: merge-artifacts-for-release
+    runs-on: windows-2022
+    steps:
+      # checkout for the LICENSE
+      - uses: actions/checkout@v4
+
+      - name: Download Release Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: usvfs_Release
+          path: ./install
+
+      # 7-Zip stores a path that starts with ./ without its directories
+      - name: Create USVFS archives
+        shell: bash
+        run: |
+          dll_files=(
+            ./LICENSE
+            ./install/bin/usvfs_x64.dll
+            ./install/bin/usvfs_x86.dll
+            ./install/pdb/usvfs_x64.pdb
+            ./install/pdb/usvfs_x86.pdb
+          )
+          proxy_files=(
+            ./install/bin/usvfs_proxy_x64.exe
+            ./install/bin/usvfs_proxy_x86.exe
+            ./install/pdb/usvfs_proxy_x64.pdb
+            ./install/pdb/usvfs_proxy_x86.pdb
+          )
+          7z a usvfs-dll-only.7z "${dll_files[@]}"
+          7z a usvfs.7z "${dll_files[@]}" "${proxy_files[@]}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: usvfs.7z
+          archive: false
+      - uses: actions/upload-artifact@v7
+        with:
+          path: usvfs-dll-only.7z
+          archive: false
+
   test:
     name: Test USVFS
     needs: merge-artifacts-for-tests
@@ -155,31 +199,28 @@ jobs:
 
   publish:
     if: github.ref_type == 'tag'
-    needs: [merge-artifacts-for-release, test]
-    runs-on: windows-2022
+    needs: [package, test]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      # USVFS does not use different names for debug and release so we are going to
-      # retrieve both install artifacts and put them under install/ and install/debug/
-
-      - name: Download Release Artifact
-        uses: actions/download-artifact@master
+      - name: Download USVFS archives
+        uses: actions/download-artifact@v8
         with:
-          name: usvfs_Release
-          path: ./install
+          pattern: usvfs*.7z
+          path: ./dist
+          merge-multiple: true
 
-      - name: Download Debug Artifact
-        uses: actions/download-artifact@master
-        with:
-          name: usvfs_Debug
-          path: ./install/debug
-
-      - name: Create USVFS Base archive
-        run: 7z a usvfs_${{ github.ref_name }}.7z ./install/*
-
-      - name: Publish Release
+      # attach the archives to a release made by hand for this tag, or draft one to be
+      # given its notes and published by hand
+      - name: Upload USVFS archives
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create --draft=false --notes="Release ${{ github.ref_name }}" "${{ github.ref_name }}" ./usvfs_${{ github.ref_name }}.7z
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" > /dev/null; then
+            gh release upload "$TAG" ./dist/usvfs.7z ./dist/usvfs-dll-only.7z --clobber
+          else
+            gh release create "$TAG" --draft --title "$TAG" --notes "" ./dist/usvfs.7z ./dist/usvfs-dll-only.7z
+          fi
