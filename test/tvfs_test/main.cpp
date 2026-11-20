@@ -25,6 +25,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 
 #include <test_helpers.h>
 
+#include <climits>
 #include <fstream>
 #include <iostream>
 
@@ -231,6 +232,27 @@ TEST_F(USVFSTest, GetCurrentDirectoryAHookCopiesDirectory)
 
   EXPECT_EQ(expectedLength, usvfs::hook_GetCurrentDirectoryA(MAX_PATH, actual));
   EXPECT_STREQ(expected, actual);
+}
+
+TEST_F(USVFSTest, GetCurrentDirectoryAHookTakesBufferLengthBeyondInt)
+{
+  char expected[MAX_PATH];
+  const DWORD expectedLength = ::GetCurrentDirectoryA(MAX_PATH, expected);
+  ASSERT_NE(0UL, expectedLength);
+  // the hook writes only the directory and its terminating null
+  char actual[MAX_PATH];
+  const DWORD beyondInt = static_cast<DWORD>(INT_MAX) + 1;
+
+  EXPECT_EQ(expectedLength, usvfs::hook_GetCurrentDirectoryA(beyondInt, actual));
+  EXPECT_STREQ(expected, actual);
+}
+
+TEST_F(USVFSTest, GetCurrentDirectoryAHookFailsWithConversionError)
+{
+  ::SetLastError(ERROR_SUCCESS);
+
+  EXPECT_EQ(0UL, usvfs::hook_GetCurrentDirectoryA(MAX_PATH, nullptr));
+  EXPECT_EQ(static_cast<DWORD>(ERROR_INVALID_PARAMETER), ::GetLastError());
 }
 /*
 TEST_F(USVFSTest, GetFullPathNameOnRegularCurrentDirectory)

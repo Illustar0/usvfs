@@ -1097,12 +1097,21 @@ DWORD WINAPI usvfs::hook_GetCurrentDirectoryA(DWORD nBufferLength, LPSTR lpBuffe
   // a buffer too small; the length it returns otherwise leaves the null out
   const int size = WideCharToMultiByte(CP_ACP, 0, currentDirectory.c_str(), -1, nullptr,
                                        0, nullptr, nullptr);
-  if (size > 0 && static_cast<DWORD>(size) > nBufferLength) {
+  if (size == 0) {
+    // fails as GetCurrentDirectoryA fails: with 0, and the error for GetLastError
+    callContext.updateLastError();
+  } else if (static_cast<DWORD>(size) > nBufferLength) {
     res = static_cast<DWORD>(size);
-  } else if (size > 0) {
-    res = WideCharToMultiByte(CP_ACP, 0, currentDirectory.c_str(), -1, lpBuffer,
-                              static_cast<int>(nBufferLength), nullptr, nullptr) -
-          1;
+  } else {
+    // converts the size measured, which the buffer holds and an int does, unlike a
+    // buffer length beyond INT_MAX
+    const int converted = WideCharToMultiByte(CP_ACP, 0, currentDirectory.c_str(), -1,
+                                              lpBuffer, size, nullptr, nullptr);
+    if (converted == 0) {
+      callContext.updateLastError();
+    } else {
+      res = static_cast<DWORD>(converted) - 1;
+    }
   }
 
   HOOK_END
