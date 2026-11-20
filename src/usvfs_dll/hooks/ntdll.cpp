@@ -151,6 +151,18 @@ std::ostream& operator<<(std::ostream& os, POBJECT_ATTRIBUTES attr)
   return operator<<(os, *attr->ObjectName);
 }
 
+// The path under which the redirection tree files what an NT path names: its DOS path,
+// after the "\??\" prefix, or the "\\?\" one that Microsoft sometimes uses instead.
+std::wstring resolveNtLookupPath(const UnicodeString& ntPath)
+{
+  LPCWSTR dosPath = static_cast<LPCWSTR>(ntPath);
+  if ((wcsncmp(dosPath, LR"(\??\)", 4) == 0) ||
+      (wcsncmp(dosPath, LR"(\\?\)", 4) == 0)) {
+    dosPath += 4;
+  }
+  return std::wstring(dosPath);
+}
+
 RedirectionInfo applyReroute(const usvfs::HookContext::ConstPtr& context,
                              const usvfs::HookCallContext& callContext,
                              const UnicodeString& inPath)
@@ -162,7 +174,7 @@ RedirectionInfo applyReroute(const usvfs::HookContext::ConstPtr& context,
   if (callContext.active()) {
     // see if the file exists in the redirection tree
     std::string lookupPath = ush::string_cast<std::string>(
-        static_cast<LPCWSTR>(result.path) + 4, ush::CodePage::UTF8);
+        resolveNtLookupPath(result.path), ush::CodePage::UTF8);
     auto node = context->redirectionTable()->findNode(lookupPath.c_str());
     // if so, replace the file name with the path to the mapped file
     if ((node.get() != nullptr) &&
@@ -227,7 +239,7 @@ findCreateTarget(const usvfs::HookContext::ConstPtr& context,
   result.second = UnicodeString();
 
   std::string lookupPath = ush::string_cast<std::string>(
-      static_cast<LPCWSTR>(result.first) + 4, ush::CodePage::UTF8);
+      resolveNtLookupPath(result.first), ush::CodePage::UTF8);
   FindCreateTarget visitor;
   usvfs::RedirectionTree::VisitorFunction visitorWrapper =
       [&](const usvfs::RedirectionTree::NodePtrT& node) {
@@ -421,14 +433,7 @@ void gatherVirtualEntries(const UnicodeString& dirName,
                           const usvfs::RedirectionTreeContainer& redir,
                           PUNICODE_STRING FileName, Searches::Info& info)
 {
-  LPCWSTR dirNameW = static_cast<LPCWSTR>(dirName);
-  // fix directory name. I'd love to know why microsoft sometimes uses "\??\" vs
-  // "\\?\"
-  if ((wcsncmp(dirNameW, LR"(\\?\)", 4) == 0) ||
-      (wcsncmp(dirNameW, LR"(\??\)", 4) == 0)) {
-    dirNameW += 4;
-  }
-  auto node = redir->findNode(boost::filesystem::path(dirNameW));
+  auto node = redir->findNode(boost::filesystem::path(resolveNtLookupPath(dirName)));
   if (node.get() != nullptr) {
     std::string searchPattern =
         FileName != nullptr
