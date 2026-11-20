@@ -1317,6 +1317,13 @@ std::optional<std::string_view> findForwardingReason(const DirectoryQuery& query
   if (!layout) {
     return "the information class carries no file names";
   }
+  // ntdll fails a query whose pointers it cannot access, which the virtual listing
+  // cannot tell, short of crashing on them; it leaves the null ones to ntdll at least
+  if (query.statusBlock == nullptr || query.buffer == nullptr ||
+      (query.fileName != nullptr && query.fileName->Length != 0 &&
+       query.fileName->Buffer == nullptr)) {
+    return "a pointer of the query is null";
+  }
   // ntdll rejects a buffer that cannot hold a record or is misaligned, so it is left
   // to: the internal reads into that buffer would fail too, and the virtual listing
   // would then report an empty directory instead of the error

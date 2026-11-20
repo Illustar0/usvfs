@@ -662,6 +662,66 @@ TEST_F(USVFSTest, NtQueryDirectoryFileRejectsUndersizedBuffersLikeNtdll)
   }
 }
 
+namespace
+{
+
+// A pointer of a query left null where ntdll takes a valid one.
+enum class NullPointer
+{
+  Buffer,
+  StatusBlock,
+  FileNameBuffer,
+};
+
+QueryOutcome queryWithNull(NtQueryDirectoryFile_type query, HANDLE directory,
+                           NullPointer nullPointer)
+{
+  QueryOutcome outcome;
+  outcome.statusBlock.Status      = UNWRITTEN_STATUS;
+  outcome.statusBlock.Information = UNWRITTEN_INFORMATION;
+  alignas(8) char buffer[0x1000];
+  // a name one character long
+  UNICODE_STRING fileName{sizeof(WCHAR), sizeof(WCHAR), nullptr};
+  outcome.result =
+      query(directory, nullptr, nullptr, nullptr,
+            nullPointer == NullPointer::StatusBlock ? nullptr : &outcome.statusBlock,
+            nullPointer == NullPointer::Buffer ? nullptr : buffer, sizeof(buffer),
+            FileDirectoryInformation, FALSE,
+            nullPointer == NullPointer::FileNameBuffer ? &fileName : nullptr, TRUE);
+  return outcome;
+}
+
+}  // namespace
+
+TEST_F(USVFSTest, NtQueryDirectoryFileRejectsNullPointersLikeNtdll)
+{
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  addVirtualEntries(ctx->redirectionTable());
+
+  for (const auto& [nullPointer, name] :
+       {std::pair{NullPointer::Buffer, "buffer"},
+        std::pair{NullPointer::StatusBlock, "status block"},
+        std::pair{NullPointer::FileNameBuffer, "buffer of the file name"}}) {
+    SCOPED_TRACE(name);
+    HANDLE nativeHandle = openRootDirectory(true);
+    HANDLE hookedHandle = openRootDirectory(true);
+    ASSERT_NE(INVALID_HANDLE_VALUE, nativeHandle);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hookedHandle);
+
+    const QueryOutcome expected =
+        queryWithNull(nativeQueryDirectoryFile(), nativeHandle, nullPointer);
+    const QueryOutcome actual =
+        queryWithNull(&usvfs::hook_NtQueryDirectoryFile, hookedHandle, nullPointer);
+
+    EXPECT_LT(expected.result, 0) << "ntdll takes the null pointer";
+    expectSameOutcome(expected, actual);
+    usvfs::hook_NtClose(nativeHandle);
+    usvfs::hook_NtClose(hookedHandle);
+  }
+}
+
 TEST_F(USVFSTest, NtQueryDirectoryFileRejectsMisalignedBuffersLikeNtdll)
 {
   auto params = defaultUsvfsParams();
