@@ -52,6 +52,7 @@ class HookCallContext
 {
 
 public:
+  // the context of a hook in no group, active unless ALL_GROUPS is
   HookCallContext();
   HookCallContext(MutExHookGroup group);
   ~HookCallContext();
