@@ -543,6 +543,10 @@ TEST_F(USVFSTest, NtQueryObjectVirtualFile)
 // skip where it has none
 static LPCWSTR ALIASED_DIRW = L"C:\\Program Files";
 
+// a virtual file in ALIASED_DIRW
+static LPCWSTR ALIASED_DIR_FILE_NAMEW = L"usvfs_short_name.exe";
+static LPCWSTR ALIASED_DIR_FILEW      = L"C:\\Program Files\\usvfs_short_name.exe";
+
 // the 8.3 form of a real path, which is the path itself without aliases
 static std::wstring shortPathOf(LPCWSTR path)
 {
@@ -606,6 +610,79 @@ TEST_F(USVFSTest, NtQueryDirectoryFileGivesVirtualEntryNoShortName)
   ASSERT_EQ(L"Program Files",
             std::wstring(info->FileName, info->FileNameLength / sizeof(WCHAR)));
   ASSERT_EQ(0, info->ShortNameLength);
+
+  usvfs::hook_NtClose(hdl);
+}
+
+TEST_F(USVFSTest, GetFileAttributesHookRedirectsShortNamePath)
+{
+  const std::wstring shortDirectory = shortPathOf(ALIASED_DIRW);
+  if (shortDirectory == ALIASED_DIRW) {
+    GTEST_SKIP() << ALIASED_DIRW << " has no 8.3 alias";
+  }
+
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  ctx->redirectionTable().addFile(ALIASED_DIR_FILEW,
+                                  usvfs::RedirectionDataLocal(REAL_FILEA));
+
+  const std::wstring shortFile = shortDirectory + L"\\" + ALIASED_DIR_FILE_NAMEW;
+  ASSERT_EQ(::GetFileAttributesW(REAL_FILEW),
+            usvfs::hook_GetFileAttributesW(shortFile.c_str()));
+}
+
+TEST_F(USVFSTest, NtOpenFileHookRedirectsShortNamePath)
+{
+  const std::wstring shortDirectory = shortPathOf(ALIASED_DIRW);
+  if (shortDirectory == ALIASED_DIRW) {
+    GTEST_SKIP() << ALIASED_DIRW << " has no 8.3 alias";
+  }
+
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  ctx->redirectionTable().addFile(ALIASED_DIR_FILEW,
+                                  usvfs::RedirectionDataLocal(REAL_FILEA));
+
+  const std::wstring shortFile = shortDirectory + L"\\" + ALIASED_DIR_FILE_NAMEW;
+  HANDLE hdl = hooked_NtOpenFile(shortFile.c_str(), FILE_GENERIC_READ,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 FILE_NON_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hdl);
+
+  usvfs::hook_NtClose(hdl);
+}
+
+TEST_F(USVFSTest, NtQueryDirectoryFileFindsVirtualFileThroughShortNamePath)
+{
+  const std::wstring shortDirectory = shortPathOf(ALIASED_DIRW);
+  if (shortDirectory == ALIASED_DIRW) {
+    GTEST_SKIP() << ALIASED_DIRW << " has no 8.3 alias";
+  }
+
+  auto params = defaultUsvfsParams();
+  std::unique_ptr<usvfs::HookContext> ctx(
+      usvfsCreateHookContext(*params, ::GetModuleHandle(nullptr)));
+  ctx->redirectionTable().addFile(ALIASED_DIR_FILEW,
+                                  usvfs::RedirectionDataLocal(REAL_FILEA));
+
+  HANDLE hdl = hooked_NtOpenFile(shortDirectory.c_str(), FILE_GENERIC_READ,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+  ASSERT_NE(INVALID_HANDLE_VALUE, hdl);
+
+  IO_STATUS_BLOCK status;
+  char buffer[1024];
+  usvfs::UnicodeString fileName(ALIASED_DIR_FILE_NAMEW);
+  ASSERT_EQ(STATUS_SUCCESS, usvfs::hook_NtQueryDirectoryFile(
+                                hdl, nullptr, nullptr, nullptr, &status, buffer,
+                                sizeof(buffer), FileDirectoryInformation, TRUE,
+                                static_cast<PUNICODE_STRING>(fileName), TRUE));
+
+  const auto* info = reinterpret_cast<FILE_DIRECTORY_INFORMATION*>(buffer);
+  ASSERT_EQ(ALIASED_DIR_FILE_NAMEW,
+            std::wstring(info->FileName, info->FileNameLength / sizeof(WCHAR)));
 
   usvfs::hook_NtClose(hdl);
 }

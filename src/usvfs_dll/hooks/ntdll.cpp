@@ -160,7 +160,7 @@ std::wstring resolveNtLookupPath(const UnicodeString& ntPath)
       (wcsncmp(dosPath, LR"(\\?\)", 4) == 0)) {
     dosPath += 4;
   }
-  return std::wstring(dosPath);
+  return usvfs::expandShortNames(dosPath);
 }
 
 RedirectionInfo applyReroute(const usvfs::HookContext::ConstPtr& context,

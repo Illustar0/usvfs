@@ -40,6 +40,42 @@ static inline bool pathDirectlyAvailable(LPCWSTR pathName)
   return attrib == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND;
 }
 
+// Returns the path with its 8.3 aliases replaced by the long names they stand for, as
+// the redirection tree knows only long names. A program gets aliases from
+// GetShortPathNameW, which builds them from directory listings. Only entries on disk
+// carry aliases there, virtual ones have none, so the aliases all lie in the part of
+// the path that exists on disk: the longest prefix ending in a component with a tilde
+// that the disk resolves. The rest of the path stays as it is.
+static inline std::wstring expandShortNames(std::wstring_view path)
+{
+  for (size_t searchEnd = path.size(); searchEnd > 0;) {
+    const size_t tilde = path.find_last_of(L'~', searchEnd - 1);
+    if (tilde == std::wstring_view::npos) {
+      break;
+    }
+    const size_t componentEnd =
+        std::min(path.find_first_of(LR"(\/)", tilde), path.size());
+    const std::wstring prefix(path.substr(0, componentEnd));
+
+    // the disk alone resolves aliases, so no hook may answer
+    PreserveGetLastError callerError;
+    FunctionGroupLock lock(MutExHookGroup::ALL_GROUPS);
+    std::wstring longPrefix(::GetLongPathNameW(prefix.c_str(), nullptr, 0), L'\0');
+    if (!longPrefix.empty()) {
+      const DWORD length = ::GetLongPathNameW(prefix.c_str(), longPrefix.data(),
+                                              static_cast<DWORD>(longPrefix.size()));
+      if (length > 0 && length < longPrefix.size()) {
+        longPrefix.resize(length);
+        return longPrefix.append(path.substr(componentEnd));
+      }
+    }
+
+    const size_t componentStart = path.find_last_of(LR"(\/)", tilde);
+    searchEnd = componentStart == std::wstring_view::npos ? 0 : componentStart;
+  }
+  return std::wstring(path);
+}
+
 class MapTracker
 {
 public:
@@ -393,7 +429,7 @@ public:
   // the path under which the redirection tree files what a Win32 path names
   static fs::path resolveLookupPath(const wchar_t* inPath)
   {
-    return canonizePath(absolutePath(inPath));
+    return expandShortNames(canonizePath(absolutePath(inPath)).wstring());
   }
 
   static RerouteW create(const HookContext::ConstPtr& context,
