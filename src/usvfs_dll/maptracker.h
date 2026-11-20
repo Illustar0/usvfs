@@ -390,6 +390,12 @@ public:
     return p.make_preferred();
   }
 
+  // the path under which the redirection tree files what a Win32 path names
+  static fs::path resolveLookupPath(const wchar_t* inPath)
+  {
+    return canonizePath(absolutePath(inPath));
+  }
+
   static RerouteW create(const HookContext::ConstPtr& context,
                          const HookCallContext& callContext, const wchar_t* inPath,
                          bool inverse = false)
@@ -397,8 +403,8 @@ public:
     RerouteW result;
 
     if (interestingPath(inPath) && callContext.active()) {
-      const auto& lookupPath = canonizePath(absolutePath(inPath));
-      result.m_RealPath      = lookupPath.wstring();
+      const fs::path lookupPath = resolveLookupPath(inPath);
+      result.m_RealPath         = lookupPath.wstring();
 
       result.m_Buffer = k32DeleteTracker.lookup(result.m_RealPath);
       bool found      = !result.m_Buffer.empty();
@@ -449,8 +455,8 @@ public:
     RerouteW result;
 
     if (interestingPath(inPath) && callContext.active()) {
-      const auto& lookupPath = canonizePath(absolutePath(inPath));
-      result.m_RealPath      = lookupPath.wstring();
+      const fs::path lookupPath = resolveLookupPath(inPath);
+      result.m_RealPath         = lookupPath.wstring();
 
       result.m_Buffer = k32DeleteTracker.lookup(result.m_RealPath);
       bool found      = !result.m_Buffer.empty();
