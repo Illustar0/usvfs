@@ -49,6 +49,9 @@ void RecursiveSharedLock::unlock()
 {
   Hold hold = holdOfCurrentThread();
   --hold.depth;
+  // recorded before the release, which is the last access to the lock, as with any
+  // mutex: a thread that takes the lock next may destroy it, and free the slot
+  setHoldOfCurrentThread(hold);
   if (hold.depth == 0) {
     if (hold.isExclusive) {
       ::ReleaseSRWLockExclusive(&m_lock);
@@ -56,7 +59,6 @@ void RecursiveSharedLock::unlock()
       ::ReleaseSRWLockShared(&m_lock);
     }
   }
-  setHoldOfCurrentThread(hold);
 }
 
 bool RecursiveSharedLock::isHeldByCurrentThread() const
