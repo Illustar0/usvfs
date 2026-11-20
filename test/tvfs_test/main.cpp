@@ -582,6 +582,54 @@ TEST_F(USVFSLongPathTest, FindFirstFileExHookTakesExtendedLengthPath)
   EXPECT_TRUE(findsName(find, data, L"real.ini")) << "last error=" << ::GetLastError();
 }
 
+TEST_F(USVFSLongPathTest, FindFirstFileExHookTakesExtendedLengthPathInShortDirectory)
+{
+  // a directory short enough for every file function to take it without a prefix,
+  // holding a file whose path exceeds MAX_PATH
+  const std::wstring directory = m_longDir.substr(0, m_root.size() + 4 * 49);
+  const std::wstring name      = std::wstring(64, L'n') + L".ini";
+  ASSERT_LT(directory.size(), MAX_PATH - 12);
+  ASSERT_GT(directory.size() + 1 + name.size(), MAX_PATH);
+  writeFile(directory + L"\\" + name, "");
+  WIN32_FIND_DATAW data;
+
+  const HANDLE find = usvfs::hook_FindFirstFileExW(
+      extendedLengthPath(directory + L"\\" + name).c_str(), FindExInfoBasic, &data,
+      FindExSearchNameMatch, nullptr, 0);
+
+  EXPECT_TRUE(findsName(find, data, name)) << "last error=" << ::GetLastError();
+}
+
+TEST_F(USVFSLongPathTest, FindFirstFileExHookFindsVerbatimNameEndingInDot)
+{
+  writeFile(dataDir() + L"\\name.", "");
+  WIN32_FIND_DATAW data;
+
+  const HANDLE find = usvfs::hook_FindFirstFileExW(
+      extendedLengthPath(dataDir() + L"\\name.").c_str(), FindExInfoBasic, &data,
+      FindExSearchNameMatch, nullptr, 0);
+
+  EXPECT_TRUE(findsName(find, data, L"name.")) << "last error=" << ::GetLastError();
+}
+
+TEST_F(USVFSLongPathTest, FindFirstFileExHookMatchesTrailingDotOfPlainPathAsDos)
+{
+  // the file functions take "*." for the names without an extension only in a path
+  // they normalize
+  writeFile(dataDir() + L"\\noextension", "");
+  writeFile(dataDir() + L"\\extension.ini", "");
+  const std::wstring pattern = dataDir() + L"\\*.";
+  WIN32_FIND_DATAW data;
+
+  const HANDLE withoutExtension = usvfs::hook_FindFirstFileExW(
+      pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
+  EXPECT_TRUE(findsName(withoutExtension, data, L"noextension"))
+      << "last error=" << ::GetLastError();
+  const HANDLE withExtension = usvfs::hook_FindFirstFileExW(
+      pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
+  EXPECT_FALSE(findsName(withExtension, data, L"extension.ini"));
+}
+
 TEST_F(USVFSLongPathTest, DeleteFileHookTakesExtendedLengthPath)
 {
   const std::wstring path = extendedLengthPath(longFile());

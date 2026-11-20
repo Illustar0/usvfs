@@ -1472,9 +1472,12 @@ DWORD WINAPI usvfs::hook_GetModuleFileNameW(HMODULE hModule, LPWSTR lpFilename,
 }
 
 // The search path FindFirstFileExW takes for `pattern`: its directory resolved with the
-// current directory the hooks track, in the form the file functions take at any length,
-// and its last component as the caller gave it, which the function matches with the DOS
-// wildcard rules rather than normalizing it as a path.
+// current directory the hooks track, as the redirection tree names it, followed by its
+// last component as the caller gave it. It keeps the form of `pattern`, since the
+// function parses the whole path, last component included, by its form: a path in the
+// \\?\ form verbatim and at any length; any other one normalized, within MAX_PATH
+// unless the process is long path aware, with a trailing dot that only turns a final
+// "*" into a match for names without an extension.
 static fs::path resolvedSearchPath(LPCWSTR pattern)
 {
   if (pattern == nullptr) {
@@ -1492,7 +1495,9 @@ static fs::path resolvedSearchPath(LPCWSTR pattern)
   if (!resolved) {
     return fs::path(pattern);
   }
-  return fs::path(resolved->win32Path()) / std::wstring(text.substr(nameStart));
+  const std::wstring directoryPath =
+      ush::isVerbatimWin32Path(text) ? resolved->verbatimWin32Path() : resolved->str();
+  return fs::path(directoryPath) / std::wstring(text.substr(nameStart));
 }
 
 HANDLE WINAPI usvfs::hook_FindFirstFileExW(

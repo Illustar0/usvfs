@@ -49,9 +49,12 @@ public:
   std::wstring ntPath() const;
 
   // The form the Win32 file functions take this path in, in any process: str() itself
-  // while they take it as it is, else "\\?\C:\dir" or "\\?\UNC\server\share\dir", which
-  // they take at any length and without normalizing it again.
+  // while they take it as it is, else verbatimWin32Path().
   std::wstring win32Path() const;
+
+  // "\\?\C:\dir" or "\\?\UNC\server\share\dir", which the Win32 file functions take
+  // verbatim: at any length and without normalizing it again.
+  std::wstring verbatimWin32Path() const;
 
 private:
   explicit DosPath(std::wstring path);
@@ -65,5 +68,9 @@ private:
 // file functions take at any length: DosPath::fromFullPath(fullPath)->win32Path(), or
 // `fullPath` as it is for a path to no drive or share.
 std::wstring toWin32Path(std::wstring_view fullPath);
+
+// Whether the Win32 file functions take `path` verbatim, without normalizing it: a path
+// in the \\?\ form, or an NT path in the \??\ form.
+bool isVerbatimWin32Path(std::wstring_view path);
 
 }  // namespace usvfs::shared

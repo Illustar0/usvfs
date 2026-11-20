@@ -470,6 +470,22 @@ TEST(DosPathTest, PrefixesWin32PathTheFileFunctionsWouldNormalize)
   EXPECT_EQ(LR"(\\?\C:\name.)", DosPath::fromNt(LR"(\??\C:\name.)")->win32Path());
 }
 
+TEST(DosPathTest, ConvertsToVerbatimWin32PathAtAnyLength)
+{
+  EXPECT_EQ(LR"(\\?\C:\dir)", DosPath::fromWin32(LR"(C:\dir)")->verbatimWin32Path());
+  EXPECT_EQ(LR"(\\?\UNC\server\share\dir)",
+            DosPath::fromWin32(LR"(\\server\share\dir)")->verbatimWin32Path());
+}
+
+TEST(DosPathTest, TellsVerbatimWin32Path)
+{
+  EXPECT_TRUE(isVerbatimWin32Path(LR"(\\?\C:\dir)"));
+  EXPECT_TRUE(isVerbatimWin32Path(LR"(\??\C:\dir)"));
+  EXPECT_FALSE(isVerbatimWin32Path(LR"(C:\dir)"));
+  // the file functions normalize a local device path
+  EXPECT_FALSE(isVerbatimWin32Path(LR"(\\.\C:\dir)"));
+}
+
 TEST(DosPathTest, ConvertsFullPathToWin32Path)
 {
   EXPECT_EQ(LR"(\\?\C:\)" + longRelativePath(),

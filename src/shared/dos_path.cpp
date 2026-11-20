@@ -205,6 +205,11 @@ std::wstring DosPath::win32Path() const
   if (m_path.size() <= longestPlainPath && toNtPath(m_path) == ntPath()) {
     return m_path;
   }
+  return verbatimWin32Path();
+}
+
+std::wstring DosPath::verbatimWin32Path() const
+{
   return isUnc() ? std::wstring(win32UncPrefix) + m_path.substr(uncPrefix.size())
                  : std::wstring(win32Prefix) + m_path;
 }
@@ -218,6 +223,11 @@ std::wstring toWin32Path(std::wstring_view fullPath)
 {
   const auto path = DosPath::fromFullPath(fullPath);
   return path ? path->win32Path() : std::wstring(fullPath);
+}
+
+bool isVerbatimWin32Path(std::wstring_view path)
+{
+  return path.starts_with(win32Prefix) || path.starts_with(ntPrefix);
 }
 
 }  // namespace usvfs::shared
