@@ -2,9 +2,6 @@ name: Build USVFS
 
 on:
   push:
-    branches: [master, dev/cmake]
-    tags:
-      - "*"
   pull_request:
     types: [opened, synchronize, reopened]
 
