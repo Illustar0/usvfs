@@ -9,7 +9,9 @@ on:
     types: [opened, synchronize, reopened]
 
 env:
-  VCPKG_BINARY_SOURCES: clear;x-azblob,${{ vars.AZ_BLOB_VCPKG_URL }},${{ secrets.AZ_BLOB_SAS }},readwrite
+  # vcpkg rejects an x-azblob source without a URL, so repositories without the Azure blob
+  # fall back to the local binary cache, which the build job keeps in the GitHub cache
+  VCPKG_BINARY_SOURCES: ${{ vars.AZ_BLOB_VCPKG_URL && format('clear;x-azblob,{0},{1},readwrite', vars.AZ_BLOB_VCPKG_URL, secrets.AZ_BLOB_SAS) || 'clear;default,readwrite' }}
 
 jobs:
   build:
@@ -25,9 +27,19 @@ jobs:
         shell: bash
         run: |
           echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
+          echo "RUNNER_IMAGE_VERSION=$ImageVersion" >> $GITHUB_ENV
 
       # checkout USVFS and vcpkg
       - uses: actions/checkout@v4
+
+      # a new runner image can bring a new compiler, which invalidates every cached package
+      - name: Cache vcpkg binaries
+        if: vars.AZ_BLOB_VCPKG_URL == ''
+        uses: actions/cache@v6
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-${{ matrix.arch }}-${{ env.RUNNER_IMAGE_VERSION }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-${{ matrix.arch }}-${{ env.RUNNER_IMAGE_VERSION }}-
 
       # configure
       - run: cmake --preset vs2022-windows-${{ matrix.arch }} -B build_${{ matrix.arch }} "-DCMAKE_INSTALL_PREFIX=install/${{ matrix.config }}"
