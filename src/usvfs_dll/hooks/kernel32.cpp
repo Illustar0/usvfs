@@ -723,7 +723,7 @@ BOOL WINAPI usvfs::hook_MoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileN
 
       if (writeReroute.newReroute()) {
         if (isDirectory)
-          RerouteW::addDirectoryMapping(WRITE_CONTEXT(), fs::path(lpNewFileName),
+          RerouteW::addDirectoryMapping(WRITE_CONTEXT(), writeReroute.treeKey(),
                                         fs::path(writeReroute.plainFileName()));
         else
           writeReroute.insertMapping(WRITE_CONTEXT());
@@ -856,7 +856,7 @@ BOOL WINAPI usvfs::hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFil
 
       if (writeReroute.newReroute()) {
         if (isDirectory)
-          RerouteW::addDirectoryMapping(WRITE_CONTEXT(), fs::path(lpNewFileName),
+          RerouteW::addDirectoryMapping(WRITE_CONTEXT(), writeReroute.treeKey(),
                                         fs::path(writeReroute.plainFileName()));
         else
           writeReroute.insertMapping(WRITE_CONTEXT());
@@ -1008,7 +1008,7 @@ BOOL WINAPI usvfs::hook_MoveFileWithProgressW(LPCWSTR lpExistingFileName,
 
       if (writeReroute.newReroute()) {
         if (isDirectory)
-          RerouteW::addDirectoryMapping(WRITE_CONTEXT(), fs::path(lpNewFileName),
+          RerouteW::addDirectoryMapping(WRITE_CONTEXT(), writeReroute.treeKey(),
                                         fs::path(writeReroute.plainFileName()));
         else
           writeReroute.insertMapping(WRITE_CONTEXT());

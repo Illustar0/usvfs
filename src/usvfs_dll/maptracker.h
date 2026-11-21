@@ -179,6 +179,10 @@ public:
 
   bool newReroute() const { return m_NewReroute; }
 
+  // the key the redirection tree files the caller's path under, once create() or
+  // createNew() resolved it
+  const std::wstring& treeKey() const { return m_RealPath; }
+
   void insertMapping(const HookContext::Ptr& context, bool directory = false)
   {
     const std::wstring& reroutedPath = m_ReroutedPath->str();
@@ -738,6 +742,7 @@ public:
   bool isDir() const { return m_isDir; }
   bool newReroute() const { return m_reroute.newReroute(); }
   bool wasRerouted() const { return m_reroute.wasRerouted(); }
+  const std::wstring& treeKey() const { return m_reroute.treeKey(); }
   LPCWSTR fileName() const { return m_reroute.fileName(); }
   LPCWSTR plainFileName() const { return m_reroute.plainFileName(); }
   const std::optional<shared::DosPath>& reroutedPath() const
