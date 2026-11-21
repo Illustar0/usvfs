@@ -2123,6 +2123,36 @@ std::vector<std::wstring> sortedNames(const std::vector<ListedQuery>& queries)
   return names;
 }
 
+// The name GetShortPathNameW gives a file: its 8.3 name where it has one, its long name
+// otherwise.
+std::filesystem::path shortNameOf(const std::filesystem::path& file)
+{
+  std::wstring shortPath(::GetShortPathNameW(file.c_str(), nullptr, 0), L'\0');
+  shortPath.resize(::GetShortPathNameW(file.c_str(), shortPath.data(),
+                                       static_cast<DWORD>(shortPath.size())));
+  return std::filesystem::path(shortPath).filename();
+}
+
+// Removes the 8.3 name of a file, which NTFS matches a pattern against as it matches
+// the long name. Returns whether the file is left with its long name only.
+bool removeShortName(const std::filesystem::path& file)
+{
+  // ReFS, which makes no 8.3 names, refuses to remove one
+  if (shortNameOf(file) == file.filename()) {
+    return true;
+  }
+  const HANDLE handle = ::CreateFileW(
+      file.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  // an empty name removes the 8.3 name
+  const bool isRemoved = ::SetFileShortNameW(handle, L"") != FALSE;
+  ::CloseHandle(handle);
+  return isRemoved;
+}
+
 }  // namespace
 
 // ntdll is the reference for which virtual entries a pattern matches, as it matches
@@ -2148,9 +2178,14 @@ TEST_F(USVFSTest, NtQueryDirectoryFileMatchesVirtualEntriesLikeNtdll)
                                      L".hidden",    L"foo",        L"foo.bar",
                                      L"Ärger.dat",  L"über.txt"};
   for (size_t index = 0; index < std::size(names); ++index) {
+    const std::filesystem::path namesake = namesakeDirectory / names[index];
     const std::filesystem::path sourceFile =
         sourceDirectory / std::format(L"source_{}.txt", index);
-    std::ofstream(namesakeDirectory / names[index]);
+    std::ofstream{namesake};
+    // a virtual entry has no 8.3 name, so a namesake with one would match more patterns
+    if (!removeShortName(namesake)) {
+      GTEST_SKIP() << "the volume keeps 8.3 names, which virtual entries lack";
+    }
     std::ofstream{sourceFile};
     // in UTF-8, as usvfsVirtualLinkFile adds it: a wide path would go through the
     // locale of the Boost.Filesystem of this executable, which is not UTF-8
