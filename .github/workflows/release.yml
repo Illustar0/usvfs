@@ -1,0 +1,218 @@
+name: Release USVFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, the version of usvfs_version.h followed by the build string if any (for example, v0.5.7.2-pr99-alpha.8)
+        required: true
+        type: string
+      dry_run:
+        description: Build and package without publishing
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # vcpkg rejects an x-azblob source without a URL, so repositories without the Azure blob
+  # fall back to the local binary cache, which the build job keeps in the GitHub cache
+  VCPKG_BINARY_SOURCES: ${{ vars.AZ_BLOB_VCPKG_URL && format('clear;x-azblob,{0},{1},readwrite', vars.AZ_BLOB_VCPKG_URL, secrets.AZ_BLOB_SAS) || 'clear;default,readwrite' }}
+
+jobs:
+  version:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      build-string: ${{ steps.version.outputs.build-string }}
+    steps:
+      # git-cliff reads the commits since the last tag
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # the tag is the version of usvfs_version.h followed by the build string, which the
+      # header leaves empty
+      - name: Read the build string of the tag
+        id: version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$TAG is not v<major>.<minor>.<build>.<revision> followed by a build string of letters, digits, dots and hyphens"
+            exit 1
+          fi
+          version=${BASH_REMATCH[1]}
+          build_string=${BASH_REMATCH[2]}
+
+          header=include/usvfs/usvfs_version.h
+          header_version=$(for part in MAJOR MINOR BUILD REVISION; do
+            sed -n "s/^#define USVFS_VERSION_$part \([0-9]*\).*/\1/p" "$header"
+          done | paste -sd .)
+          if [[ "$version" != "$header_version" ]]; then
+            echo "::error::$TAG names version $version, but $header holds $header_version"
+            exit 1
+          fi
+
+          # the release creates the tag on the commit built, and its notes are the commits
+          # since the last tag
+          if git rev-parse --verify --quiet "refs/tags/$TAG" > /dev/null; then
+            echo "::error::$TAG exists already"
+            exit 1
+          fi
+
+          echo "build-string=$build_string" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        env:
+          TAG: ${{ inputs.tag }}
+        run: npx --yes git-cliff --config cliff.toml --unreleased --tag "$TAG" --output release-notes.md
+
+      - name: Summarize dry run
+        if: ${{ inputs.dry_run }}
+        run: cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  build:
+    name: Build USVFS
+    needs: version
+    strategy:
+      matrix:
+        arch: [x86, x64]
+    runs-on: windows-2022
+    steps:
+      - name: Set environmental variables
+        shell: bash
+        run: |
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
+          echo "RUNNER_IMAGE_VERSION=$ImageVersion" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v7
+
+      - name: Set the build string
+        if: needs.version.outputs.build-string != ''
+        shell: pwsh
+        env:
+          BUILD_STRING: ${{ needs.version.outputs.build-string }}
+        run: |
+          $header = 'include/usvfs/usvfs_version.h'
+          $content = Get-Content -Raw $header
+          $definitions = @{
+            '#define USVFS_BUILD_STRING ""'   = "#define USVFS_BUILD_STRING `"$env:BUILD_STRING`""
+            '#define USVFS_BUILD_WSTRING L""' = "#define USVFS_BUILD_WSTRING L`"$env:BUILD_STRING`""
+          }
+          foreach ($definition in $definitions.GetEnumerator()) {
+            if (-not $content.Contains($definition.Key)) {
+              throw "$header lacks $($definition.Key)"
+            }
+            $content = $content.Replace($definition.Key, $definition.Value)
+          }
+          Set-Content -Path $header -Value $content -NoNewline
+
+      # a new runner image can bring a new compiler, which invalidates every cached package
+      - name: Cache vcpkg binaries
+        if: vars.AZ_BLOB_VCPKG_URL == ''
+        uses: actions/cache@v6
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-${{ matrix.arch }}-${{ env.RUNNER_IMAGE_VERSION }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-${{ matrix.arch }}-${{ env.RUNNER_IMAGE_VERSION }}-
+
+      - run: cmake --preset vs2022-windows-${{ matrix.arch }} -B build_${{ matrix.arch }} "-DCMAKE_INSTALL_PREFIX=install"
+      - run: cmake --build build_${{ matrix.arch }} --config Release --target INSTALL
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: usvfs_${{ matrix.arch }}
+          path: ./install
+          if-no-files-found: error
+
+  # flat archives of the x86 and x64 binaries, the layout Mod Organizer users unpack
+  package:
+    name: Package USVFS
+    needs: build
+    runs-on: windows-2022
+    steps:
+      # checkout for the LICENSE
+      - uses: actions/checkout@v7
+
+      - name: Download USVFS install trees
+        uses: actions/download-artifact@v8
+        with:
+          pattern: usvfs_*
+          path: ./install
+          merge-multiple: true
+
+      # 7-Zip stores a path that starts with ./ without its directories
+      - name: Create USVFS archives
+        shell: bash
+        run: |
+          dll_files=(
+            ./LICENSE
+            ./install/bin/usvfs_x64.dll
+            ./install/bin/usvfs_x86.dll
+            ./install/pdb/usvfs_x64.pdb
+            ./install/pdb/usvfs_x86.pdb
+          )
+          proxy_files=(
+            ./install/bin/usvfs_proxy_x64.exe
+            ./install/bin/usvfs_proxy_x86.exe
+            ./install/pdb/usvfs_proxy_x64.pdb
+            ./install/pdb/usvfs_proxy_x86.pdb
+          )
+          7z a usvfs-dll-only.7z "${dll_files[@]}"
+          7z a usvfs.7z "${dll_files[@]}" "${proxy_files[@]}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: usvfs.7z
+          archive: false
+      - uses: actions/upload-artifact@v7
+        with:
+          path: usvfs-dll-only.7z
+          archive: false
+
+  publish:
+    name: Publish USVFS
+    needs: [version, package]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download USVFS archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: usvfs*.7z
+          path: ./dist
+          merge-multiple: true
+
+      - name: Download release notes
+        uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+
+      # a tag with a build string is an alpha or another prerelease
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          body_path: release-notes.md
+          prerelease: ${{ needs.version.outputs.build-string != '' }}
+          files: |
+            dist/usvfs.7z
+            dist/usvfs-dll-only.7z
+          fail_on_unmatched_files: true
