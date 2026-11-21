@@ -21,6 +21,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 #include "usvfs.h"
 #include "hookmanager.h"
 #include "loghelpers.h"
+#include "maptracker.h"
 #include "redirectiontree.h"
 #include "usvfs_version.h"
 #include "usvfsparametersprivate.h"
@@ -655,7 +656,9 @@ BOOL WINAPI usvfsVirtualLinkFile(LPCWSTR source, LPCWSTR destination,
   // TODO difference between winapi and ntdll api regarding system32 vs syswow64
   // (and other windows links?)
   try {
-    if (!assertPathExists(context->redirectionTable(), destination)) {
+    // the tree files the link under the path the hooks look it up by
+    const bfs::path destinationKey = usvfs::RerouteW::resolveLookupPath(destination);
+    if (!assertPathExists(context->redirectionTable(), destinationKey.c_str())) {
       SetLastError(ERROR_PATH_NOT_FOUND);
       return FALSE;
     }
@@ -671,14 +674,14 @@ BOOL WINAPI usvfsVirtualLinkFile(LPCWSTR source, LPCWSTR destination,
     }
 
     auto res = context->redirectionTable().addFile(
-        bfs::path(destination), usvfs::RedirectionDataLocal(sourceU8),
+        destinationKey, usvfs::RedirectionDataLocal(sourceU8),
         !(flags & LINKFLAG_FAILIFEXISTS));
 
     if (shouldAddToInverseTree(sourceU8)) {
       std::string destinationU8 =
           ush::string_cast<std::string>(destination, ush::CodePage::UTF8);
 
-      context->inverseTable().addFile(bfs::path(source),
+      context->inverseTable().addFile(usvfs::RerouteW::resolveLookupPath(source),
                                       usvfs::RedirectionDataLocal(destinationU8), true);
     }
 
@@ -723,7 +726,9 @@ BOOL WINAPI usvfsVirtualLinkDirectoryStatic(LPCWSTR source, LPCWSTR destination,
       return FALSE;
     }
 
-    if (!assertPathExists(context->redirectionTable(), destination)) {
+    // the tree files the link under the path the hooks look it up by
+    const bfs::path destinationKey = usvfs::RerouteW::resolveLookupPath(destination);
+    if (!assertPathExists(context->redirectionTable(), destinationKey.c_str())) {
       SetLastError(ERROR_PATH_NOT_FOUND);
       return FALSE;
     }
@@ -732,7 +737,7 @@ BOOL WINAPI usvfsVirtualLinkDirectoryStatic(LPCWSTR source, LPCWSTR destination,
         ush::string_cast<std::string>(source, ush::CodePage::UTF8) + "\\";
 
     context->redirectionTable().addDirectory(
-        destination, usvfs::RedirectionDataLocal(sourceU8),
+        destinationKey, usvfs::RedirectionDataLocal(sourceU8),
         usvfs::shared::FLAG_DIRECTORY | convertRedirectionFlags(flags),
         (flags & LINKFLAG_CREATETARGET) != 0);
 
@@ -742,9 +747,10 @@ BOOL WINAPI usvfsVirtualLinkDirectoryStatic(LPCWSTR source, LPCWSTR destination,
     if ((flags & LINKFLAG_RECURSIVE) != 0) {
       std::wstring sourceP(source);
       std::wstring sourceW      = sourceP + L"\\";
-      std::wstring destinationW = std::wstring(destination) + L"\\";
+      std::wstring destinationW = destinationKey.wstring() + L"\\";
       if (sourceP.length() >= MAX_PATH && !ush::startswith(sourceP.c_str(), LR"(\\?\)"))
         sourceP = LR"(\\?\)" + sourceP;
+      const bfs::path sourceKey = usvfs::RerouteW::resolveLookupPath(source);
 
       for (winapi::ex::wide::FileResult file :
            winapi::ex::wide::quickFindFiles(sourceP.c_str(), L"*")) {
@@ -788,16 +794,16 @@ BOOL WINAPI usvfsVirtualLinkDirectoryStatic(LPCWSTR source, LPCWSTR destination,
           // TODO could save memory here by storing only the file name for the
           // source and constructing the full name using the parent directory
           context->redirectionTable().addFile(
-              bfs::path(destination) / nameU8,
-              usvfs::RedirectionDataLocal(sourceU8 + nameU8), true);
+              destinationKey / nameU8, usvfs::RedirectionDataLocal(sourceU8 + nameU8),
+              true);
 
           if (shouldAddToInverseTree(nameU8)) {
             std::string destinationU8 =
                 ush::string_cast<std::string>(destination, ush::CodePage::UTF8) + "\\";
 
             context->inverseTable().addFile(
-                bfs::path(source) / nameU8,
-                usvfs::RedirectionDataLocal(destinationU8 + nameU8), true);
+                sourceKey / nameU8, usvfs::RedirectionDataLocal(destinationU8 + nameU8),
+                true);
           }
         }
       }

@@ -710,6 +710,55 @@ TEST_F(USVFSTestAuto, CanCreateMultipleLinks)
                      FILE_ATTRIBUTE_DIRECTORY);
 }
 
+TEST_F(USVFSTestAuto, FileLinkedThroughShortNamePathIsFoundThroughBothForms)
+{
+  const std::wstring shortDirectory = shortPathOf(ALIASED_DIRW);
+  if (shortDirectory == ALIASED_DIRW) {
+    GTEST_SKIP() << ALIASED_DIRW << " has no 8.3 alias";
+  }
+  const std::wstring shortFile = shortDirectory + L"\\" + ALIASED_DIR_FILE_NAMEW;
+
+  ASSERT_EQ(TRUE, usvfsVirtualLinkFile(REAL_FILEW, shortFile.c_str(), 0));
+
+  const DWORD attributes = ::GetFileAttributesW(REAL_FILEW);
+  EXPECT_EQ(attributes, usvfs::hook_GetFileAttributesW(ALIASED_DIR_FILEW));
+  EXPECT_EQ(attributes, usvfs::hook_GetFileAttributesW(shortFile.c_str()));
+}
+
+TEST_F(USVFSTestAuto, DirectoryLinkedThroughShortNamePathIsListedThroughBothForms)
+{
+  const std::wstring shortDirectory = shortPathOf(ALIASED_DIRW);
+  if (shortDirectory == ALIASED_DIRW) {
+    GTEST_SKIP() << ALIASED_DIRW << " has no 8.3 alias";
+  }
+  const std::filesystem::path source = test::path_of_test_temp(L"short_name_link");
+  std::filesystem::remove_all(source);
+  std::filesystem::create_directories(source);
+  std::ofstream(source / L"linked.ini");
+  constexpr LPCWSTR LINK_NAME = L"\\usvfs_short_name_link";
+
+  ASSERT_EQ(TRUE, usvfsVirtualLinkDirectoryStatic(source.c_str(),
+                                                  (shortDirectory + LINK_NAME).c_str(),
+                                                  LINKFLAG_RECURSIVE));
+
+  for (const std::wstring& directory : {std::wstring(ALIASED_DIRW), shortDirectory}) {
+    SCOPED_TRACE(directory);
+    HANDLE hdl = hooked_NtOpenFile((directory + LINK_NAME).c_str(), FILE_GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+    ASSERT_NE(INVALID_HANDLE_VALUE, hdl);
+
+    IO_STATUS_BLOCK status;
+    char buffer[1024];
+    usvfs::UnicodeString fileName(L"linked.ini");
+    EXPECT_EQ(STATUS_SUCCESS, usvfs::hook_NtQueryDirectoryFile(
+                                  hdl, nullptr, nullptr, nullptr, &status, buffer,
+                                  sizeof(buffer), FileDirectoryInformation, TRUE,
+                                  static_cast<PUNICODE_STRING>(fileName), TRUE));
+    usvfs::hook_NtClose(hdl);
+  }
+}
+
 int main(int argc, char** argv)
 {
   using namespace test;
