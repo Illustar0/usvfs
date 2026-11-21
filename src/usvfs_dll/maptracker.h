@@ -45,6 +45,51 @@ static inline bool pathDirectlyAvailable(LPCWSTR pathName)
   return attrib == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND;
 }
 
+// The long form of `path`, a DOS path, as the disk resolves it with no hook answering
+// for it; nothing for a path the disk does not hold.
+static inline std::optional<std::wstring> longPathOnDisk(std::wstring_view path)
+{
+  const std::wstring win32Path = shared::toWin32Path(path);
+  PreserveGetLastError callerError;
+  FunctionGroupLock lock(MutExHookGroup::ALL_GROUPS);
+  std::wstring longPath(::GetLongPathNameW(win32Path.c_str(), nullptr, 0), L'\0');
+  const DWORD length = longPath.empty()
+                           ? 0
+                           : ::GetLongPathNameW(win32Path.c_str(), longPath.data(),
+                                                static_cast<DWORD>(longPath.size()));
+  if (length == 0 || length >= longPath.size()) {
+    return std::nullopt;
+  }
+  longPath.resize(length);
+  const auto longDosPath = shared::DosPath::fromFullPath(longPath);
+  return longDosPath ? std::optional(longDosPath->str()) : std::nullopt;
+}
+
+// The key the redirection tree files what `path` names under: `path` with its 8.3
+// aliases replaced by the long names they stand for. GetShortPathNameW builds paths of
+// the aliases that directory listings return, so a program may name a virtual file
+// through the alias of a directory on disk, while the tree holds only long names. Only
+// entries on disk have aliases, so the disk resolves the longest prefix of `path` that
+// ends in a component with a tilde, as the aliases the file systems generate have; an
+// alias set by hand without one is left as it is.
+static inline std::wstring treeKeyOf(const shared::DosPath& path)
+{
+  const std::wstring& text = path.str();
+  for (size_t searchEnd = text.size(); searchEnd > 0;) {
+    const size_t tilde = text.find_last_of(L'~', searchEnd - 1);
+    if (tilde == std::wstring::npos) {
+      break;
+    }
+    const size_t componentEnd = std::min(text.find(L'\\', tilde), text.size());
+    if (const auto longPrefix = longPathOnDisk(text.substr(0, componentEnd))) {
+      return *longPrefix + text.substr(componentEnd);
+    }
+    const size_t componentStart = text.rfind(L'\\', tilde);
+    searchEnd = componentStart == std::wstring::npos ? 0 : componentStart;
+  }
+  return text;
+}
+
 class MapTracker
 {
 public:
@@ -96,8 +141,8 @@ extern MapTracker k32FakeDirTracker;
 
 class RerouteW
 {
-  // the caller's path as the file functions resolve it, but with the current directory
-  // the hooks track: what the redirection tree and the trackers are keyed by
+  // the key the redirection tree and the trackers file the caller's path under:
+  // treeKeyOf() the path resolvePath() gives for it
   std::wstring m_RealPath{};
   // where the caller's path leads in the virtual file system, when that is elsewhere
   std::optional<shared::DosPath> m_ReroutedPath{};
@@ -391,7 +436,7 @@ public:
     if (!path) {
       return result;
     }
-    result.m_RealPath = path->str();
+    result.m_RealPath = treeKeyOf(*path);
 
     std::wstring target = k32DeleteTracker.lookup(result.m_RealPath);
     if (!target.empty()) {
@@ -424,7 +469,7 @@ public:
     if (!path) {
       return result;
     }
-    result.m_RealPath = path->str();
+    result.m_RealPath = treeKeyOf(*path);
 
     std::wstring target = k32DeleteTracker.lookup(result.m_RealPath);
     if (!target.empty()) {

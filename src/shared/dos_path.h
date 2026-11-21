@@ -9,9 +9,11 @@ namespace usvfs::shared
 
 // A fully qualified path to a file or directory on a drive or a share, "C:\dir\file" or
 // "\\server\share\dir\file", normalized as Windows normalizes a path on its way to a
-// file system, and with no trailing separator but that of a drive's root, "C:\". The
-// redirection tree is keyed by this form. Each form of path the hooks take converts to
-// it, and it converts to each form the functions the hooks call take, at any length:
+// file system, and with no trailing separator but that of a drive's root, "C:\". Like
+// that normalization, it keeps the 8.3 aliases in a path, which the file system
+// resolves only when it looks the path up; the redirection tree is keyed by this form
+// once they are resolved. Each form of path the hooks take converts to it, and it
+// converts to each form the functions the hooks call take, at any length:
 //
 //   const auto path = DosPath::fromWin32(LR"(Data\..\Data\plugin.esp)", LR"(C:\Game)");
 //   path->str();        // C:\Game\Data\plugin.esp

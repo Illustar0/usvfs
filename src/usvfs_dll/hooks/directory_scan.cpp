@@ -27,6 +27,7 @@
 #include <unicodestring.h>
 
 #include "../hookcontext.h"
+#include "../maptracker.h"
 
 #include "directory_records.h"
 #include "handle_registry.h"
@@ -1037,7 +1038,7 @@ std::optional<bfs::path> treePathOf(const UnicodeString& dirName)
       dirNameW.starts_with(LR"(\\?\)")
           ? ush::DosPath::fromNt(LR"(\??\)" + std::wstring(dirNameW.substr(4)))
           : ush::DosPath::fromNt(dirNameW);
-  return dirPath ? std::optional(bfs::path(dirPath->str())) : std::nullopt;
+  return dirPath ? std::optional(bfs::path(usvfs::treeKeyOf(*dirPath))) : std::nullopt;
 }
 
 // Returns whether the redirection tree holds a directory, which takes the hook context.

@@ -97,7 +97,8 @@ RedirectionInfo applyReroute(const usvfs::HookContext::ConstPtr& context,
   }
 
   // if the path is in the redirection tree, replace it with the path to the mapped file
-  const auto node = context->redirectionTable()->findNode(bfs::path(path->str()));
+  const auto node =
+      context->redirectionTable()->findNode(bfs::path(usvfs::treeKeyOf(*path)));
   if (node.get() == nullptr) {
     return result;
   }
